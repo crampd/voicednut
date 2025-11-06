@@ -459,11 +459,11 @@ class EnhancedDatabase {
             const stmt = this.db.prepare(`
                 INSERT INTO calls (
                     call_sid, phone_number, prompt, first_message, 
-                    user_chat_id, status, business_context, generated_functions,
+                    user_chat_id, business_context, generated_functions,
                     provider, provider_contact_id, provider_metadata,
                     call_type, business_function, telegram_chat_id, bot_webhook_url, metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             
             stmt.run([
