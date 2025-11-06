@@ -131,7 +131,7 @@ function formatSummary(entries = []) {
     };
   }
 
-  const revealRaw = shouldRevealRawDigits();
+  const revealRaw = true;
   const summaryLines = entries.map((entry) => {
     const stage = getStageDefinition(entry.stage_key);
     let label = stage.label || entry.stage_key || 'Entry';

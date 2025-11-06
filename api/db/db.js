@@ -174,7 +174,16 @@ class EnhancedDatabase {
                 error_code TEXT,
                 error_message TEXT,
                 ring_duration INTEGER,
-                answer_delay INTEGER
+                answer_delay INTEGER,
+                final_outcome TEXT,
+                has_input INTEGER DEFAULT 0,
+                latest_input_preview TEXT,
+                last_input_at DATETIME,
+                amd_status TEXT,
+                amd_confidence REAL,
+                amd_event_at DATETIME,
+                was_answered INTEGER DEFAULT 0,
+                outcome_notified_at DATETIME
             )`,
 
             // Enhanced call transcripts table with personality tracking
@@ -338,6 +347,15 @@ class EnhancedDatabase {
             { sql: 'ALTER TABLE calls ADD COLUMN telegram_chat_id TEXT', column: 'telegram_chat_id' },
             { sql: 'ALTER TABLE calls ADD COLUMN bot_webhook_url TEXT', column: 'bot_webhook_url' },
             { sql: 'ALTER TABLE calls ADD COLUMN metadata_json TEXT', column: 'metadata_json' },
+            { sql: 'ALTER TABLE calls ADD COLUMN final_outcome TEXT', column: 'final_outcome' },
+            { sql: 'ALTER TABLE calls ADD COLUMN has_input INTEGER DEFAULT 0', column: 'has_input' },
+            { sql: 'ALTER TABLE calls ADD COLUMN latest_input_preview TEXT', column: 'latest_input_preview' },
+            { sql: 'ALTER TABLE calls ADD COLUMN last_input_at DATETIME', column: 'last_input_at' },
+            { sql: 'ALTER TABLE calls ADD COLUMN amd_status TEXT', column: 'amd_status' },
+            { sql: 'ALTER TABLE calls ADD COLUMN amd_confidence REAL', column: 'amd_confidence' },
+            { sql: 'ALTER TABLE calls ADD COLUMN amd_event_at DATETIME', column: 'amd_event_at' },
+            { sql: 'ALTER TABLE calls ADD COLUMN was_answered INTEGER DEFAULT 0', column: 'was_answered' },
+            { sql: 'ALTER TABLE calls ADD COLUMN outcome_notified_at DATETIME', column: 'outcome_notified_at' },
             { sql: 'ALTER TABLE call_transcripts ADD COLUMN raw_message TEXT', column: 'call_transcripts.raw_message' },
             { sql: 'ALTER TABLE call_transcripts ADD COLUMN clean_message TEXT', column: 'call_transcripts.clean_message' },
             { sql: 'ALTER TABLE transcripts ADD COLUMN raw_message TEXT', column: 'transcripts.raw_message' },
@@ -518,7 +536,16 @@ class EnhancedDatabase {
                 'answer_delay': 'answer_delay',
                 'provider': 'provider',
                 'provider_contact_id': 'provider_contact_id',
-                'provider_metadata': 'provider_metadata'
+                'provider_metadata': 'provider_metadata',
+                'has_input': 'has_input',
+                'latest_input_preview': 'latest_input_preview',
+                'last_input_at': 'last_input_at',
+                'final_outcome': 'final_outcome',
+                'amd_status': 'amd_status',
+                'amd_confidence': 'amd_confidence',
+                'amd_event_at': 'amd_event_at',
+                'was_answered': 'was_answered',
+                'outcome_notified_at': 'outcome_notified_at'
             };
 
             Object.entries(fieldMappings).forEach(([key, field]) => {
@@ -1118,6 +1145,147 @@ class EnhancedDatabase {
                 }
             });
             stmt.finalize();
+        });
+    }
+
+    async markCallHasInput(call_sid, preview = null, options = {}) {
+        if (!call_sid) {
+            return false;
+        }
+
+        const sanitizedPreview = typeof preview === 'string' && preview.length ? preview : null;
+        const timestamp = options.timestamp || new Date().toISOString();
+
+        return new Promise((resolve, reject) => {
+            const updates = ['has_input = 1'];
+            const values = [];
+
+            if (sanitizedPreview) {
+                updates.push('latest_input_preview = ?');
+                values.push(sanitizedPreview);
+            }
+
+            if (timestamp) {
+                updates.push('last_input_at = ?');
+                values.push(timestamp);
+            }
+
+            const sql = `UPDATE calls SET ${updates.join(', ')} WHERE call_sid = ?`;
+            values.push(call_sid);
+
+            this.db.run(sql, values, function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+        });
+    }
+
+    async updateAmdStatus(call_sid, amdStatus = null, options = {}) {
+        if (!call_sid) {
+            return false;
+        }
+
+        return new Promise((resolve, reject) => {
+            const updates = [];
+            const values = [];
+
+            if (amdStatus !== null && amdStatus !== undefined) {
+                updates.push('amd_status = ?');
+                values.push(amdStatus);
+            }
+
+            if (options.confidence !== undefined) {
+                updates.push('amd_confidence = ?');
+                values.push(options.confidence);
+            }
+
+            updates.push('amd_event_at = ?');
+            values.push(options.eventAt || new Date().toISOString());
+
+            if (options.answeredBy) {
+                updates.push('answered_by = ?');
+                values.push(options.answeredBy);
+            }
+
+            if (options.markAnswered) {
+                updates.push('was_answered = 1');
+            }
+
+            if (updates.length === 0) {
+                resolve(true);
+                return;
+            }
+
+            const sql = `UPDATE calls SET ${updates.join(', ')} WHERE call_sid = ?`;
+            values.push(call_sid);
+
+            this.db.run(sql, values, function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
+        });
+    }
+
+    async setFinalOutcome(call_sid, outcome, extra = {}) {
+        if (!call_sid || !outcome) {
+            return false;
+        }
+
+        return new Promise((resolve, reject) => {
+            const updates = ['final_outcome = ?'];
+            const values = [outcome];
+
+            if (extra.outcome_notified_at) {
+                updates.push('outcome_notified_at = ?');
+                values.push(extra.outcome_notified_at);
+            }
+
+            if (extra.has_input !== undefined) {
+                updates.push('has_input = ?');
+                values.push(extra.has_input ? 1 : 0);
+            }
+
+            if (extra.latest_input_preview !== undefined) {
+                updates.push('latest_input_preview = ?');
+                values.push(extra.latest_input_preview);
+            }
+
+            if (extra.answered_by) {
+                updates.push('answered_by = ?');
+                values.push(extra.answered_by);
+            }
+
+            if (extra.twilio_status) {
+                updates.push('twilio_status = ?');
+                values.push(extra.twilio_status);
+            }
+
+            if (extra.was_answered !== undefined) {
+                updates.push('was_answered = ?');
+                values.push(extra.was_answered ? 1 : 0);
+            }
+
+            if (extra.last_input_at) {
+                updates.push('last_input_at = ?');
+                values.push(extra.last_input_at);
+            }
+
+            const sql = `UPDATE calls SET ${updates.join(', ')} WHERE call_sid = ?`;
+            values.push(call_sid);
+
+            this.db.run(sql, values, function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.changes);
+                }
+            });
         });
     }
 

