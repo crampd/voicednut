@@ -23,6 +23,21 @@ function parseDtmfMetadata(metadata) {
   }
 }
 
+function parseCallMetadata(metadata) {
+  if (!metadata) {
+    return null;
+  }
+  if (typeof metadata === 'object') {
+    return metadata;
+  }
+  try {
+    return JSON.parse(metadata);
+  } catch (error) {
+    console.warn('Failed to parse call metadata payload:', error.message);
+    return null;
+  }
+}
+
 function formatDtmfEntries(entries = []) {
   const revealRaw = shouldRevealRawDigits();
   return entries.map((entry) => {
@@ -570,6 +585,64 @@ class EnhancedWebhookService {
     }
   }
 
+  async sendCallInputSummary(call_sid, telegram_chat_id) {
+    try {
+      const [inputs, callDetails, dtmfEntries] = await Promise.all([
+        this.db.getCallInputs(call_sid),
+        this.db.getCall(call_sid),
+        this.db.getCallDtmfEntries(call_sid),
+      ]);
+
+      const hasInputs = Array.isArray(inputs) && inputs.length > 0;
+      const hasDtmfEntries = Array.isArray(dtmfEntries) && dtmfEntries.length > 0;
+
+      if (!hasInputs && !hasDtmfEntries) {
+        await this.sendTelegramMessage(
+          telegram_chat_id,
+          buildTelegramMessage(['🔢 No keypad inputs were collected for this call.'])
+        );
+        return true;
+      }
+
+      const metadata = parseCallMetadata(callDetails?.metadata_json) || {};
+      const sequence = Array.isArray(metadata?.input_sequence) ? metadata.input_sequence : [];
+
+      const lines = ['📥 Call Input Summary', ''];
+
+      if (hasInputs) {
+        inputs.forEach((input) => {
+          const stepConfig = sequence[input.step - 1] || {};
+          const label = stepConfig.label || `Step ${input.step}`;
+          lines.push(`${label}: ${input.value}`);
+        });
+      } else {
+        const { summaryLines, containsRaw } = formatSummary(dtmfEntries);
+        if (summaryLines.length > 0) {
+          summaryLines.forEach((line) => lines.push(line));
+        } else {
+          lines.push('No keypad digits recorded.');
+        }
+        lines.push('');
+        lines.push(
+          containsRaw
+            ? '🚧 Dev compliance mode — raw digits displayed. Handle with care.'
+            : 'Digits masked per active compliance policy.'
+        );
+      }
+
+      await this.sendTelegramMessage(telegram_chat_id, buildTelegramMessage(lines));
+      return true;
+    } catch (error) {
+      console.error('❌ Failed to send call input summary:', error);
+      try {
+        await this.sendTelegramMessage(telegram_chat_id, '❌ Error delivering call input summary');
+      } catch (fallbackError) {
+        console.error('Failed to send fallback summary message:', fallbackError);
+      }
+      return false;
+    }
+  }
+
   // Process individual notification with enhanced error handling
   async sendNotification(notification) {
     const { id, call_sid, notification_type, telegram_chat_id, phone_number } = notification;
@@ -617,6 +690,9 @@ class EnhancedWebhookService {
         case 'call_input_dtmf':
         case 'call_dtmf_captured':
           success = await this.sendCallInputNotification(call_sid, telegram_chat_id);
+          break;
+        case 'call_input_summary':
+          success = await this.sendCallInputSummary(call_sid, telegram_chat_id);
           break;
         case 'call_failed':
           const failedCall = await this.db.getCall(call_sid);

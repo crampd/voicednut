@@ -206,6 +206,16 @@ class EnhancedDatabase {
                 received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
             )`,
+            `CREATE TABLE IF NOT EXISTS call_inputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT NOT NULL,
+                step INTEGER NOT NULL,
+                input_type TEXT NOT NULL CHECK(input_type IN ('speech','digit')),
+                value TEXT NOT NULL,
+                confidence REAL,
+                captured_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(call_sid) REFERENCES calls(call_sid)
+            )`,
 
             // Add backward compatibility table name
             `CREATE TABLE IF NOT EXISTS transcripts (
@@ -323,6 +333,11 @@ class EnhancedDatabase {
             { sql: "ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'twilio'", column: 'provider' },
             { sql: 'ALTER TABLE calls ADD COLUMN provider_contact_id TEXT', column: 'provider_contact_id' },
             { sql: 'ALTER TABLE calls ADD COLUMN provider_metadata TEXT', column: 'provider_metadata' },
+            { sql: "ALTER TABLE calls ADD COLUMN call_type TEXT DEFAULT 'service'", column: 'call_type' },
+            { sql: 'ALTER TABLE calls ADD COLUMN business_function TEXT', column: 'business_function' },
+            { sql: 'ALTER TABLE calls ADD COLUMN telegram_chat_id TEXT', column: 'telegram_chat_id' },
+            { sql: 'ALTER TABLE calls ADD COLUMN bot_webhook_url TEXT', column: 'bot_webhook_url' },
+            { sql: 'ALTER TABLE calls ADD COLUMN metadata_json TEXT', column: 'metadata_json' },
             { sql: 'ALTER TABLE call_transcripts ADD COLUMN raw_message TEXT', column: 'call_transcripts.raw_message' },
             { sql: 'ALTER TABLE call_transcripts ADD COLUMN clean_message TEXT', column: 'call_transcripts.clean_message' },
             { sql: 'ALTER TABLE transcripts ADD COLUMN raw_message TEXT', column: 'transcripts.raw_message' },
@@ -381,6 +396,8 @@ class EnhancedDatabase {
             'CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON webhook_notifications(created_at)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_chat_id ON webhook_notifications(telegram_chat_id)',
             'CREATE INDEX IF NOT EXISTS idx_notifications_priority ON webhook_notifications(priority)',
+            'CREATE INDEX IF NOT EXISTS idx_call_inputs_call_sid ON call_inputs(call_sid)',
+            'CREATE INDEX IF NOT EXISTS idx_call_inputs_step ON call_inputs(call_sid, step)',
             
             // Metrics indexes
             'CREATE INDEX IF NOT EXISTS idx_metrics_date ON notification_metrics(date)',
@@ -430,7 +447,12 @@ class EnhancedDatabase {
             generated_functions = null,
             provider = 'twilio',
             provider_contact_id = null,
-            provider_metadata = null
+            provider_metadata = null,
+            call_type = 'service',
+            business_function = null,
+            telegram_chat_id = null,
+            bot_webhook_url = null,
+            metadata_json = null
         } = callData;
         
         return new Promise((resolve, reject) => {
@@ -438,9 +460,10 @@ class EnhancedDatabase {
                 INSERT INTO calls (
                     call_sid, phone_number, prompt, first_message, 
                     user_chat_id, status, business_context, generated_functions,
-                    provider, provider_contact_id, provider_metadata
+                    provider, provider_contact_id, provider_metadata,
+                    call_type, business_function, telegram_chat_id, bot_webhook_url, metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'initiated', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             
             stmt.run([
@@ -453,7 +476,12 @@ class EnhancedDatabase {
                 generated_functions,
                 provider,
                 provider_contact_id,
-                provider_metadata ? JSON.stringify(provider_metadata) : null
+                provider_metadata ? JSON.stringify(provider_metadata) : null,
+                call_type || 'service',
+                business_function || null,
+                telegram_chat_id || null,
+                bot_webhook_url || null,
+                metadata_json ? (typeof metadata_json === 'string' ? metadata_json : JSON.stringify(metadata_json)) : null
             ], function(err) {
                 if (err) {
                     reject(err);
@@ -1064,6 +1092,66 @@ class EnhancedDatabase {
                 }
             });
             stmt.finalize();
+        });
+    }
+
+    async saveCallInput(entry) {
+        const {
+            call_sid,
+            step,
+            input_type,
+            value,
+            confidence = null
+        } = entry;
+
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO call_inputs (call_sid, step, input_type, value, confidence)
+                VALUES (?, ?, ?, ?, ?)
+            `);
+
+            stmt.run([call_sid, step, input_type, value, confidence], function(err) {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(this.lastID);
+                }
+            });
+            stmt.finalize();
+        });
+    }
+
+    async getCallInputs(call_sid) {
+        return new Promise((resolve, reject) => {
+            const sql = `
+                SELECT * FROM call_inputs
+                WHERE call_sid = ?
+                ORDER BY step ASC, captured_at ASC, id ASC
+            `;
+
+            this.db.all(sql, [call_sid], (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
+    async getNextCallInputStep(call_sid) {
+        return new Promise((resolve, reject) => {
+            this.db.get(
+                `SELECT COALESCE(MAX(step), 0) as max_step FROM call_inputs WHERE call_sid = ?`,
+                [call_sid],
+                (err, row) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve((row?.max_step || 0) + 1);
+                    }
+                }
+            );
         });
     }
 

