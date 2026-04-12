@@ -5,13 +5,11 @@ import {
   Cell,
   List,
   Navigation,
-  Placeholder,
   Section,
 } from '@telegram-apps/telegram-ui';
 
 import '@/pages/AdminDashboard/AdminDashboardPage.css';
 import { Link } from '@/components/Link/Link.tsx';
-import { Page } from '@/components/Page.tsx';
 import {
   DASHBOARD_ACTION_CONTRACTS,
   DASHBOARD_STATIC_ROUTE_CONTRACTS,
@@ -30,6 +28,7 @@ import {
   UiMetricTile,
   UiSelect,
   UiStatePanel,
+  UiWorkspacePulse,
   UiTextarea,
 } from '@/components/ui/AdminPrimitives';
 import {
@@ -94,6 +93,11 @@ import {
   type CallScriptRecord,
   type CallWorkflowMode,
 } from './CommandPages.tsx';
+import {
+  CommandPageLayout,
+  CommandPageLoadingState,
+  CommandPageRestrictedState,
+} from './CommandPageScaffold.tsx';
 
 type CallLiveConsoleSectionProps = {
   activeCallSid: string;
@@ -121,32 +125,6 @@ type CallQuickActionsSectionProps = {
   accessLevel: MiniAppCommandAccessLevel;
   pathname: string;
 };
-
-function CallLoadingState({ pageTitle }: { pageTitle: string }) {
-  return (
-    <Page back>
-      <Placeholder
-        header={pageTitle}
-        description={resolveCommandPageLoadingCopy(pageTitle)}
-      />
-    </Page>
-  );
-}
-
-function CallAccessRequiredSection() {
-  return (
-    <Section
-      header="Access required"
-      footer="Call execution is restricted to authorized users. The Mini App keeps the same rule."
-    >
-      <UiStatePanel
-        title="Authorized access required"
-        description="Request access from an admin or use Help Center, Usage Guide, or Quick Actions to review available workflows."
-        tone="warning"
-      />
-    </Section>
-  );
-}
 
 function CallLiveConsoleSection({
   activeCallSid,
@@ -1767,13 +1745,39 @@ function CallCommandPageContent() {
   );
 
   if (loading) {
-    return <CallLoadingState pageTitle={pageTitle} />;
+    return (
+      <CommandPageLoadingState
+        title={pageTitle}
+        summary={resolveCommandPageLoadingCopy(pageTitle)}
+        note={contract.notes}
+      />
+    );
   }
 
   return (
-    <Page back>
+    <CommandPageLayout
+      eyebrow="Operator call workspace"
+      title={pageTitle}
+      summary={contract.summary}
+      meta={<UiBadge variant={canOperate ? 'success' : 'warning'}>{describeAccessLevel(accessLevel)}</UiBadge>}
+      metaAriaLabel={`${pageTitle} workspace access`}
+      note={contract.notes}
+      pulse={(
+        <UiWorkspacePulse
+          title="Workspace pulse"
+          description="Launch, monitor, and recover live call execution from one Telegram-native surface that stays aligned with the shared backend contracts."
+          tone={error ? 'warning' : (activeCallSid ? 'success' : 'info')}
+          status={error ? 'Needs attention' : (activeCallSid ? 'Live console attached' : 'Ready')}
+          items={[
+            { label: 'Access', value: describeAccessLevel(accessLevel) },
+            { label: 'Session', value: error ? 'Attention required' : 'Healthy' },
+            { label: 'Live call', value: activeCallSid || 'Awaiting launch' },
+          ]}
+        />
+      )}
+    >
       <List>
-        <Section header={pageTitle} footer={contract.notes}>
+        <Section header="Session status" footer="This command page stays bound to the same access gates, runtime state, and action contracts used elsewhere in the app.">
           <Cell subtitle={contract.summary}>
             {describeAccessLevel(accessLevel)}
           </Cell>
@@ -1794,7 +1798,14 @@ function CallCommandPageContent() {
         </Section>
 
         {!canOperate ? (
-          <CallAccessRequiredSection />
+          <CommandPageRestrictedState
+            title={pageTitle}
+            summary={contract.summary}
+            note={contract.notes}
+            accessLevel={accessLevel}
+            requiredAccess="authorized"
+            stateDescription="Request access from an admin or continue with Help Center, Quick Actions, or the admin console while call execution remains locked."
+          />
         ) : (
           <>
             {renderCallSetupWorkspace()}
@@ -1831,7 +1842,7 @@ function CallCommandPageContent() {
         />
         <CallContinueAdminSection />
       </List>
-    </Page>
+    </CommandPageLayout>
   );
 }
 

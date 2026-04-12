@@ -1,4 +1,5 @@
 import { UiBadge, UiButton } from '@/components/ui/AdminPrimitives';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 
 type SettingsPageProps = {
   userLabel: string;
@@ -94,24 +95,22 @@ export function SettingsPage({
 
   return (
     <section className="va-settings-page">
-      <div className="va-settings-hero">
-        <div className="va-settings-title-wrap">
-          <p className="va-kicker">Preferences</p>
-          <h2 className="va-settings-title">Settings</h2>
-          <p className="va-muted">
-            Manage account basics, app behavior, accessibility posture, and recovery controls.
-          </p>
+      <AdminPageIntro
+        eyebrow="Preferences"
+        title="Settings"
+        summary="Manage account basics, app behavior, accessibility posture, and recovery controls."
+        metaAriaLabel="Settings summary"
+        meta={
           <div className="va-settings-meta-strip">
             <UiBadge variant={updatesVariant}>Live updates {liveUpdatesLabel}</UiBadge>
             <UiBadge variant="meta">{roleLabel} access</UiBadge>
             <UiBadge variant="info">{featureFlagsLabel}</UiBadge>
           </div>
-          <p className="va-settings-hero-note">
-            This page stays focused on session, accessibility, and diagnostics so the dashboard home
-            remains the place for navigation and day-to-day work.
-          </p>
-        </div>
-        <div className="va-settings-summary">
+        }
+        note="This page stays focused on session, accessibility, and diagnostics so the dashboard home remains the place for navigation and day-to-day work."
+      />
+      <div className="va-settings-hero">
+        <div className="va-settings-summary va-title-card-actions">
           <span className={`va-settings-flag-state ${pollingPaused ? 'is-disabled' : 'is-enabled'}`}>
             Live updates {liveUpdatesLabel}
           </span>

@@ -69,8 +69,8 @@ export const MODULE_CONTEXT: Record<DashboardModule, { subtitle: string; detail:
     detail: 'Caller screening workspace.',
   },
   scriptsparity: {
-    subtitle: 'Focused SMS and email editing lane inside the broader Script Designer model.',
-    detail: 'Message-lane editing workspace.',
+    subtitle: 'Compatibility entry that opens the shared Script Designer on the focused SMS and email lanes.',
+    detail: 'Focused entry into Script Designer.',
   },
   messaging: {
     subtitle: 'Unified SMS and email diagnostics workspace with history and batch health visibility.',

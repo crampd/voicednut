@@ -4,6 +4,7 @@ import { buildModuleRequestState } from './moduleRequestState';
 import type { DashboardVm } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectScriptStudioPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import {
   UiActionBar,
   UiBadge,
@@ -128,23 +129,23 @@ export function CallerFlagsModerationPage({ visible, vm }: CallerFlagsModeration
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Inbound Screening</p>
-        <h2 className="va-page-title">Caller Flags</h2>
-        <p className="va-muted">Review the same caller screening flow the bot exposes and update inbound allow, block, or spam decisions from a standard admin workspace.</p>
-        <div className="va-page-intro-meta" aria-label="Caller flag screening summary">
-          <UiBadge variant={pulseTone === 'warning' ? 'info' : pulseTone === 'neutral' ? 'meta' : pulseTone}>
-            {pulseStatus}
-          </UiBadge>
-          <UiBadge variant="meta">Bot-backed policy</UiBadge>
-          <UiBadge variant="info">{statusLabel(statusFilter)}</UiBadge>
-          <UiBadge variant="meta">{flags.length} loaded</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Keep inbound screening deliberate: review the current caller posture, then apply allow, block, or spam
-          decisions with the same source of truth used by the bot.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Inbound Screening"
+        title="Caller Flags"
+        summary="Review the same caller screening flow the bot exposes and update inbound allow, block, or spam decisions from a standard admin workspace."
+        metaAriaLabel="Caller flag screening summary"
+        meta={
+          <>
+            <UiBadge variant={pulseTone === 'warning' ? 'info' : pulseTone === 'neutral' ? 'meta' : pulseTone}>
+              {pulseStatus}
+            </UiBadge>
+            <UiBadge variant="meta">Bot-backed policy</UiBadge>
+            <UiBadge variant="info">{statusLabel(statusFilter)}</UiBadge>
+            <UiBadge variant="meta">{flags.length} loaded</UiBadge>
+          </>
+        }
+        note="Keep inbound screening deliberate: review the current caller posture, then apply allow, block, or spam decisions with the same source of truth used by the bot."
+      />
 
       <UiWorkspacePulse
         title="Caller screening"

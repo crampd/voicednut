@@ -165,7 +165,7 @@ export const DASHBOARD_MODULE_SCREEN_CONTRACTS: Record<DashboardModuleId, {
     capability: 'caller_flags_manage',
   },
   scriptsparity: {
-    label: 'Message Lanes',
+    label: 'Focused Scripts',
     capability: 'caller_flags_manage',
   },
   messaging: {
@@ -301,14 +301,14 @@ export const DASHBOARD_PAGE_WORKFLOW_CONTRACTS: readonly DashboardPageWorkflowCo
   {
     pageId: 'dashboard.module.scriptsparity',
     path: DASHBOARD_MODULE_ROUTE_CONTRACTS.scriptsparity,
-    pageComponent: 'ScriptsParityExpansionPage',
+    pageComponent: 'ScriptStudioPage',
     canonicalCommand: BOT_PRIMARY_COMMANDS.SCRIPTS,
     relatedCommands: [BOT_PRIMARY_COMMANDS.SMS, BOT_PRIMARY_COMMANDS.EMAIL],
     capability: DASHBOARD_MODULE_SCREEN_CONTRACTS.scriptsparity.capability,
     workflowStatus: 'partial',
     fallbackPath: DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT,
     moduleId: 'scriptsparity',
-    notes: 'Maintain SMS scripts and email templates here with review, simulation, promotion, and version recovery, while clone and preview handoff still continue in the broader scripts workflow.',
+    notes: 'Compatibility route that opens the shared Script Designer on the message lanes for focused SMS and email editing.',
   },
   {
     pageId: 'dashboard.module.messaging',
@@ -468,7 +468,7 @@ export const DASHBOARD_MODULE_WORKFLOW_DETAIL_CONTRACTS: Record<
       'Refresh provider readiness through provider.get(channel=email) before large send decisions.',
       'Parse, deduplicate, and surface invalid recipients before queueing.',
       'Preview template variables and render hints before execution.',
-      'Keep template authoring and review in Message Lanes or Script Designer instead of mixing it into bulk-send execution.',
+      'Keep template authoring in Script Designer or its focused message entry instead of mixing it into bulk-send execution.',
     ],
     confirmationRules: [
       'Queue a bulk email job only after audience and content requirements pass.',
@@ -500,7 +500,7 @@ export const DASHBOARD_MODULE_WORKFLOW_DETAIL_CONTRACTS: Record<
       'CSV/TXT audience upload for bulk mailer ownership.',
       'Inline template render preview before queueing.',
       'Deliverability trend monitoring alongside compose flow.',
-      'Direct handoff to Message Lanes and Script Designer for governed email template work.',
+      'Direct handoff to Script Designer and its focused message entry for governed email template work.',
     ],
   },
   content: {
@@ -566,12 +566,12 @@ export const DASHBOARD_MODULE_WORKFLOW_DETAIL_CONTRACTS: Record<
     ],
     validationSteps: [
       'Keep SMS script and email template actions behind caller_flags_manage capability.',
-      'Require explicit selected assets before governance actions such as review, promote, simulate, diff, or rollback.',
-      'Refresh both content lists after create, update, delete, review, promote, or rollback so the operator sees the authoritative result.',
+      'Route message-lane editing through the shared Script Designer instead of a second workflow surface.',
+      'Refresh both content lists after create, update, or delete so the operator sees the authoritative result.',
     ],
     confirmationRules: [
-      'Create, update, delete, review, promote, and rollback actions remain explicit operator-triggered mutations.',
-      'List, version, diff, and simulation requests stay bounded read-only requests.',
+      'Create, update, and delete actions remain explicit operator-triggered mutations.',
+      'List and fetch requests stay bounded operational reads.',
     ],
     executionActions: [
       'smsscript.list',
@@ -579,32 +579,18 @@ export const DASHBOARD_MODULE_WORKFLOW_DETAIL_CONTRACTS: Record<
       'smsscript.create',
       'smsscript.update',
       'smsscript.delete',
-      'smsscript.submit_review',
-      'smsscript.review',
-      'smsscript.promote_live',
-      'smsscript.simulate',
-      'smsscript.versions',
-      'smsscript.diff',
-      'smsscript.rollback',
       'emailtemplate.list',
       'emailtemplate.get',
       'emailtemplate.create',
       'emailtemplate.update',
       'emailtemplate.delete',
-      'emailtemplate.submit_review',
-      'emailtemplate.review',
-      'emailtemplate.promote_live',
-      'emailtemplate.simulate',
-      'emailtemplate.versions',
-      'emailtemplate.diff',
-      'emailtemplate.rollback',
     ],
     successBehavior: [
       'Refresh SMS script and email template lists while preserving the active workspace.',
-      'Keep the currently selected script or template visible after successful updates, reviews, promotions, and rollback actions.',
+      'Keep the currently selected script or template visible after successful updates and deletes.',
     ],
     failureBehavior: [
-      'Preserve draft content, governance notes, simulation variables, and selected assets when content updates fail.',
+      'Preserve draft content and selected assets when content updates fail.',
       'Show request-specific errors inline without clearing the opposing channel workspace.',
     ],
     degradedBehavior: [
@@ -613,10 +599,9 @@ export const DASHBOARD_MODULE_WORKFLOW_DETAIL_CONTRACTS: Record<
     ],
     fallbackPath: DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT,
     productivityEnhancements: [
-      'One workspace for SMS and email content ownership.',
+      'Focused entry into the shared Script Designer for SMS and email content ownership.',
       'Parallel refresh and maintenance of adjacent content families.',
       'Selection-preserving updates that reduce operator context switching between channels.',
-      'Lifecycle review, simulation, and version recovery without leaving the focused message lanes.',
     ],
   },
   messaging: {
@@ -1288,25 +1273,11 @@ export const DASHBOARD_MODULE_ACTION_CONTRACTS = {
     DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_CREATE,
     DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_UPDATE,
     DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_DELETE,
-    DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_SUBMIT_REVIEW,
-    DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_REVIEW,
-    DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_PROMOTE_LIVE,
-    DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_SIMULATE,
-    DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_VERSIONS,
-    DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_DIFF,
-    DASHBOARD_ACTION_CONTRACTS.SMSSCRIPT_ROLLBACK,
     DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_LIST,
     DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_GET,
     DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_CREATE,
     DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_UPDATE,
     DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_DELETE,
-    DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_SUBMIT_REVIEW,
-    DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_REVIEW,
-    DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_PROMOTE_LIVE,
-    DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_SIMULATE,
-    DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_VERSIONS,
-    DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_DIFF,
-    DASHBOARD_ACTION_CONTRACTS.EMAILTEMPLATE_ROLLBACK,
   ],
   messaging: [
     DASHBOARD_ACTION_CONTRACTS.SMS_MESSAGES_RECENT,
@@ -1332,3 +1303,84 @@ export const DASHBOARD_MODULE_ACTION_CONTRACTS = {
 export const DASHBOARD_MODULE_ACTION_IDS = Array.from(new Set(
   Object.values(DASHBOARD_MODULE_ACTION_CONTRACTS).flat(),
 ));
+
+function createParityAssertionError(message: string): Error {
+  return new Error(`[miniapp parity] ${message}`);
+}
+
+function assertUniqueStrings(values: readonly string[], label: string): void {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  values.forEach((value) => {
+    if (seen.has(value)) {
+      duplicates.add(value);
+      return;
+    }
+    seen.add(value);
+  });
+  if (duplicates.size > 0) {
+    throw createParityAssertionError(`${label} contains duplicates: ${Array.from(duplicates).join(', ')}`);
+  }
+}
+
+function assertMiniAppParityContracts(): void {
+  const commandRoutePaths = Object.values(MINIAPP_COMMAND_ROUTE_CONTRACTS);
+  const commandPageContracts = Object.entries(MINIAPP_COMMAND_PAGE_CONTRACTS);
+  const commandActionIds = new Set(Object.keys(MINIAPP_COMMAND_ACTION_CONTRACTS));
+  const dashboardActionIds = new Set(Object.values(DASHBOARD_ACTION_CONTRACTS));
+  const knownRoutePaths = new Set<string>([
+    ...Object.values(DASHBOARD_STATIC_ROUTE_CONTRACTS),
+    ...Object.values(MINIAPP_COMMAND_ROUTE_CONTRACTS),
+    ...Object.values(DASHBOARD_MODULE_ROUTE_CONTRACTS),
+  ]);
+
+  assertUniqueStrings(commandRoutePaths, 'command route paths');
+  assertUniqueStrings(commandPageContracts.map(([, contract]) => contract.path), 'command page paths');
+  assertUniqueStrings(Object.values(DASHBOARD_MODULE_ROUTE_CONTRACTS), 'dashboard module routes');
+  assertUniqueStrings(DASHBOARD_MODULE_ACTION_IDS, 'dashboard module action ids');
+
+  commandPageContracts.forEach(([pageKey, contract]) => {
+    const expectedPath = MINIAPP_COMMAND_ROUTE_CONTRACTS[pageKey as keyof typeof MINIAPP_COMMAND_ROUTE_CONTRACTS];
+    if (!expectedPath) {
+      throw createParityAssertionError(`command page "${pageKey}" is missing a route contract`);
+    }
+    if (contract.path !== expectedPath) {
+      throw createParityAssertionError(
+        `command page "${pageKey}" path mismatch: contract uses "${contract.path}" but route registry uses "${expectedPath}"`,
+      );
+    }
+    if (!Object.values(BOT_PRIMARY_COMMANDS).includes(contract.canonicalCommand)) {
+      throw createParityAssertionError(`command page "${pageKey}" canonical command "${contract.canonicalCommand}" is not registered`);
+    }
+    contract.actionIds.forEach((actionId) => {
+      if (!commandActionIds.has(actionId)) {
+        throw createParityAssertionError(`command page "${pageKey}" references unknown action "${actionId}"`);
+      }
+    });
+  });
+
+  Object.entries(MINIAPP_COMMAND_ACTION_CONTRACTS).forEach(([actionId, contract]) => {
+    if (contract.routePath && !knownRoutePaths.has(contract.routePath)) {
+      throw createParityAssertionError(`command action "${actionId}" points to unknown route "${contract.routePath}"`);
+    }
+  });
+
+  const scriptsLifecycleActionIds = [
+    DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_UPDATE,
+    DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SUBMIT_REVIEW,
+    DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_REVIEW,
+    DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_PROMOTE_LIVE,
+    DASHBOARD_ACTION_CONTRACTS.CALLSCRIPT_SIMULATE,
+  ] as const;
+
+  scriptsLifecycleActionIds.forEach((actionId) => {
+    if (!dashboardActionIds.has(actionId)) {
+      throw createParityAssertionError(`scripts lifecycle action "${actionId}" is missing from dashboard action contracts`);
+    }
+    if (!DASHBOARD_MODULE_ACTION_CONTRACTS.content.includes(actionId)) {
+      throw createParityAssertionError(`scripts lifecycle action "${actionId}" is not exposed through the content module`);
+    }
+  });
+}
+
+assertMiniAppParityContracts();

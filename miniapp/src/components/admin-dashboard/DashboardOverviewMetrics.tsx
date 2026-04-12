@@ -18,8 +18,8 @@ export function DashboardOverviewMetrics({
   return (
     <section aria-label="Overview status">
       <UiWorkspacePulse
-        title="Live status"
-        description="Core delivery, incident, and queue posture across the app."
+        title="System posture"
+        description="Delivery health, recovery posture, and queue load across the active control surface."
         status={isDashboardDegraded ? 'Attention needed' : 'Healthy'}
         tone={isDashboardDegraded ? 'warning' : 'success'}
         items={[

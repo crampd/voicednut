@@ -49,7 +49,12 @@ type DashboardViewStageProps = {
   groupedVisibleModules: DashboardWorkspaceLauncherGroup[];
   moduleShortcutIndexById: Record<string, number>;
   activeModule: DashboardModule;
+  pinnedModules: DashboardModule[];
+  recentModules: DashboardModule[];
   onSelectModule: (moduleId: DashboardModule) => void;
+  onTogglePinnedModule: (moduleId: DashboardModule) => void;
+  onOpenSettings: () => void;
+  onRefreshDashboard: () => void;
   moduleVm: DashboardVm;
   hasCapability: (capability: string) => boolean;
   moduleErrorBoundariesEnabled: boolean;
@@ -94,7 +99,12 @@ export function DashboardViewStage({
   groupedVisibleModules,
   moduleShortcutIndexById,
   activeModule,
+  pinnedModules,
+  recentModules,
   onSelectModule,
+  onTogglePinnedModule,
+  onOpenSettings,
+  onRefreshDashboard,
   moduleVm,
   hasCapability,
   moduleErrorBoundariesEnabled,
@@ -179,6 +189,8 @@ export function DashboardViewStage({
             />
             {visibleModulesCount === 0 ? (
               <EmptyModulesCard
+                sessionRole={sessionRole}
+                lastSuccessfulPollLabel={lastSuccessfulPollLabel}
                 onRefreshAccess={onRefreshAccess}
                 refreshDisabled={loading || busy}
               />
@@ -190,7 +202,13 @@ export function DashboardViewStage({
                 groupedVisibleModules={groupedVisibleModules}
                 moduleShortcutIndexById={moduleShortcutIndexById}
                 activeModule={activeModule}
+                pinnedModules={pinnedModules}
+                recentModules={recentModules}
+                sessionRole={sessionRole}
                 onSelectModule={onSelectModule}
+                onTogglePinnedModule={onTogglePinnedModule}
+                onOpenSettings={onOpenSettings}
+                onRefreshDashboard={onRefreshDashboard}
               />
             ) : null}
             <DashboardShellOwnershipCard
@@ -204,6 +222,8 @@ export function DashboardViewStage({
           <>
             {visibleModulesCount === 0 ? (
               <EmptyModulesCard
+                sessionRole={sessionRole}
+                lastSuccessfulPollLabel={lastSuccessfulPollLabel}
                 onRefreshAccess={onRefreshAccess}
                 refreshDisabled={loading || busy}
               />

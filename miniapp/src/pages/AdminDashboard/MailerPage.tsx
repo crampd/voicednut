@@ -6,6 +6,7 @@ import { moduleRoutePath } from './dashboardShellConfig';
 import type { DashboardVm, EmailJob } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectMailerPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
 import { LoadingTelemetryCard } from '@/components/admin-dashboard/DashboardStateCards';
 import {
@@ -177,25 +178,23 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Messaging</p>
-        <h2 className="va-page-title">Mailer</h2>
-        <p className="va-muted">
-          Run the bulk-email lane from one place: readiness, queueing, job status, history, and 24-hour delivery posture.
-        </p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={pulseTone === 'error' ? 'error' : pulseTone === 'warning' ? 'warning' : pulseTone === 'info' ? 'info' : 'success'}>
-            {pulseStatus}
-          </UiBadge>
-          <UiBadge variant="meta">Bulk email lane</UiBadge>
-          <UiBadge variant={domainHealthNeedsAttention ? 'warning' : 'info'}>
-            Domain {domainHealthStatusLabel}
-          </UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Keep campaign execution here, refresh readiness before queueing, and hand off governed template editing to the dedicated script workspaces.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Messaging"
+        title="Mailer"
+        summary="Run the bulk-email lane from one place: readiness, queueing, job status, history, and 24-hour delivery posture."
+        meta={
+          <>
+            <UiBadge variant={pulseTone === 'error' ? 'error' : pulseTone === 'warning' ? 'warning' : pulseTone === 'info' ? 'info' : 'success'}>
+              {pulseStatus}
+            </UiBadge>
+            <UiBadge variant="meta">Bulk email lane</UiBadge>
+            <UiBadge variant={domainHealthNeedsAttention ? 'warning' : 'info'}>
+              Domain {domainHealthStatusLabel}
+            </UiBadge>
+          </>
+        }
+        note="Keep campaign execution here, refresh readiness before queueing, and hand off governed template editing to the dedicated script workspaces."
+      />
 
       <UiWorkspacePulse
         title="Bulk email workspace"
@@ -219,7 +218,7 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
       <section className="va-section-block">
         <header className="va-section-header">
           <h3 className="va-section-title">Operational Checks</h3>
-          <p className="va-muted">Refresh readiness, inspect 24-hour bulk performance, and jump into the template workspaces when needed.</p>
+            <p className="va-muted">Refresh readiness, inspect 24-hour bulk performance, and jump into the shared template designer when needed.</p>
         </header>
         <section className="va-grid">
           <UiCard>
@@ -319,13 +318,13 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
             <div className="va-ops-card-header">
               <div className="va-ops-card-headline">
                 <h3>Template Handoff</h3>
-                <p className="va-muted">Keep bulk sending operational here while governed authoring and review stay in the script workspaces.</p>
+                <p className="va-muted">Keep bulk sending operational here while governed authoring stays in the shared script designer.</p>
               </div>
               <UiBadge variant="meta">Linked workspaces</UiBadge>
             </div>
             <UiActionBar
               title="Keep bulk delivery here and editing there"
-              description="Reviewed template authoring stays in the dedicated editing pages, not in the bulk-send console."
+              description="Template authoring stays in Script Designer; this console remains focused on delivery operations."
               actions={(
                 <>
                   <UiButton
@@ -333,7 +332,7 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
                     disabled={controlsBusy}
                     onClick={() => openMailerLinkedWorkspace('scriptsparity')}
                   >
-                    Open Message Lanes
+                    Open Focused Message Entry
                   </UiButton>
                   <UiButton
                     variant="secondary"
@@ -346,10 +345,10 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
               )}
             />
             <p className="va-muted">
-              Use Message Lanes for email template review, promotion, simulation, and rollback.
+              Use the focused message entry when you want Script Designer to open directly on SMS and email editing lanes.
             </p>
             <p className="va-muted">
-              Use Script Designer when you need the combined call, SMS, and email editing model from the main bot workflow.
+              Use Script Designer when you need the full combined call, SMS, and email editing model from the main bot workflow.
             </p>
           </UiCard>
         </section>
@@ -420,7 +419,7 @@ export function MailerPage({ visible, vm }: MailerPageProps) {
               />
             </div>
             <p className="va-field-hint">
-              Use a reviewed template ID from Message Lanes when this batch should run a governed email template.
+              Use a reviewed template ID from Script Designer when this batch should run a governed email template.
             </p>
             <p className="va-card-eyebrow">Content</p>
             <UiInput

@@ -5,13 +5,11 @@ import {
   Cell,
   List,
   Navigation,
-  Placeholder,
   Section,
 } from '@telegram-apps/telegram-ui';
 
 import '@/pages/AdminDashboard/AdminDashboardPage.css';
 import { Link } from '@/components/Link/Link.tsx';
-import { Page } from '@/components/Page.tsx';
 import {
   DASHBOARD_ACTION_CONTRACTS,
   DASHBOARD_STATIC_ROUTE_CONTRACTS,
@@ -30,6 +28,7 @@ import {
   UiMetricTile,
   UiSelect,
   UiStatePanel,
+  UiWorkspacePulse,
   UiTextarea,
 } from '@/components/ui/AdminPrimitives';
 import {
@@ -40,7 +39,6 @@ import {
   toInt,
   toText,
 } from '@/services/admin-dashboard/dashboardPrimitives';
-import { resolveDashboardAction } from '@/services/admin-dashboard/dashboardActionGuards';
 
 import {
   SMS_CALLBACK_PARITY_ROWS,
@@ -49,6 +47,7 @@ import {
   describeAccessLevel,
   parseCallbackToken,
   renderQuickActionCell,
+  resolveCommandCallbackAction,
   resolveCallbackActionLabel,
   resolveCommandPageLoadingCopy,
   resolveCommandPageTitle,
@@ -61,6 +60,11 @@ import {
   toJsonText,
   toTextList,
 } from './CommandPages.tsx';
+import {
+  CommandPageLayout,
+  CommandPageLoadingState,
+  CommandPageRestrictedState,
+} from './CommandPageScaffold.tsx';
 
 type SmsCommandMessageStatusResponse = {
   success?: boolean;
@@ -438,9 +442,9 @@ function SmsCommandPageContent() {
       setCallbackResult('');
       return;
     }
-    const actionResolution = resolveDashboardAction(rawCallbackAction);
-    if (!actionResolution.actionId || !actionResolution.supported) {
-      setActionError(`${actionLabel} is not active for this session. Refresh session data or continue in Admin Console.`);
+    const actionResolution = resolveCommandCallbackAction(rawCallbackAction);
+    if (!actionResolution.supported) {
+      setActionError(actionResolution.error);
       setCallbackResult('');
       return;
     }
@@ -699,19 +703,38 @@ function SmsCommandPageContent() {
 
   if (loading) {
     return (
-      <Page back>
-        <Placeholder
-          header={pageTitle}
-          description={resolveCommandPageLoadingCopy(pageTitle)}
-        />
-      </Page>
+      <CommandPageLoadingState
+        title={pageTitle}
+        summary={resolveCommandPageLoadingCopy(pageTitle)}
+        note={contract.notes}
+      />
     );
   }
 
   return (
-    <Page back>
+    <CommandPageLayout
+      eyebrow="Messaging workspace"
+      title={pageTitle}
+      summary={contract.summary}
+      meta={<UiBadge variant={canOperate ? 'success' : 'warning'}>{describeAccessLevel(accessLevel)}</UiBadge>}
+      metaAriaLabel={`${pageTitle} workspace access`}
+      note={contract.notes}
+      pulse={(
+        <UiWorkspacePulse
+          title="Workspace pulse"
+          description="Compose, inspect, and route SMS workflows from one focused surface while preserving the same Mini App access rules and backend action contracts."
+          tone={error ? 'warning' : (actionReadyCount > 0 || sendResult ? 'success' : 'info')}
+          status={error ? 'Needs attention' : (actionReadyCount > 0 || sendResult ? 'Active' : 'Ready')}
+          items={[
+            { label: 'Access', value: describeAccessLevel(accessLevel) },
+            { label: 'Composer', value: smsComposerReady ? 'Ready' : 'Needs input' },
+            { label: 'Diagnostics', value: actionReadyCount > 0 ? `${actionReadyCount} loaded` : 'Idle' },
+          ]}
+        />
+      )}
+    >
       <List>
-        <Section header={pageTitle} footer={contract.notes}>
+        <Section header="Session status" footer="This command page stays wired to the same SMS routes, action contracts, and role gating enforced across the rest of the Mini App.">
           <Cell subtitle={contract.summary}>
             {describeAccessLevel(accessLevel)}
           </Cell>
@@ -732,16 +755,14 @@ function SmsCommandPageContent() {
         </Section>
 
         {!canOperate ? (
-          <Section
-            header="Access required"
-            footer="SMS execution is restricted to authorized users. The Mini App enforces the same rule."
-          >
-            <UiStatePanel
-              title="Authorized access required"
-              description="Request access from an admin or use Help Center, Usage Guide, or Quick Actions to review available workflows."
-              tone="warning"
-            />
-          </Section>
+          <CommandPageRestrictedState
+            title={pageTitle}
+            summary={contract.summary}
+            note={contract.notes}
+            accessLevel={accessLevel}
+            requiredAccess="authorized"
+            stateDescription="Request access from an admin or continue with Help Center, Quick Actions, or the admin console while SMS execution remains locked."
+          />
         ) : (
           <Section
             header="SMS workspace"
@@ -1375,7 +1396,7 @@ function SmsCommandPageContent() {
           </Link>
         </Section>
       </List>
-    </Page>
+    </CommandPageLayout>
   );
 }
 

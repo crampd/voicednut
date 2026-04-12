@@ -1,4 +1,4 @@
-import { lazy, type JSX, type LazyExoticComponent } from 'react';
+import { lazy, type ComponentType, type JSX, type LazyExoticComponent } from 'react';
 
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { ModuleErrorFallbackCard } from '@/components/admin-dashboard/DashboardStateCards';
@@ -9,6 +9,8 @@ type ModulePageProps = {
   visible: boolean;
   vm: DashboardVm;
 };
+
+type ModulePageComponent = ComponentType<ModulePageProps>;
 
 type ModuleMetadata = {
   label: string;
@@ -51,10 +53,6 @@ const CallerFlagsModerationPage = lazy(async () => {
   const mod = await import('@/pages/AdminDashboard/CallerFlagsModerationPage');
   return { default: mod.CallerFlagsModerationPage };
 });
-const ScriptsParityExpansionPage = lazy(async () => {
-  const mod = await import('@/pages/AdminDashboard/ScriptsParityExpansionPage');
-  return { default: mod.ScriptsParityExpansionPage };
-});
 const MessagingInvestigationPage = lazy(async () => {
   const mod = await import('@/pages/AdminDashboard/MessagingInvestigationPage');
   return { default: mod.MessagingInvestigationPage };
@@ -72,7 +70,11 @@ const AuditIncidentsPage = lazy(async () => {
   return { default: mod.AuditIncidentsPage };
 });
 
-const MODULE_COMPONENTS: Record<DashboardModule, LazyExoticComponent<(props: ModulePageProps) => JSX.Element | null>> = {
+const FocusedScriptsEntry: ModulePageComponent = (props) => (
+  <ScriptStudioPage {...props} initialLane="sms" />
+);
+
+const MODULE_COMPONENTS: Record<DashboardModule, LazyExoticComponent<ModulePageComponent> | ModulePageComponent> = {
   ops: OpsDashboardPage,
   sms: SmsSenderPage,
   mailer: MailerPage,
@@ -80,7 +82,7 @@ const MODULE_COMPONENTS: Record<DashboardModule, LazyExoticComponent<(props: Mod
   content: ScriptStudioPage,
   calllog: CallLogExplorerPage,
   callerflags: CallerFlagsModerationPage,
-  scriptsparity: ScriptsParityExpansionPage,
+  scriptsparity: FocusedScriptsEntry,
   messaging: MessagingInvestigationPage,
   persona: PersonaManagerPage,
   users: UsersRolePage,

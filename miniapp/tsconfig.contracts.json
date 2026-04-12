@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": false,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": false,
+    "outDir": "./.tmp-contract-check",
+    "rootDir": ".",
+    "tsBuildInfoFile": "./.tmp-contract-check/tsconfig.contracts.tsbuildinfo",
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "scripts/validate-miniapp-contracts.ts",
+    "src/contracts/commandPageCatalog.ts",
+    "src/contracts/miniappParityContracts.ts"
+  ]
+}

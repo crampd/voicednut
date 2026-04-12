@@ -11,6 +11,7 @@ import type {
 } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectOpsPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
 import {
   UiBadge,
@@ -228,22 +229,19 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Operations</p>
-        <h2 className="va-page-title">Control Plane Dashboard</h2>
-        <p className="va-muted">
-          Reliability, runtime controls, and recovery signals for calls, SMS, and email.
-        </p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={opsPulseTone}>{opsPulseStatus}</UiBadge>
-          <UiBadge variant="meta">Runtime control</UiBadge>
-          <UiBadge variant="info">{queueBacklogTotal} backlog</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Use this surface to confirm live sync posture, review queue pressure, and steer runtime
-          recovery before operators move into channel-specific workflows.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Operations"
+        title="Control Plane Dashboard"
+        summary="Reliability, runtime controls, and recovery signals for calls, SMS, and email."
+        meta={
+          <>
+            <UiBadge variant={opsPulseTone}>{opsPulseStatus}</UiBadge>
+            <UiBadge variant="meta">Runtime control</UiBadge>
+            <UiBadge variant="info">{queueBacklogTotal} backlog</UiBadge>
+          </>
+        }
+        note="Use this surface to confirm live sync posture, review queue pressure, and steer runtime recovery before operators move into channel-specific workflows."
+      />
 
       <UiWorkspacePulse
         title="Operations workspace"

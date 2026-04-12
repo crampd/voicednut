@@ -4,6 +4,7 @@ import { buildModuleRequestState } from './moduleRequestState';
 import type { DashboardVm } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectSmsPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
 import {
   UiActionBar,
@@ -183,23 +184,19 @@ export function MessagingInvestigationPage({ visible, vm }: MessagingInvestigati
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Messaging</p>
-        <h2 className="va-page-title">Messaging Investigation</h2>
-        <p className="va-muted">
-          Unified delivery investigation for the bot-backed SMS and email workflows, including status,
-          conversations, recent activity, job history, and channel health snapshots.
-        </p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={pulseTone}>{pulseStatus}</UiBadge>
-          <UiBadge variant="meta">Cross-channel delivery</UiBadge>
-          <UiBadge variant="info">{activeFilterCount} active filters</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Use one operational surface to inspect SMS delivery, email jobs, recent artifacts, and
-          message history before escalating to the broader admin workflow.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Messaging"
+        title="Messaging Investigation"
+        summary="Unified delivery investigation for the bot-backed SMS and email workflows, including status, conversations, recent activity, job history, and channel health snapshots."
+        meta={
+          <>
+            <UiBadge variant={pulseTone}>{pulseStatus}</UiBadge>
+            <UiBadge variant="meta">Cross-channel delivery</UiBadge>
+            <UiBadge variant="info">{activeFilterCount} active filters</UiBadge>
+          </>
+        }
+        note="Use one operational surface to inspect SMS delivery, email jobs, recent artifacts, and message history before escalating to the broader admin workflow."
+      />
 
       <UiWorkspacePulse
         title="Delivery investigation"

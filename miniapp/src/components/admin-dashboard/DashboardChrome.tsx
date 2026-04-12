@@ -1,5 +1,10 @@
 import { UiButton } from '@/components/ui/AdminPrimitives';
 import { DashboardAvatar } from '@/components/admin-dashboard/DashboardAvatar';
+import {
+  describeSessionIdentityLabel,
+  describeSessionRole,
+  describeSessionSource,
+} from '@/contracts/miniappAccessExperience';
 
 type ModuleItem = {
   id: string;
@@ -109,14 +114,17 @@ export function DashboardMainHeader({
 }: DashboardMainHeaderProps) {
   const posture = resolveHeaderPosture(sessionRole);
   const normalizedRoleSource = sessionRoleSource.replace(/_/g, ' ');
+  const sessionIdentityLabel = describeSessionIdentityLabel(sessionRole);
+  const sessionAccessLabel = describeSessionRole(sessionRole);
+  const sessionSourceLabel = describeSessionSource(sessionRole, sessionRoleSource);
   const flagsLabel = typeof featureFlagsCount === 'number'
     ? `${featureFlagsCount} active`
     : String(featureFlagsCount);
 
   return (
-    <header className={`va-header${compact ? ' is-compact' : ''}`}>
-      <div className="va-header-primary">
-        <div className="va-header-avatar-shell">
+    <header className={`va-title-card va-header${compact ? ' is-compact' : ''}`}>
+      <div className="va-title-card-head va-header-primary">
+        <div className="va-title-card-avatar-shell va-header-avatar-shell">
           <DashboardProfileAvatarButton
             userLabel={userLabel}
             userAvatarUrl={userAvatarUrl}
@@ -126,18 +134,18 @@ export function DashboardMainHeader({
             onOpenSettings={onOpenSettings}
           />
         </div>
-        <div className="va-header-copy">
-          <div className="va-header-eyebrow-row">
-            <p className="va-header-eyebrow">Telegram operations workspace</p>
-            <span className="va-header-brand-chip">Mini App</span>
+        <div className="va-title-card-copy va-header-copy">
+          <div className="va-title-card-eyebrow-row va-header-eyebrow-row">
+            <p className="va-title-card-eyebrow va-header-eyebrow">Telegram operations workspace</p>
+            <span className="va-title-card-chip va-header-brand-chip">Mini App</span>
           </div>
-          <div className="va-header-title-row">
-            <h1>VOICEDNUT</h1>
-            <span className={`va-header-posture is-${posture.tone}`}>{posture.label}</span>
+          <div className="va-title-card-title-row va-header-title-row">
+            <h1 className="va-title-card-title">VOICEDNUT</h1>
+            <span className={`va-title-card-chip va-header-posture is-${posture.tone}`}>{posture.label}</span>
           </div>
-          <p className="va-header-subtitle">Operations command center</p>
-          <div className="va-header-story">
-            <p className="va-header-lead">
+          <p className="va-title-card-subtitle va-header-subtitle">Operations command center</p>
+          <div className="va-title-card-story va-header-story">
+            <p className="va-title-card-note va-header-lead">
               One professional workspace for delivery, calling, provider health, and incident response.
             </p>
             <p className="va-module-context-line va-muted">
@@ -147,22 +155,22 @@ export function DashboardMainHeader({
           </div>
         </div>
       </div>
-      <div className="va-header-meta">
-        <div className="va-header-signal-card">
-          <span className="va-header-signal-label">Operator</span>
+      <div className="va-title-card-meta va-header-meta">
+        <div className="va-title-card-stat va-header-signal-card">
+          <span className="va-title-card-stat-label va-header-signal-label">{sessionIdentityLabel}</span>
           <strong>{userLabel}</strong>
-          <span className="va-header-signal-note">Signed in for live workflow coverage</span>
+          <span className="va-title-card-note va-header-signal-note">{sessionSourceLabel}</span>
         </div>
-        <div className="va-header-signal-grid">
-          <div className="va-header-signal-card">
-            <span className="va-header-signal-label">Access</span>
-            <strong>Role {sessionRole}</strong>
-            <span className="va-header-signal-note">Source {normalizedRoleSource}</span>
+        <div className="va-title-card-stat-grid va-header-signal-grid">
+          <div className="va-title-card-stat va-header-signal-card">
+            <span className="va-title-card-stat-label va-header-signal-label">Access</span>
+            <strong>{sessionAccessLabel}</strong>
+            <span className="va-title-card-note va-header-signal-note">Source {normalizedRoleSource}</span>
           </div>
-          <div className="va-header-signal-card">
-            <span className="va-header-signal-label">Workspace</span>
+          <div className="va-title-card-stat va-header-signal-card">
+            <span className="va-title-card-stat-label va-header-signal-label">Workspace</span>
             <strong>{settingsStatusLabel}</strong>
-            <span className="va-header-signal-note">Feature flags {flagsLabel}</span>
+            <span className="va-title-card-note va-header-signal-note">Feature flags {flagsLabel}</span>
           </div>
         </div>
       </div>
@@ -206,21 +214,21 @@ export function DashboardFocusedHeader({
   onOpenSettings,
 }: DashboardFocusedHeaderProps) {
   return (
-    <header className="va-focused-header">
-      <div className="va-focused-main">
-        <div className="va-focused-copy">
-          <div className="va-focused-eyebrow-row">
-            <p className="va-focused-eyebrow">Focused workspace</p>
-            <span className="va-focused-chip">Live module</span>
+    <header className="va-title-card va-focused-header">
+      <div className="va-title-card-head va-focused-main">
+        <div className="va-title-card-copy va-focused-copy">
+          <div className="va-title-card-eyebrow-row va-focused-eyebrow-row">
+            <p className="va-title-card-eyebrow va-focused-eyebrow">Focused workspace</p>
+            <span className="va-title-card-chip va-focused-chip">Live module</span>
           </div>
-          <h2 className="va-page-title">{title}</h2>
-          <p className="va-focused-subtitle">Operations workspace</p>
-          <div className="va-focused-story">
-            <p className="va-muted">{subtitle}</p>
+          <h2 className="va-page-title va-title-card-title">{title}</h2>
+          <p className="va-title-card-subtitle va-focused-subtitle">Operations workspace</p>
+          <div className="va-title-card-story va-focused-story">
+            <p className="va-muted va-title-card-note">{subtitle}</p>
           </div>
         </div>
       </div>
-      <div className="va-focused-actions">
+      <div className="va-title-card-actions va-focused-actions">
         <DashboardProfileAvatarButton
           userLabel={title}
           userAvatarUrl={userAvatarUrl}

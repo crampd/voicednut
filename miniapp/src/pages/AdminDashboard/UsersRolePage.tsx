@@ -4,6 +4,7 @@ import type { DashboardVm, UserRow } from './types';
 import { selectUsersRolePageVm } from './vmSelectors';
 import { selectUsersRowsMemoized, type UserRoleFilter } from './tableSelectors';
 import { downloadCsv } from './csvExport';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import {
   UiBadge,
   UiButton,
@@ -297,20 +298,19 @@ export function UsersRolePage({ visible, vm }: UsersRolePageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">User Directory</p>
-        <h2 className="va-page-title">Users &amp; Roles</h2>
-        <p className="va-muted">Review the bot-backed roster, confirm audit reasons, and manage access changes without drifting from the main bot workflow.</p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={usersSummaryTone}>{usersSummaryStatus}</UiBadge>
-          <UiBadge variant="meta">Bot-backed roster</UiBadge>
-          <UiBadge variant="info">{roleFilterLabel(roleFilter)}</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Access changes stay audited here, while username-based add and remove flows continue in the
-          main bot until they are exposed safely in this workspace.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="User Directory"
+        title="Users & Roles"
+        summary="Review the bot-backed roster, confirm audit reasons, and manage access changes without drifting from the main bot workflow."
+        meta={
+          <>
+            <UiBadge variant={usersSummaryTone}>{usersSummaryStatus}</UiBadge>
+            <UiBadge variant="meta">Bot-backed roster</UiBadge>
+            <UiBadge variant="info">{roleFilterLabel(roleFilter)}</UiBadge>
+          </>
+        }
+        note="Access changes stay audited here, while username-based add and remove flows continue in the main bot until they are exposed safely in this workspace."
+      />
 
       <UiWorkspacePulse
         title="User access"

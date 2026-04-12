@@ -4,6 +4,7 @@ import { buildModuleRequestState } from './moduleRequestState';
 import type { DashboardVm } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectScriptStudioPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
 import {
   UiBadge,
@@ -71,23 +72,19 @@ export function PersonaManagerPage({ visible, vm }: PersonaManagerPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Persona Policy</p>
-        <h2 className="va-page-title">Persona Manager</h2>
-        <p className="va-muted">
-          Review the admin persona registry mirrored from the bot flow before it is used by call
-          scripts, agents, and messaging lanes.
-        </p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={pulseTone === 'neutral' ? 'meta' : pulseTone}>{pulseStatus}</UiBadge>
-          <UiBadge variant="meta">Persona registry</UiBadge>
-          <UiBadge variant="info">{builtin.length + custom.length} profiles</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Use this surface to verify persona coverage and policy posture before operators apply the
-          registry in calls, scripts, or messaging flows.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Persona Policy"
+        title="Persona Manager"
+        summary="Review the admin persona registry mirrored from the bot flow before it is used by call scripts, agents, and messaging lanes."
+        meta={
+          <>
+            <UiBadge variant={pulseTone === 'neutral' ? 'meta' : pulseTone}>{pulseStatus}</UiBadge>
+            <UiBadge variant="meta">Persona registry</UiBadge>
+            <UiBadge variant="info">{builtin.length + custom.length} profiles</UiBadge>
+          </>
+        }
+        note="Use this surface to verify persona coverage and policy posture before operators apply the registry in calls, scripts, or messaging flows."
+      />
 
       <UiWorkspacePulse
         title="Persona registry"

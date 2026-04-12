@@ -1,5 +1,8 @@
+import type { CSSProperties } from 'react';
+
 import { Link } from '@/components/Link/Link.tsx';
 import { UiSurfaceState, UiWorkspacePulse } from '@/components/ui/AdminPrimitives';
+import { HOME_ACCESS_COPY, resolveCommandAccessSummary } from '@/contracts/miniappAccessExperience';
 import {
   DASHBOARD_STATIC_ROUTE_CONTRACTS,
   type DashboardModuleId,
@@ -46,6 +49,29 @@ type ContinueItem = {
   detail: string;
   value: string;
   to: string;
+  moduleId: DashboardModuleId;
+};
+
+type FocusRailItem = {
+  id: string;
+  title: string;
+  detail: string;
+  meta: string;
+  to: string;
+  eyebrow: string;
+  actionLabel: string;
+  moduleId?: DashboardModuleId;
+};
+
+type TaskPreset = {
+  id: string;
+  title: string;
+  detail: string;
+  signal: string;
+  kicker: string;
+  to: string;
+  actionLabel: string;
+  moduleId?: DashboardModuleId;
 };
 
 type RoleKey = 'admin' | 'operator' | 'viewer';
@@ -98,8 +124,8 @@ const HOME_ACTION_COPY: Partial<Record<DashboardModuleId, HomeActionCopy>> = {
     description: 'Switch between call, SMS, and email script editing from one workspace.',
   },
   scriptsparity: {
-    title: 'Message lanes',
-    description: 'Open a narrower SMS and email editor without leaving the scripts model.',
+    title: 'Focused scripts',
+    description: 'Open Script Designer directly on the SMS and email lanes.',
   },
   callerflags: {
     title: 'Caller flags',
@@ -308,6 +334,7 @@ function buildContinueItems(
       detail,
       value: status,
       to: moduleRoutePath(openIncidentCount > 0 ? 'audit' : 'ops'),
+      moduleId: openIncidentCount > 0 ? 'audit' : 'ops',
     });
   }
 
@@ -319,6 +346,7 @@ function buildContinueItems(
       detail: recentActivity.detail,
       value: formatTime(recentActivity.at),
       to: moduleRoutePath('ops'),
+      moduleId: 'ops',
     });
   }
 
@@ -333,6 +361,7 @@ function buildContinueItems(
       detail: `${toText(recentEmailJob.status, 'Queued')} • ${sent}/${total || sent} sent • ${failed} failed`,
       value: formatTime(recentEmailJob.updated_at || recentEmailJob.created_at),
       to: moduleRoutePath('mailer'),
+      moduleId: 'mailer',
     });
   }
 
@@ -349,10 +378,134 @@ function buildContinueItems(
       detail: `${phone} • ${status}`,
       value: formatTime(recentCall.updated_at || recentCall.created_at),
       to: moduleRoutePath('calllog'),
+      moduleId: 'calllog',
     });
   }
 
   return items.slice(0, 3);
+}
+
+function buildTaskPresets(args: {
+  roleKey: RoleKey;
+  visibleModuleIdSet: Set<DashboardModuleId>;
+  openIncidentCount: number;
+  queueBacklogTotal: number;
+  emailJobs: EmailJob[];
+  callLogs: CallLogRow[];
+  continueItems: ContinueItem[];
+}): TaskPreset[] {
+  const {
+    roleKey,
+    visibleModuleIdSet,
+    openIncidentCount,
+    queueBacklogTotal,
+    emailJobs,
+    callLogs,
+    continueItems,
+  } = args;
+  const presets: TaskPreset[] = [];
+  const addPreset = (preset: TaskPreset | null) => {
+    if (!preset || presets.some((item) => item.id === preset.id)) {
+      return;
+    }
+    presets.push(preset);
+  };
+
+  if (openIncidentCount > 0 && visibleModuleIdSet.has('audit')) {
+    addPreset({
+      id: 'preset-incidents',
+      title: openIncidentCount > 1 ? 'Stabilize active incidents' : 'Resolve the active incident',
+      detail: 'Open runbooks, escalation history, and recent operator activity from the audit lane.',
+      signal: `${openIncidentCount} open`,
+      kicker: 'Priority task',
+      to: moduleRoutePath('audit'),
+      actionLabel: 'Open audit',
+      moduleId: 'audit',
+    });
+  }
+
+  if (queueBacklogTotal > 0 && visibleModuleIdSet.has('ops')) {
+    addPreset({
+      id: 'preset-backlog',
+      title: 'Reduce queue pressure',
+      detail: 'Check runtime posture and queued work before launching more sends or calls.',
+      signal: `${queueBacklogTotal} queued`,
+      kicker: 'Operations',
+      to: moduleRoutePath('ops'),
+      actionLabel: 'Review ops',
+      moduleId: 'ops',
+    });
+  }
+
+  if (emailJobs[0] && visibleModuleIdSet.has('mailer')) {
+    addPreset({
+      id: 'preset-mailer',
+      title: 'Check delivery health',
+      detail: 'Inspect the latest email send, retry posture, and failure counts in one pass.',
+      signal: formatTime(emailJobs[0].updated_at || emailJobs[0].created_at),
+      kicker: 'Delivery watch',
+      to: moduleRoutePath('mailer'),
+      actionLabel: 'Open mailer',
+      moduleId: 'mailer',
+    });
+  }
+
+  if (callLogs[0] && visibleModuleIdSet.has('calllog')) {
+    addPreset({
+      id: 'preset-calls',
+      title: 'Review recent calls',
+      detail: 'Resume follow-up from the latest call outcomes and timeline updates.',
+      signal: formatTime(callLogs[0].updated_at || callLogs[0].created_at),
+      kicker: 'Follow-up',
+      to: moduleRoutePath('calllog'),
+      actionLabel: 'Open calls',
+      moduleId: 'calllog',
+    });
+  }
+
+  if (roleKey === 'admin' && visibleModuleIdSet.has('users')) {
+    addPreset({
+      id: 'preset-access',
+      title: 'Adjust access and roles',
+      detail: 'Handle operator visibility, provisioning, and permission changes without leaving home.',
+      signal: 'Admin only',
+      kicker: 'Access control',
+      to: moduleRoutePath('users'),
+      actionLabel: 'Open users',
+      moduleId: 'users',
+    });
+  }
+
+  if (presets.length === 0 && continueItems[0]) {
+    addPreset({
+      id: 'preset-resume',
+      title: continueItems[0].title,
+      detail: continueItems[0].detail,
+      signal: continueItems[0].value,
+      kicker: 'Resume work',
+      to: continueItems[0].to,
+      actionLabel: 'Continue',
+      moduleId: continueItems[0].moduleId,
+    });
+  }
+
+  if (presets.length === 0) {
+    addPreset({
+      id: 'preset-guide',
+      title: roleKey === 'viewer' ? 'Review the guided start' : 'Start from the operator guide',
+      detail: roleKey === 'viewer'
+        ? 'Use the browse-safe guide to understand which workflows unlock after approval.'
+        : 'Use the guided routes to pick the fastest next workflow for this session.',
+      signal: roleKey === 'viewer' ? 'Browse-safe' : 'Guided',
+      kicker: roleKey === 'viewer' ? 'Preview' : 'Setup',
+      to: roleKey === 'viewer'
+        ? MINIAPP_COMMAND_ROUTE_CONTRACTS.START
+        : MINIAPP_COMMAND_ROUTE_CONTRACTS.GUIDE,
+      actionLabel: roleKey === 'viewer' ? 'Review start' : 'Open guide',
+    });
+  }
+
+  return presets.slice(0, 3);
 }
 
 export function DashboardHomeBriefing({
@@ -404,7 +557,105 @@ export function DashboardHomeBriefing({
     incidentRows,
     openIncidentCount,
   );
+  const taskPresets = buildTaskPresets({
+    roleKey,
+    visibleModuleIdSet,
+    openIncidentCount,
+    queueBacklogTotal,
+    emailJobs,
+    callLogs,
+    continueItems,
+  });
   const homeTone: 'warning' | 'success' = openIncidentCount > 0 ? 'warning' : 'success';
+  const {
+    commandAccessLevel,
+    readyCommandPages,
+    lockedCommandPages,
+    nextUnlockLabel,
+  } = resolveCommandAccessSummary(sessionRole);
+  const accessStripCopy = HOME_ACCESS_COPY[commandAccessLevel];
+  const highlightedActions = resolvedPrimaryActions.slice(0, 3);
+  const resumeItem = continueItems[0];
+  const fallbackLaunchAction = resolvedPrimaryActions[0];
+  const launchAction = resolvedPrimaryActions.find((action) => action.id !== fallbackLaunchAction?.id)
+    || fallbackLaunchAction;
+  const watchItem: FocusRailItem = openIncidentCount > 0
+    ? {
+        id: 'watch-incidents',
+        title: openIncidentCount > 1 ? `${openIncidentCount} incidents open` : 'Incident watch',
+        detail: 'Runbooks and escalation history are ready from the audit workspace.',
+        meta: openIncidentCount > 1 ? 'Priority watch' : 'Needs review',
+        to: moduleRoutePath('audit'),
+        eyebrow: 'Watch',
+        actionLabel: 'Inspect',
+        moduleId: 'audit',
+      }
+    : queueBacklogTotal > 0
+      ? {
+          id: 'watch-backlog',
+          title: `${queueBacklogTotal} queued items waiting`,
+          detail: 'Review queue pressure and service posture before launching more work.',
+          meta: 'Backlog watch',
+          to: moduleRoutePath('ops'),
+          eyebrow: 'Watch',
+          actionLabel: 'Review',
+          moduleId: 'ops',
+        }
+      : emailJobs[0]
+        ? {
+            id: 'watch-mailer',
+            title: 'Mailer delivery watch',
+            detail: 'Recent email activity is available with send, failure, and retry context.',
+            meta: formatTime(emailJobs[0].updated_at || emailJobs[0].created_at),
+            to: moduleRoutePath('mailer'),
+            eyebrow: 'Watch',
+            actionLabel: 'Open',
+            moduleId: 'mailer',
+          }
+        : {
+            id: 'watch-health',
+            title: 'Runtime posture stable',
+            detail: `Last healthy sync: ${lastSuccessfulPollLabel}. Keep the operations board nearby for drift.`,
+            meta: 'Healthy',
+            to: moduleRoutePath('ops'),
+            eyebrow: 'Watch',
+            actionLabel: 'Monitor',
+            moduleId: 'ops',
+          };
+  const focusRailItems: FocusRailItem[] = [
+    resumeItem
+      ? {
+          id: 'focus-resume',
+          title: resumeItem.title,
+          detail: resumeItem.detail,
+          meta: resumeItem.value,
+          to: resumeItem.to,
+          eyebrow: 'Resume',
+          actionLabel: 'Continue',
+          moduleId: resumeItem.moduleId,
+        }
+      : {
+          id: 'focus-resume-start',
+          title: fallbackLaunchAction?.title || 'Open the next workspace',
+          detail: fallbackLaunchAction?.description || 'Start with the recommended area for this session.',
+          meta: roleCopy.status,
+          to: fallbackLaunchAction?.to || MINIAPP_COMMAND_ROUTE_CONTRACTS.GUIDE,
+          eyebrow: 'Resume',
+          actionLabel: fallbackLaunchAction?.actionLabel || 'Start',
+          moduleId: fallbackLaunchAction?.moduleId,
+        },
+    watchItem,
+    {
+      id: 'focus-launch',
+      title: launchAction?.title || 'Open the guide',
+      detail: launchAction?.description || 'Use the guide to pick the next workflow.',
+      meta: launchAction?.moduleId ? 'Workspace ready' : 'Workflow entry',
+      to: launchAction?.to || MINIAPP_COMMAND_ROUTE_CONTRACTS.GUIDE,
+      eyebrow: 'Launch',
+      actionLabel: launchAction?.actionLabel || 'Open',
+      moduleId: launchAction?.moduleId,
+    },
+  ];
 
   return (
     <section className="va-section-block va-home-briefing" aria-labelledby="va-home-briefing-title">
@@ -421,6 +672,43 @@ export function DashboardHomeBriefing({
         ]}
       />
 
+      <div className={`va-home-session-strip va-home-session-strip-${commandAccessLevel}`}>
+        <div className="va-home-session-copy">
+          <strong>{accessStripCopy.title}</strong>
+          <span>{accessStripCopy.description}</span>
+        </div>
+        <div className="va-home-session-metrics" aria-label="Session access summary">
+          <span className="va-home-session-chip">{readyCommandPages.length} open now</span>
+          <span className="va-home-session-chip">{lockedCommandPages.length} locked</span>
+          <span className="va-home-session-chip">Next unlock: {nextUnlockLabel}</span>
+        </div>
+      </div>
+
+      <div className="va-home-focus-rail" aria-label="Operator focus rail">
+        {focusRailItems.map((item, index) => (
+          <Link
+            key={item.id}
+            className="va-home-focus-card"
+            to={item.to}
+            data-module={item.moduleId || item.id}
+            style={{ '--va-enter-delay': `${index * 42}ms` } as CSSProperties}
+          >
+            <span className="va-home-focus-head">
+              <span className="va-home-focus-eyebrow">{item.eyebrow}</span>
+              <span className="va-home-focus-meta">{item.meta}</span>
+            </span>
+            <span className="va-home-focus-title-row">
+              <span className="va-home-focus-glyph" data-module={item.moduleId || item.id} aria-hidden>
+                {item.moduleId ? moduleGlyph(item.moduleId) : homeActionGlyph(item.id)}
+              </span>
+              <strong>{item.title}</strong>
+            </span>
+            <span className="va-home-focus-detail">{item.detail}</span>
+            <span className="va-home-focus-action">{item.actionLabel}</span>
+          </Link>
+        ))}
+      </div>
+
       <div className="va-grid va-home-grid">
         <UiSurfaceState
           className="va-home-panel"
@@ -429,24 +717,76 @@ export function DashboardHomeBriefing({
           statusVariant="info"
           tone="info"
           title="Primary actions"
-          description={`This home follows the bot's start posture, but keeps launch actions in standard app navigation. Last healthy sync: ${lastSuccessfulPollLabel}.`}
+          description={`Use the shortest path into the next task. Last healthy sync: ${lastSuccessfulPollLabel}.`}
         />
         {resolvedPrimaryActions.length > 0 ? (
           <div className="va-home-action-grid" aria-labelledby="va-home-briefing-title">
             <h2 id="va-home-briefing-title" className="va-sr-only">Homepage actions</h2>
-            {resolvedPrimaryActions.map((action) => (
+            <div className="va-home-action-summary" aria-label="Recommended actions">
+              <span className="va-home-action-summary-label">Recommended now</span>
+              <div className="va-home-action-summary-list">
+                {highlightedActions.map((action) => (
+                  <span
+                    key={`home-action-summary-${action.id}`}
+                    className="va-home-action-summary-chip"
+                    data-module={action.moduleId || action.id}
+                  >
+                    {action.title}
+                  </span>
+                ))}
+              </div>
+            </div>
+            {taskPresets.length > 0 ? (
+              <div className="va-home-task-strip" aria-label="Task presets">
+                <span className="va-home-task-strip-label">Task presets</span>
+                <div className="va-home-task-list">
+                  {taskPresets.map((preset, index) => (
+                    <Link
+                      key={preset.id}
+                      className="va-home-task-card"
+                      to={preset.to}
+                      data-module={preset.moduleId || preset.id}
+                      style={{ '--va-enter-delay': `${index * 40 + 32}ms` } as CSSProperties}
+                    >
+                      <span className="va-home-task-head">
+                        <span className="va-home-task-kicker">{preset.kicker}</span>
+                        <span className="va-home-task-signal">{preset.signal}</span>
+                      </span>
+                      <span className="va-home-task-body">
+                        <span className="va-home-task-glyph" aria-hidden>
+                          {preset.moduleId ? moduleGlyph(preset.moduleId) : homeActionGlyph(preset.id)}
+                        </span>
+                        <span className="va-home-task-copy">
+                          <strong>{preset.title}</strong>
+                          <span>{preset.detail}</span>
+                        </span>
+                      </span>
+                      <span className="va-home-task-action">{preset.actionLabel}</span>
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {resolvedPrimaryActions.map((action, index) => (
               <Link
                 key={`home-action-${action.id}`}
                 className="va-home-action-card"
                 to={action.to}
+                data-module={action.moduleId || action.id}
+                style={{ '--va-enter-delay': `${index * 36}ms` } as CSSProperties}
               >
-                <span className="va-home-action-glyph" aria-hidden>{homeActionGlyph(action.id)}</span>
+                <span className="va-home-action-glyph" data-module={action.moduleId || action.id} aria-hidden>
+                  {homeActionGlyph(action.id)}
+                </span>
                 <span className="va-home-action-copy">
                   <span className="va-home-action-head">
                     <span className="va-home-action-kicker">
-                      {action.moduleId ? 'Workspace' : 'Workflow'}
+                      {index === 0 ? 'Recommended next' : (action.moduleId ? 'Workspace' : 'Workflow')}
                     </span>
-                    <span className="va-shortcut-action">{action.actionLabel || 'Open'}</span>
+                    <span className="va-home-action-meta">
+                      <span className="va-home-action-rank">{`0${index + 1}`}</span>
+                      <span className="va-shortcut-action">{action.actionLabel || 'Open'}</span>
+                    </span>
                   </span>
                   <strong>{action.title}</strong>
                   <span>{action.description}</span>

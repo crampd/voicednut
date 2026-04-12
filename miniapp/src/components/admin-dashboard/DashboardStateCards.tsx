@@ -1,3 +1,8 @@
+import { Link } from '@/components/Link/Link.tsx';
+import {
+  DASHBOARD_STATIC_ROUTE_CONTRACTS,
+  MINIAPP_COMMAND_ROUTE_CONTRACTS,
+} from '@/contracts/miniappParityContracts';
 import { UiButton, UiCard, UiSkeletonLine, UiSurfaceState } from '@/components/ui/AdminPrimitives';
 import { describeSessionBlockedReason } from '@/services/admin-dashboard/dashboardSessionErrors';
 
@@ -16,6 +21,8 @@ type SessionBlockedCardProps = {
 };
 
 type EmptyModulesCardProps = {
+  sessionRole: string;
+  lastSuccessfulPollLabel: string;
   onRefreshAccess: () => void;
   refreshDisabled: boolean;
 };
@@ -108,19 +115,82 @@ export function SessionBlockedCard({
 }
 
 export function EmptyModulesCard({
+  sessionRole,
+  lastSuccessfulPollLabel,
   onRefreshAccess,
   refreshDisabled,
 }: EmptyModulesCardProps) {
+  const roleKey = sessionRole === 'admin' || sessionRole === 'operator' || sessionRole === 'viewer'
+    ? sessionRole
+    : 'viewer';
+  const roleStatus = roleKey === 'viewer'
+    ? 'Restricted access'
+    : roleKey === 'operator'
+      ? 'Access not provisioned'
+      : 'Access unavailable';
+  const supportLinks = roleKey === 'viewer'
+    ? [
+        {
+          title: 'Request approval',
+          description: 'Open help and access guidance for the workspaces this role cannot run yet.',
+          to: MINIAPP_COMMAND_ROUTE_CONTRACTS.HELP,
+        },
+        {
+          title: 'Review the guided start',
+          description: 'See the browse-safe app flow and what unlocks after approval.',
+          to: MINIAPP_COMMAND_ROUTE_CONTRACTS.START,
+        },
+        {
+          title: 'Read the usage guide',
+          description: 'Preview the main workflows before you ask for execution access.',
+          to: MINIAPP_COMMAND_ROUTE_CONTRACTS.GUIDE,
+        },
+      ]
+    : [
+        {
+          title: 'Open app settings',
+          description: 'Check session posture, environment state, and recovery controls.',
+          to: DASHBOARD_STATIC_ROUTE_CONTRACTS.SETTINGS,
+        },
+        {
+          title: 'Review operating guidance',
+          description: 'Confirm the expected workflow before reloading module access.',
+          to: MINIAPP_COMMAND_ROUTE_CONTRACTS.GUIDE,
+        },
+      ];
+
   return (
     <section className="va-grid">
       <UiSurfaceState
         cardTone="empty"
         tone="info"
         eyebrow="Workspace access"
-        status="No modules yet"
+        status={roleStatus}
         statusVariant="info"
         title="No modules available"
-        description="This role has no enabled modules yet. Ask an administrator to grant access, then refresh."
+        description={(
+          <div className="va-empty-state-copy">
+            <p>
+              {roleKey === 'viewer'
+                ? 'This session is in browse-safe mode. You can review guidance now, then request approval for the workspaces you need.'
+                : 'This session has no enabled modules yet. Use the support routes below, then reload access once provisioning is complete.'}
+            </p>
+            <p className="va-empty-state-meta">
+              Last healthy sync: <strong>{lastSuccessfulPollLabel}</strong>
+            </p>
+            <div className="va-shortcut-list va-empty-state-links" aria-label="Access recovery routes">
+              {supportLinks.map((link) => (
+                <Link key={link.title} className="va-shortcut-link" to={link.to}>
+                  <span className="va-shortcut-copy">
+                    <strong>{link.title}</strong>
+                    <span>{link.description}</span>
+                  </span>
+                  <span className="va-shortcut-action">Open</span>
+                </Link>
+              ))}
+            </div>
+          </div>
+        )}
         actions={(
           <UiButton
             variant="primary"

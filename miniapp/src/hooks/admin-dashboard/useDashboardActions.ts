@@ -199,7 +199,12 @@ export function useDashboardActions({
       resolvedAction = actionResolution.actionId;
     }
     if (!actionResolution.supported) {
-      throw new Error(`Blocked action: "${resolvedAction}" is unavailable in this Mini App build.`);
+      const detail = `Action unavailable: "${resolvedAction}" is not part of the current Mini App contract. Refreshing available controls may be required.`;
+      setError(detail);
+      setNotice(`Dashboard contract refreshed for ${resolvedAction}.`);
+      triggerHaptic('warning');
+      pushActivity('error', 'Action unavailable', detail);
+      throw new Error(detail);
     }
     const actionPolicy = getDashboardActionPolicy(resolvedAction);
     if (actionPolicy.capability && hasCapability && !hasCapability(actionPolicy.capability)) {
@@ -254,12 +259,23 @@ export function useDashboardActions({
       return result.data;
     } catch (err) {
       const isAbortError = err instanceof DOMException && err.name === 'AbortError';
-      const detail = isAbortError
+      let detail = isAbortError
         ? `Action timed out after ${actionMeta.request_timeout_ms}ms`
         : err instanceof Error
           ? err.message
           : String(err);
       const errorMetadata = readErrorMetadata(err);
+      if (!isAbortError && isUnsupportedMiniAppActionError(errorMetadata.code, detail)) {
+        const recoveryDetail = `Action unavailable: ${resolvedAction}. Dashboard controls were refreshed; retry from the current supported workspace.`;
+        try {
+          await Promise.resolve(loadBootstrap());
+          setNotice(`Dashboard contract refreshed after unsupported action: ${resolvedAction}`);
+        } catch (refreshErr) {
+          const refreshErrorDetail = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
+          pushActivity('error', 'Contract refresh failed', `${refreshErrorDetail} (${resolvedAction})`);
+        }
+        detail = recoveryDetail;
+      }
       const latencyMs = Math.max(0, Date.now() - startedAt);
       setActionTelemetry({
         traceHint,

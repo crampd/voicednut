@@ -1,5 +1,5 @@
 import { initData, miniApp, settingsButton, useRawInitData, useSignal } from '@tma.js/sdk-react';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import '@/pages/AdminDashboard/AdminDashboardPage.css';
@@ -184,6 +184,10 @@ const STREAM_REFRESH_DEBOUNCE_MS = 350;
 const STREAM_STALE_FALLBACK_MS = 45000;
 const SMS_DEFAULT_COST_PER_SEGMENT = 0.0075;
 const ACTIVITY_INFO_DEDUPE_MS = 8000;
+const DASHBOARD_PINNED_MODULES_STORAGE_KEY = 'voxly-miniapp-dashboard-pinned-modules';
+const DASHBOARD_RECENT_MODULES_STORAGE_KEY = 'voxly-miniapp-dashboard-recent-modules';
+const DASHBOARD_PINNED_MODULE_LIMIT = 4;
+const DASHBOARD_RECENT_MODULE_LIMIT = 5;
 const API_BASE_URL = String(
   import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_BASE || '',
 ).trim().replace(/\/+$/, '');
@@ -198,6 +202,32 @@ function isTypingTarget(target: EventTarget | null): boolean {
   if (target.isContentEditable) return true;
   const tagName = target.tagName.toLowerCase();
   return tagName === 'input' || tagName === 'textarea' || tagName === 'select';
+}
+
+function readStoredModuleList(storageKey: string): DashboardModule[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) return [];
+    return sanitizeStoredModuleList(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+function sanitizeStoredModuleList(candidate: unknown): DashboardModule[] {
+  if (!Array.isArray(candidate)) return [];
+  const seen = new Set<DashboardModule>();
+  return candidate.reduce<DashboardModule[]>((acc, item) => {
+    if (typeof item !== 'string') return acc;
+    const normalized = item.trim().toLowerCase();
+    const moduleId = normalized as DashboardModule;
+    if (!MODULE_ID_SET.has(moduleId)) return acc;
+    if (seen.has(moduleId)) return acc;
+    seen.add(moduleId);
+    acc.push(moduleId);
+    return acc;
+  }, []);
 }
 
 export function AdminDashboardPage() {
@@ -237,6 +267,12 @@ export function AdminDashboardPage() {
   const [activityLog, setActivityLog] = useState<ActivityEntry[]>([]);
   const [actionLatencyMsSamples, setActionLatencyMsSamples] = useState<number[]>([]);
   const [activeModule, setActiveModule] = useState<DashboardModule>('ops');
+  const [pinnedModules, setPinnedModules] = useState<DashboardModule[]>(
+    () => readStoredModuleList(DASHBOARD_PINNED_MODULES_STORAGE_KEY).slice(0, DASHBOARD_PINNED_MODULE_LIMIT),
+  );
+  const [recentModules, setRecentModules] = useState<DashboardModule[]>(
+    () => readStoredModuleList(DASHBOARD_RECENT_MODULES_STORAGE_KEY).slice(0, DASHBOARD_RECENT_MODULE_LIMIT),
+  );
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
   const [pollingPaused, setPollingPaused] = useState<boolean>(false);
   const [smsRecipientsInput, setSmsRecipientsInput] = useState<string>('');
@@ -371,11 +407,23 @@ export function AdminDashboardPage() {
       triggerHaptic('selection');
       return moduleId;
     });
+    setRecentModules((prev) => [moduleId, ...prev.filter((entry) => entry !== moduleId)]
+      .slice(0, DASHBOARD_RECENT_MODULE_LIMIT));
     const targetPath = moduleRoutePath(moduleId);
     if (location.pathname !== targetPath) {
       navigate(targetPath);
     }
   }, [location.pathname, navigate, triggerHaptic]);
+
+  const togglePinnedModule = useCallback((moduleId: DashboardModule): void => {
+    triggerHaptic('selection');
+    setPinnedModules((prev) => {
+      if (prev.includes(moduleId)) {
+        return prev.filter((entry) => entry !== moduleId);
+      }
+      return [moduleId, ...prev].slice(0, DASHBOARD_PINNED_MODULE_LIMIT);
+    });
+  }, [triggerHaptic]);
 
   const returnToHome = useCallback((): void => {
     setSettingsOpen((prev) => {
@@ -714,6 +762,19 @@ export function AdminDashboardPage() {
       };
     });
   }, [visibleModules]);
+  const availableWorkspaceModuleIds = useMemo(() => new Set(
+    workspaceModules
+      .filter((module) => module.isAvailable)
+      .map((module) => module.id),
+  ), [workspaceModules]);
+  const quickAccessPinnedModules = useMemo(
+    () => pinnedModules.filter((moduleId) => availableWorkspaceModuleIds.has(moduleId)),
+    [availableWorkspaceModuleIds, pinnedModules],
+  );
+  const quickAccessRecentModules = useMemo(
+    () => recentModules.filter((moduleId) => availableWorkspaceModuleIds.has(moduleId)),
+    [availableWorkspaceModuleIds, recentModules],
+  );
   const groupedVisibleModules = useMemo(() => (
     MODULE_GROUPS
       .map((group) => ({
@@ -727,6 +788,30 @@ export function AdminDashboardPage() {
   const openIncidentCount = toInt(asRecord(incidentsPayload.summary).open, incidentRows.length);
   const showOverviewMode = !focusedWorkspaceMode && !settingsOpen;
   const showFocusedModuleMode = focusedWorkspaceMode && !settingsOpen;
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(
+        DASHBOARD_PINNED_MODULES_STORAGE_KEY,
+        JSON.stringify(pinnedModules.slice(0, DASHBOARD_PINNED_MODULE_LIMIT)),
+      );
+    } catch {
+      // Ignore local storage failures in constrained clients.
+    }
+  }, [pinnedModules]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(
+        DASHBOARD_RECENT_MODULES_STORAGE_KEY,
+        JSON.stringify(recentModules.slice(0, DASHBOARD_RECENT_MODULE_LIMIT)),
+      );
+    } catch {
+      // Ignore local storage failures in constrained clients.
+    }
+  }, [recentModules]);
 
   useDashboardKeyboardShortcuts({
     dialogState,
@@ -1486,7 +1571,12 @@ export function AdminDashboardPage() {
         groupedVisibleModules={groupedVisibleModules}
         moduleShortcutIndexById={moduleShortcutIndexById}
         activeModule={activeModule}
+        pinnedModules={quickAccessPinnedModules}
+        recentModules={quickAccessRecentModules}
         onSelectModule={selectModule}
+        onTogglePinnedModule={togglePinnedModule}
+        onOpenSettings={() => toggleSettings(true)}
+        onRefreshDashboard={handleRefresh}
         moduleVm={moduleVm}
         hasCapability={hasCapability}
         moduleErrorBoundariesEnabled={moduleErrorBoundariesEnabled}

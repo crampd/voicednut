@@ -4,6 +4,7 @@ import { buildSmsRequestState } from './moduleRequestState';
 import type { DashboardVm } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectSmsPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { LoadingTelemetryCard } from '@/components/admin-dashboard/DashboardStateCards';
 import {
   UiActionBar,
@@ -193,22 +194,19 @@ export function SmsSenderPage({ visible, vm }: SmsSenderPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Messaging</p>
-        <h2 className="va-page-title">SMS Operations Console</h2>
-        <p className="va-muted">
-          Compose bulk SMS campaigns, validate recipients, estimate cost, and monitor completion.
-        </p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={pulseTone}>{pulseStatus}</UiBadge>
-          <UiBadge variant="meta">Bulk messaging</UiBadge>
-          <UiBadge variant="info">{smsRecipientsParsed.length} recipients</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Prepare a batch, validate routing and cost, then move into message-level diagnostics from
-          the same workspace when delivery needs deeper review.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Messaging"
+        title="SMS Operations Console"
+        summary="Compose bulk SMS campaigns, validate recipients, estimate cost, and monitor completion."
+        meta={
+          <>
+            <UiBadge variant={pulseTone}>{pulseStatus}</UiBadge>
+            <UiBadge variant="meta">Bulk messaging</UiBadge>
+            <UiBadge variant="info">{smsRecipientsParsed.length} recipients</UiBadge>
+          </>
+        }
+        note="Prepare a batch, validate routing and cost, then move into message-level diagnostics from the same workspace when delivery needs deeper review."
+      />
 
       <UiWorkspacePulse
         title="SMS workspace"

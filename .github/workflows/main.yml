@@ -29,38 +29,22 @@ jobs:
             export PATH=$PATH:/home/ubuntu/.nvm/versions/node/v20.20.0/bin
 
             DEPLOY_ROOT=/home/ubuntu/voxly
-            RELEASES_ROOT=/home/ubuntu/voxly-releases
-            RELEASE_DIR="$RELEASES_ROOT/${{ github.sha }}"
             REPO_URL=https://github.com/voxsprint/voicednut.git
 
-            mkdir -p "$RELEASES_ROOT" "$DEPLOY_ROOT/api" "$DEPLOY_ROOT/bot"
-            rm -rf "$RELEASE_DIR"
+            mkdir -p "$DEPLOY_ROOT"
 
-            # Build a clean sparse checkout for this exact revision so deploys do not depend
-            # on any drift or local edits inside the long-lived EC2 checkout.
-            git clone --filter=blob:none --no-checkout "$REPO_URL" "$RELEASE_DIR"
-            cd "$RELEASE_DIR"
-            git sparse-checkout init --cone
-            git sparse-checkout set api bot
+            if [ ! -d "$DEPLOY_ROOT/.git" ]; then
+              git clone --filter=blob:none --no-checkout "$REPO_URL" "$DEPLOY_ROOT"
+              cd "$DEPLOY_ROOT"
+              git sparse-checkout init --cone
+              git sparse-checkout set api bot
+            else
+              cd "$DEPLOY_ROOT"
+            fi
+
+            git fetch --depth=1 origin "${{ github.sha }}"
             git checkout --force "${{ github.sha }}"
-
-            # Sync only the deployable server code into the live path while preserving
-            # server-managed env files, logs, and installed dependencies until reinstall.
-            rsync -a --delete \
-              --exclude='.env' \
-              --exclude='.env.*' \
-              --exclude='node_modules' \
-              --exclude='logs' \
-              "$RELEASE_DIR/api/" "$DEPLOY_ROOT/api/"
-            rsync -a --delete \
-              --exclude='.env' \
-              --exclude='.env.*' \
-              --exclude='node_modules' \
-              --exclude='logs' \
-              "$RELEASE_DIR/bot/" "$DEPLOY_ROOT/bot/"
-
-            # Remove any stale Mini App files left over from older full-repo deployments.
-            rm -rf "$DEPLOY_ROOT/miniapp"
+            git clean -fd api bot
 
             # Reset PM2 to a known-empty state without failing when nothing is running.
             pm2 delete all || true
@@ -79,6 +63,3 @@ jobs:
 
             # Save PM2 process list
             pm2 save
-
-            # Keep only the most recent release snapshots.
-            ls -1dt "$RELEASES_ROOT"/* 2>/dev/null | tail -n +4 | xargs -r rm -rf

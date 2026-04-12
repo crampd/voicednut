@@ -9,6 +9,7 @@ import {
   selectIncidentRowsMemoized,
 } from './tableSelectors';
 import { downloadCsv } from './csvExport';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
 import {
   UiBadge,
@@ -413,26 +414,23 @@ export function AuditIncidentsPage({ visible, vm }: AuditIncidentsPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">System Posture</p>
-        <h2 className="va-page-title">System Status & Audit</h2>
-        <p className="va-muted">
-          Mirrors bot-backed health and status posture while keeping alert triage, response actions,
-          and audit history together in one workspace.
-        </p>
-        <div className="va-page-intro-meta" aria-label="System status and audit summary">
-          <UiBadge variant={auditPulseTone === 'warning' ? 'info' : auditPulseTone}>
-            {auditPulseStatus}
-          </UiBadge>
-          <UiBadge variant="meta">Incident command center</UiBadge>
-          <UiBadge variant="info">{filteredIncidentRows.length} active alerts</UiBadge>
-          <UiBadge variant="meta">{filteredAuditRows.length} audit entries</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Use this surface to review live posture first, then move into response actions and audit follow-up without
-          leaving the operational context the bot already maintains.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="System Posture"
+        title="System Status & Audit"
+        summary="Mirrors bot-backed health and status posture while keeping alert triage, response actions, and audit history together in one workspace."
+        metaAriaLabel="System status and audit summary"
+        meta={
+          <>
+            <UiBadge variant={auditPulseTone === 'warning' ? 'info' : auditPulseTone}>
+              {auditPulseStatus}
+            </UiBadge>
+            <UiBadge variant="meta">Incident command center</UiBadge>
+            <UiBadge variant="info">{filteredIncidentRows.length} active alerts</UiBadge>
+            <UiBadge variant="meta">{filteredAuditRows.length} audit entries</UiBadge>
+          </>
+        }
+        note="Use this surface to review live posture first, then move into response actions and audit follow-up without leaving the operational context the bot already maintains."
+      />
 
       <UiWorkspacePulse
         title="Operational posture"

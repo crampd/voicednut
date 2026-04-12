@@ -4,6 +4,9 @@ import {
 
 import { Link } from '@/components/Link/Link.tsx';
 import {
+  hasCommandPageAccess,
+} from '@/contracts/commandPageCatalog';
+import {
   BOT_CALLBACK_TO_DASHBOARD_ACTION_CONTRACTS,
   MINIAPP_COMMAND_ACTION_CONTRACTS,
   MINIAPP_COMMAND_PAGE_CONTRACTS,
@@ -15,9 +18,11 @@ import {
   toInt,
   toText,
 } from '@/services/admin-dashboard/dashboardPrimitives';
+import { resolveDashboardAction } from '@/services/admin-dashboard/dashboardActionGuards';
 
 export type CommandPageId = Exclude<keyof typeof MINIAPP_COMMAND_PAGE_CONTRACTS, 'CALL'>;
 export type CallWorkflowMode = 'custom' | 'script';
+export { resolveCommandPageTitle } from '@/contracts/commandPageCatalog';
 
 type CommandContentSection = {
   header: string;
@@ -723,34 +728,13 @@ export function getCommandRuntimeRows(
 }
 
 export function hasAccess(required: MiniAppCommandAccessLevel, current: MiniAppCommandAccessLevel): boolean {
-  if (required === 'guest') return true;
-  if (required === 'authorized') return current === 'authorized' || current === 'admin';
-  return current === 'admin';
+  return hasCommandPageAccess(required, current);
 }
 
 export function describeAccessLevel(accessLevel: MiniAppCommandAccessLevel): string {
   if (accessLevel === 'admin') return 'Administrator access active';
   if (accessLevel === 'authorized') return 'Authorized operator access active';
   return 'Limited access only';
-}
-
-type CommandUiPageId = keyof typeof MINIAPP_COMMAND_PAGE_CONTRACTS;
-
-const COMMAND_PAGE_UI_TITLES: Record<CommandUiPageId, string> = {
-  START: 'Home',
-  CALL: 'Call Workspace',
-  SMS: 'Messaging Workspace',
-  HELP: 'Help Center',
-  EMAIL: 'Email Workspace',
-  SCRIPTS: 'Scripts Workspace',
-  MENU: 'Quick Actions',
-  GUIDE: 'Usage Guide',
-  HEALTH: 'System Health',
-  STATUS: 'Incident Status',
-};
-
-export function resolveCommandPageTitle(pageId: CommandUiPageId): string {
-  return COMMAND_PAGE_UI_TITLES[pageId];
 }
 
 export function resolveCommandPageLoadingCopy(title: string): string {
@@ -857,6 +841,27 @@ export function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return 'Call request failed.';
+}
+
+export function resolveCommandCallbackAction(rawAction: string): {
+  actionId: string | null;
+  supported: boolean;
+  error: string;
+} {
+  const actionLabel = resolveCallbackActionLabel(rawAction);
+  const actionResolution = resolveDashboardAction(rawAction);
+  if (!actionResolution.actionId || !actionResolution.supported) {
+    return {
+      actionId: actionResolution.actionId || null,
+      supported: false,
+      error: `${actionLabel} is not active for this session. Refresh session data or continue in Admin Console.`,
+    };
+  }
+  return {
+    actionId: actionResolution.actionId,
+    supported: true,
+    error: '',
+  };
 }
 
 export function toErrorCode(error: unknown): string {
@@ -1574,7 +1579,7 @@ export function getCommandContent(
         header: 'Workspace split',
         items: [
           'Script Designer is the primary script workspace and switches between call, SMS, and email editing lanes.',
-          'Message Lanes provides the narrower SMS and email editor when operators want a more focused workspace.',
+          'The focused message entry opens the same Script Designer directly on the SMS and email lanes when operators want a narrower starting point.',
         ],
       },
       {

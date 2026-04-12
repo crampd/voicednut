@@ -5,22 +5,25 @@ import {
   Cell,
   List,
   Navigation,
-  Placeholder,
   Section,
   Text,
 } from '@telegram-apps/telegram-ui';
 
 import '@/pages/AdminDashboard/AdminDashboardPage.css';
 import { Link } from '@/components/Link/Link.tsx';
-import { Page } from '@/components/Page.tsx';
+import { UiBadge, UiWorkspacePulse } from '@/components/ui/AdminPrimitives';
 import {
   DASHBOARD_MODULE_ROUTE_CONTRACTS,
   DASHBOARD_STATIC_ROUTE_CONTRACTS,
   MINIAPP_COMMAND_ACTION_CONTRACTS,
   MINIAPP_COMMAND_PAGE_CONTRACTS,
-  MINIAPP_COMMAND_ROUTE_CONTRACTS,
 } from '@/contracts/miniappParityContracts';
 import { useMiniAppCommandSession } from '@/hooks/useMiniAppCommandSession';
+import {
+  CommandPageLayout,
+  CommandPageLoadingState,
+  CommandPageRestrictedState,
+} from './CommandPageScaffold';
 
 import {
   createCommandRuntimeSnapshot,
@@ -63,57 +66,61 @@ function ScriptsCommandPageContent() {
 
   if (loading) {
     return (
-      <Page back>
-        <Placeholder
-          header={pageTitle}
-          description={resolveCommandPageLoadingCopy(pageTitle)}
-        />
-      </Page>
+      <CommandPageLoadingState
+        title={pageTitle}
+        summary={resolveCommandPageLoadingCopy(pageTitle)}
+        note="This handoff verifies the latest script-route contract before opening the unified Script Designer."
+        badge={<UiBadge variant="info">Connecting</UiBadge>}
+      />
     );
   }
 
   if (!pageAccessAllowed) {
     return (
-      <Page back>
-        <List>
-          <Section
-            header={pageTitle}
-            footer={`${contract.notes} Access is denied for your current session role.`}
-          >
-            <Cell subtitle={contract.summary}>
-              {describeAccessLevel(accessLevel)}
-            </Cell>
-            <Cell subtitle={`${pageActionContract.minAccess} access required`}>
-              Route restricted
-            </Cell>
-          </Section>
-          <Section header="Continue with guidance">
-            <Link to={MINIAPP_COMMAND_ROUTE_CONTRACTS.HELP}>
-              <Cell subtitle="Open Help Center for role-aware guidance.">
-                Help Center
-              </Cell>
-            </Link>
-            <Link to={MINIAPP_COMMAND_ROUTE_CONTRACTS.MENU}>
-              <Cell subtitle="Open Quick Actions for currently accessible workflows.">
-                Quick Actions
-              </Cell>
-            </Link>
-            <Link to={DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT}>
-              <Cell subtitle="Open the admin console home.">
-                Admin console
-              </Cell>
-            </Link>
-          </Section>
-        </List>
-      </Page>
+      <CommandPageRestrictedState
+        title={pageTitle}
+        summary={contract.summary}
+        note={`${contract.notes} Access is denied for your current session role.`}
+        accessLevel={accessLevel}
+        requiredAccess={pageActionContract.minAccess}
+      />
     );
   }
 
   return (
-    <Page back>
+    <CommandPageLayout
+      eyebrow="Scripts workspace"
+      title={pageTitle}
+      summary="Open the unified Script Designer and move between review, simulation, approval, and live-promotion flows without guessing which route owns the lifecycle."
+      metaAriaLabel="Scripts workspace summary"
+      meta={(
+        <>
+          <UiBadge variant={error ? 'warning' : 'success'}>
+            {error ? 'Needs attention' : 'Ready'}
+          </UiBadge>
+          <UiBadge variant="meta">Unified designer</UiBadge>
+          <UiBadge variant="info">{listedActions.length} actions</UiBadge>
+        </>
+      )}
+      note="This route is the supported handoff surface. It keeps operators inside the same authoritative Script Designer instead of fragmenting call, SMS, and email editing into duplicate pages."
+      pulse={(
+        <UiWorkspacePulse
+          title="Workspace pulse"
+          description="Track access posture, available actions, and shared runtime state before opening the editor."
+          tone={error ? 'warning' : 'success'}
+          status={error ? 'Needs attention' : 'Ready'}
+          items={[
+            { label: 'Access level', value: describeAccessLevel(accessLevel) },
+            { label: 'Available actions', value: listedActions.length },
+            { label: 'Primary destination', value: 'Script Designer' },
+            { label: 'Fallback', value: errorCode || 'Healthy session' },
+          ]}
+        />
+      )}
+    >
       <List>
         <Section
-          header={pageTitle}
+          header="Session status"
           footer={contract.notes}
         >
           <Cell subtitle={contract.summary}>
@@ -147,7 +154,7 @@ function ScriptsCommandPageContent() {
 
         <Section
           header="Workspace handoff"
-          footer="These routes stay inside the existing admin workspace shell and keep script work separated by job type."
+          footer="These routes stay inside the existing admin workspace shell and land in the same shared Script Designer with different entry emphasis."
         >
           <Link to={DASHBOARD_MODULE_ROUTE_CONTRACTS.content}>
             <Cell
@@ -159,10 +166,10 @@ function ScriptsCommandPageContent() {
           </Link>
           <Link to={DASHBOARD_MODULE_ROUTE_CONTRACTS.scriptsparity}>
             <Cell
-              subtitle="Open Message Lanes for a narrower SMS and email editing workspace."
+              subtitle="Open the focused message entry for the same Script Designer, landing directly on SMS and email editing."
               after={<Navigation>Open</Navigation>}
             >
-              Message Lanes
+              Focused Message Entry
             </Cell>
           </Link>
         </Section>
@@ -196,7 +203,7 @@ function ScriptsCommandPageContent() {
           </Link>
         </Section>
       </List>
-    </Page>
+    </CommandPageLayout>
   );
 }
 

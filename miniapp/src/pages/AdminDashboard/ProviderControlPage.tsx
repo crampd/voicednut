@@ -1,6 +1,7 @@
 import { buildProviderRequestState } from './moduleRequestState';
 import type { DashboardVm, ProviderMatrixRow } from './types';
 import { selectProviderPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { LoadingTelemetryCard } from '@/components/admin-dashboard/DashboardStateCards';
 import {
   UiActionBar,
@@ -104,25 +105,23 @@ export function ProviderControlPage({ visible, vm }: ProviderControlPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Operations</p>
-        <h2 className="va-page-title">Provider Control</h2>
-        <p className="va-muted">
-          Review the active call backbone, then validate SMS and email readiness before staging any provider change.
-        </p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={providerSummaryTone === 'warning' ? 'warning' : providerSummaryTone === 'info' ? 'info' : 'success'}>
-            {providerSummaryStatus}
-          </UiBadge>
-          <UiBadge variant="meta">Call-first routing</UiBadge>
-          <UiBadge variant={providerDegradedCount > 0 ? 'warning' : 'info'}>
-            {providerDegradedCount > 0 ? `${providerDegradedCount} degraded` : 'Routing stable'}
-          </UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Use this as the routing control surface: check the active backbone, simulate the target, confirm intent, and apply changes only after readiness clears.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Operations"
+        title="Provider Control"
+        summary="Review the active call backbone, then validate SMS and email readiness before staging any provider change."
+        meta={
+          <>
+            <UiBadge variant={providerSummaryTone === 'warning' ? 'warning' : providerSummaryTone === 'info' ? 'info' : 'success'}>
+              {providerSummaryStatus}
+            </UiBadge>
+            <UiBadge variant="meta">Call-first routing</UiBadge>
+            <UiBadge variant={providerDegradedCount > 0 ? 'warning' : 'info'}>
+              {providerDegradedCount > 0 ? `${providerDegradedCount} degraded` : 'Routing stable'}
+            </UiBadge>
+          </>
+        }
+        note="Use this as the routing control surface: check the active backbone, simulate the target, confirm intent, and apply changes only after readiness clears."
+      />
 
       <UiWorkspacePulse
         title="Call backbone health"

@@ -4,6 +4,7 @@ import { buildModuleRequestState } from './moduleRequestState';
 import type { CallLogRow, DashboardVm } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectOpsPageVm } from './vmSelectors';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DASHBOARD_ACTION_CONTRACTS } from '@/contracts/miniappParityContracts';
 import {
   UiBadge,
@@ -121,22 +122,21 @@ export function CallLogExplorerPage({ visible, vm }: CallLogExplorerPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Operations</p>
-        <h2 className="va-page-title">Call Log Explorer</h2>
-        <p className="va-muted">Search and inspect call records, state transitions, and runtime details.</p>
-        <div className="va-page-intro-meta">
-          <UiBadge variant={error ? 'error' : controlsBusy || loading ? 'info' : activeSid ? 'success' : 'warning'}>
-            {error ? 'Needs attention' : controlsBusy || loading ? 'Working' : activeSid ? 'Ready' : 'Needs input'}
-          </UiBadge>
-          <UiBadge variant="meta">Call tracing</UiBadge>
-          <UiBadge variant="info">{loadedRowsCount} loaded</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Use one workspace to locate a call, inspect its snapshot, and review recent state changes
-          before escalating deeper runtime issues.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Operations"
+        title="Call Log Explorer"
+        summary="Search and inspect call records, state transitions, and runtime details."
+        meta={
+          <>
+            <UiBadge variant={error ? 'error' : controlsBusy || loading ? 'info' : activeSid ? 'success' : 'warning'}>
+              {error ? 'Needs attention' : controlsBusy || loading ? 'Working' : activeSid ? 'Ready' : 'Needs input'}
+            </UiBadge>
+            <UiBadge variant="meta">Call tracing</UiBadge>
+            <UiBadge variant="info">{loadedRowsCount} loaded</UiBadge>
+          </>
+        }
+        note="Use one workspace to locate a call, inspect its snapshot, and review recent state changes before escalating deeper runtime issues."
+      />
 
       <UiWorkspacePulse
         title="Call log workspace"

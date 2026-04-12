@@ -4,6 +4,7 @@ import { Cell, Navigation } from '@telegram-apps/telegram-ui';
 import type { CallScriptRow, DashboardVm } from './types';
 import { selectScriptStudioPageVm } from './vmSelectors';
 import { Link } from '@/components/Link/Link.tsx';
+import { AdminPageIntro } from '@/components/admin-dashboard/AdminPageIntro';
 import { DashboardWorkflowContractCard } from '@/components/admin-dashboard/DashboardWorkflowContractCard';
 import { useDashboardHaptic } from '@/hooks/admin-dashboard/useDashboardHaptic';
 import {
@@ -27,6 +28,7 @@ import {
 type ScriptStudioPageProps = {
   visible: boolean;
   vm: DashboardVm;
+  initialLane?: ScriptStudioLane;
 };
 
 type SmsScriptRow = {
@@ -88,7 +90,7 @@ function toCallerFlagTone(value: unknown): 'info' | 'success' | 'warning' | 'err
   return 'info';
 }
 
-export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
+export function ScriptStudioPage({ visible, vm, initialLane = 'call' }: ScriptStudioPageProps) {
   if (!visible) return null;
 
   const { triggerHaptic } = useDashboardHaptic();
@@ -150,7 +152,7 @@ export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
   const [emailTemplateCreateId, setEmailTemplateCreateId] = useState<string>('');
   const [emailTemplateCreateSubject, setEmailTemplateCreateSubject] = useState<string>('');
   const [emailTemplateCreateText, setEmailTemplateCreateText] = useState<string>('');
-  const [activeScriptStudioLane, setActiveScriptStudioLane] = useState<ScriptStudioLane>('call');
+  const [activeScriptStudioLane, setActiveScriptStudioLane] = useState<ScriptStudioLane>(initialLane);
   const [callerFlags, setCallerFlags] = useState<Array<Record<string, unknown>>>([]);
   const [callerFlagsStatusFilter, setCallerFlagsStatusFilter] = useState<string>('all');
   const [callerFlagPhoneInput, setCallerFlagPhoneInput] = useState<string>('');
@@ -244,6 +246,10 @@ export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
     void loadCallerFlags();
     void loadPersonas();
   }, []);
+
+  useEffect(() => {
+    setActiveScriptStudioLane(initialLane);
+  }, [initialLane]);
 
   const activeScriptStudioLaneLabel = activeScriptStudioLane === 'call'
     ? 'Call scripts'
@@ -627,23 +633,23 @@ export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
 
   return (
     <>
-      <section className="va-page-intro">
-        <p className="va-kicker">Content</p>
-        <h2 className="va-page-title">Script Designer</h2>
-        <p className="va-muted">Switch between call scripts, SMS scripts, and email templates in one operator workspace.</p>
-        <div className="va-page-intro-meta" aria-label="Script designer summary">
-          <UiBadge variant={pulseTone === 'neutral' ? 'meta' : pulseTone}>
-            {pulseStatus}
-          </UiBadge>
-          <UiBadge variant="meta">Unified designer</UiBadge>
-          <UiBadge variant="info">{activeScriptStudioLaneLabel}</UiBadge>
-          <UiBadge variant="meta">{activeScriptStudioCount} in lane</UiBadge>
-        </div>
-        <p className="va-page-intro-note">
-          Keep authoring in one place: move between call, SMS, and email lanes without losing the surrounding policy,
-          persona, and caller-screening context the broader scripts workflow depends on.
-        </p>
-      </section>
+      <AdminPageIntro
+        eyebrow="Content"
+        title="Script Designer"
+        summary="Switch between call scripts, SMS scripts, and email templates in one operator workspace."
+        metaAriaLabel="Script designer summary"
+        meta={
+          <>
+            <UiBadge variant={pulseTone === 'neutral' ? 'meta' : pulseTone}>
+              {pulseStatus}
+            </UiBadge>
+            <UiBadge variant="meta">Unified designer</UiBadge>
+            <UiBadge variant="info">{activeScriptStudioLaneLabel}</UiBadge>
+            <UiBadge variant="meta">{activeScriptStudioCount} in lane</UiBadge>
+          </>
+        }
+        note="Keep authoring in one place: move between call, SMS, and email lanes without losing the surrounding policy, persona, and caller-screening context the shared scripts workflow depends on."
+      />
       <UiWorkspacePulse
         title="Workspace pulse"
         description="Track the active script lane, current selection, and shared policy context in one compact summary."
@@ -656,7 +662,7 @@ export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
           { label: 'Shared context', value: `${callerFlags.length} flags · ${totalPersonas} personas` },
         ]}
       />
-      <DashboardWorkflowContractCard moduleId={activeScriptStudioLane === 'call' ? 'content' : 'scriptsparity'} />
+      <DashboardWorkflowContractCard moduleId="content" />
       <UiCard>
         <div className="va-ops-card-header">
           <div className="va-ops-card-headline">
@@ -709,16 +715,16 @@ export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
         </Link>
         <Link to={DASHBOARD_MODULE_ROUTE_CONTRACTS.scriptsparity}>
           <Cell
-            subtitle="Open the focused message-lane workspace when you want a narrower editor."
+            subtitle="Open the focused message entry when you want this same designer to land directly on the SMS and email lanes."
             after={<Navigation>Open</Navigation>}
           >
-            Message Lanes
+            Focused Message Entry
           </Cell>
         </Link>
       </UiCard>
       <UiDisclosure
         title="Workspace coverage"
-        subtitle="Expose the current combined designer surface while keeping the broader lifecycle gaps explicit."
+        subtitle="Expose the current combined designer surface while keeping supported lane behavior explicit."
       >
         <UiStatePanel
           compact
@@ -729,8 +735,8 @@ export function ScriptStudioPage({ visible, vm }: ScriptStudioPageProps) {
         <UiStatePanel
           compact
           tone="info"
-          title="Continue in broader scripts workflow"
-          description="Call script creation, cloning, inbound default assignment, version history, diff, rollback, and the full SMS or email review and publishing lifecycle remain outside this current Mini App surface."
+          title="Focused entry behavior"
+          description="The focused message entry reuses this same Script Designer surface and starts on the message lanes. It does not expose a separate SMS or email governance workflow."
         />
       </UiDisclosure>
       <section className="va-grid">
