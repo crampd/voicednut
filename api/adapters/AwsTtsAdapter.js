@@ -2,6 +2,8 @@ const { PollyClient, SynthesizeSpeechCommand } = require('@aws-sdk/client-polly'
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { streamCollector } = require('@aws-sdk/util-stream-node');
 const { v4: uuidv4 } = require('uuid');
+const { runWithTimeout } = require('../utils/asyncControl');
+const { sanitizeVoiceOutputText } = require('../utils/voiceOutputGuard');
 
 /**
  * AwsTtsAdapter wraps Amazon Polly to provide synthesized audio suitable for
@@ -32,6 +34,9 @@ class AwsTtsAdapter {
     this.s3Prefix = config.polly?.outputPrefix || 'tts/';
     this.voiceId = config.polly?.voiceId || 'Joanna';
     this.s3 = this.s3Bucket ? new S3Client({ region: config.region }) : null;
+    const timeoutMs = Number(config?.polly?.requestTimeoutMs || config?.requestTimeoutMs);
+    this.requestTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 15000;
   }
 
   /**
@@ -43,20 +48,35 @@ class AwsTtsAdapter {
    * @param {string} [options.outputFormat] defaults to pcm
    */
   async synthesize(text, options = {}) {
-    if (!text || !text.trim()) {
+    const sanitized = sanitizeVoiceOutputText(text, {
+      maxChars: Number(options.maxChars || 260),
+      fallbackText: 'Let me help you with that.'
+    });
+    const speechText = String(sanitized.text || '').trim();
+    if (!speechText) {
       throw new Error('AwsTtsAdapter.synthesize requires non-empty text');
     }
 
     const params = {
       OutputFormat: options.outputFormat || 'pcm',
-      Text: text,
+      Text: speechText,
       VoiceId: options.voiceId || this.voiceId,
       Engine: options.engine || 'neural',
       SampleRate: options.sampleRate || '16000',
     };
 
     const command = new SynthesizeSpeechCommand(params);
-    const response = await this.polly.send(command);
+    const response = await runWithTimeout(this.polly.send(command), {
+      timeoutMs: this.requestTimeoutMs,
+      label: 'aws_polly_synthesize_timeout',
+      timeoutCode: 'aws_tts_timeout',
+      logger: this.logger,
+      meta: {
+        provider: 'aws_tts',
+        operation: 'synthesize',
+      },
+      warnAfterMs: Math.min(5000, Math.max(1000, Math.floor(this.requestTimeoutMs / 2))),
+    });
     const audioArray = await streamCollector(response.AudioStream);
     this.logger.info?.('Polly synthesized speech', {
       voiceId: params.VoiceId,
@@ -96,7 +116,17 @@ class AwsTtsAdapter {
     };
 
     const command = new PutObjectCommand(params);
-    await this.s3.send(command);
+    await runWithTimeout(this.s3.send(command), {
+      timeoutMs: this.requestTimeoutMs,
+      label: 'aws_s3_put_object_timeout',
+      timeoutCode: 'aws_tts_timeout',
+      logger: this.logger,
+      meta: {
+        provider: 'aws_tts',
+        operation: 's3_put_object',
+      },
+      warnAfterMs: Math.min(5000, Math.max(1000, Math.floor(this.requestTimeoutMs / 2))),
+    });
     this.logger.info?.('Uploaded Polly audio to S3', { bucket: params.Bucket, key: params.Key });
 
     return { bucket: params.Bucket, key: params.Key };

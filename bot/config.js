@@ -5,8 +5,8 @@
  */
 
 require('dotenv').config();
-const required = ['ADMIN_TELEGRAM_ID', 'ADMIN_TELEGRAM_USERNAME', 'API_URL', 'BOT_TOKEN', 'ADMIN_API_TOKEN'];
-
+const DEFAULT_BOT_EPHEMERAL_TTL_MS = 8000;
+const required = ['ADMIN_TELEGRAM_ID', 'ADMIN_TELEGRAM_USERNAME', 'API_URL', 'BOT_TOKEN'];
 const missing = required.filter((key) => !process.env[key]);
 if (missing.length > 0) {
   console.error('❌ Bot environment is missing required variables:');
@@ -15,20 +15,36 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-const miniAppUrl = process.env.MINI_APP_URL || process.env.WEB_APP_URL;
-
-if (!miniAppUrl) {
-  console.error('❌ Missing environment variable: MINI_APP_URL (or WEB_APP_URL fallback)');
+const apiSecret = process.env.API_SECRET;
+const adminApiToken = apiSecret || process.env.ADMIN_API_TOKEN;
+const apiHmacSecret = apiSecret || process.env.API_HMAC_SECRET;
+if (!adminApiToken || !apiHmacSecret) {
+  console.error('❌ Bot environment is missing API credentials. Set API_SECRET (preferred) or both ADMIN_API_TOKEN + API_HMAC_SECRET.');
   process.exit(1);
 }
 
-const templatesApiUrl = process.env.TEMPLATES_API_URL || process.env.API_URL;
+const scriptsApiUrl = process.env.SCRIPTS_API_URL || process.env.TEMPLATES_API_URL || process.env.API_URL;
+function resolveMiniAppUrl() {
+  const explicit = String(process.env.MINI_APP_URL || '').trim();
+  if (explicit) return explicit;
+  try {
+    return new URL('/miniapp', process.env.API_URL).toString();
+  } catch {
+    return '';
+  }
+}
+const miniAppUrl = resolveMiniAppUrl();
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 try {
   // eslint-disable-next-line no-new
-  new URL(templatesApiUrl);
+  new URL(scriptsApiUrl);
 } catch (error) {
-  console.error(`❌ Invalid TEMPLATES_API_URL: ${templatesApiUrl || 'undefined'} (${error.message})`);
+  console.error(`❌ Invalid SCRIPTS_API_URL: ${scriptsApiUrl || 'undefined'} (${error.message})`);
   process.exit(1);
 }
 
@@ -38,26 +54,21 @@ module.exports = {
   admin: {
     userId: process.env.ADMIN_TELEGRAM_ID,
     username: process.env.ADMIN_TELEGRAM_USERNAME,
-    apiToken: process.env.ADMIN_API_TOKEN
+    apiToken: adminApiToken
   },
   apiUrl: process.env.API_URL,
   botToken: process.env.BOT_TOKEN,
-  templatesApiUrl,
+  scriptsApiUrl,
+  miniApp: {
+    url: miniAppUrl
+  },
   defaultVoiceModel: process.env.DEFAULT_VOICE_MODEL || 'aura-asteria-en',
   defaultBusinessId: process.env.DEFAULT_BUSINESS_ID || 'general',
   defaultPurpose: process.env.DEFAULT_CALL_PURPOSE || 'general',
-
-  // New Mini App configuration
-  webAppUrl: miniAppUrl,
-  miniAppUrl,
-  webAppSecret: process.env.WEB_APP_SECRET || 'your-web-app-secret',
-  webAppPort: process.env.WEB_APP_PORT || 8080,
-
-  // CORS settings for Mini App
-  cors: {
-    origins: [
-      'https://web.telegram.org',
-      miniAppUrl
-    ].filter(Boolean)
-  }
+  ui: {
+    ephemeralTtlMs: parsePositiveInt(process.env.BOT_EPHEMERAL_TTL_MS, DEFAULT_BOT_EPHEMERAL_TTL_MS),
+  },
+  apiAuth: {
+    hmacSecret: apiHmacSecret,
+  },
 };

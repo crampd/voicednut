@@ -1,264 +1,199 @@
 const config = require('../config');
-const axios = require('axios');
-const { getUser, isAdmin } = require('../db/db');
+const httpClient = require('../utils/httpClient');
+const { escapeMarkdown, buildLine, sendEphemeral, buildMainMenuReplyMarkup } = require('../utils/ui');
+const { getAccessProfile, getDeniedAuditSummary } = require('../utils/capabilities');
 
-module.exports = (bot) => {
-    // API test command (enhanced)
-    bot.command('testapi', async (ctx) => {
+async function replyApiError(ctx, error, fallback, options = {}) {
+    const message = httpClient.getUserMessage(error, fallback);
+    return ctx.reply(message, options);
+}
+
+async function handleStatusCommand(ctx) {
+    try {
+        const access = await getAccessProfile(ctx);
+        if (!access?.isAdmin) {
+            return ctx.reply('❌ Access denied. This action is available to administrators only.');
+        }
+
+        await sendEphemeral(ctx, '🔍 Checking system status...');
+
+        const startTime = Date.now();
+        const healthHeaders = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        };
+        if (config.admin?.apiToken) {
+            healthHeaders['x-admin-token'] = config.admin.apiToken;
+        }
+        const response = await httpClient.get(null, `${config.apiUrl}/health`, {
+            timeout: 15000,
+            headers: healthHeaders
+        });
+        const responseTime = Date.now() - startTime;
+
+        const health = response.data;
+
+        const apiHealthStatus = health.status || 'healthy';
+        let message = `🔍 *System Status Report*\n\n`;
+        message += `🤖 Bot: ✅ Online & Responsive\n`;
+        message += `🌐 API: ${health.status === 'healthy' ? '✅' : '❌'} ${escapeMarkdown(apiHealthStatus)}\n`;
+        message += `${buildLine('⚡', 'API Response Time', `${responseTime}ms`)}\n\n`;
+
+        if (health.services) {
+            message += `*🔧 Services Status:*\n`;
+
+            const db = health.services.database;
+            message += `${buildLine('🗄️', 'Database', db?.connected ? '✅ Connected' : '❌ Disconnected')}\n`;
+            if (db?.recent_calls !== undefined) {
+                message += `${buildLine('📋', 'Recent DB Calls', db.recent_calls)}\n`;
+            }
+
+            const webhook = health.services.webhook_service;
+            if (webhook) {
+                message += `${buildLine('📡', 'Webhook Service', `${webhook.status === 'running' ? '✅' : '⚠️'} ${escapeMarkdown(webhook.status)}`)}\n`;
+                if (webhook.processed_today !== undefined) {
+                    message += `${buildLine('📨', 'Webhooks Today', webhook.processed_today)}\n`;
+                }
+            }
+
+            const notifications = health.services.notification_system;
+            if (notifications) {
+                message += `${buildLine('🔔', 'Notifications', `${escapeMarkdown(String(notifications.success_rate || 'N/A'))} success rate`)}\n`;
+            }
+
+            message += `\n`;
+        }
+
+        message += `*📊 Call Statistics:*\n`;
+        message += `${buildLine('📞', 'Active Calls', health.active_calls || 0)}\n`;
+        message += `${buildLine('📈', 'Live Connections', health.active_calls || 0)}\n`;
+
+        const audit = getDeniedAuditSummary();
+        if (audit.total > 0) {
+            message += `${buildLine('🔒', `Access denials (${audit.windowSeconds}s)`, `${audit.total} across ${audit.users} user(s), ${audit.rateLimited} rate-limited`)}\n`;
+            if (audit.recent && audit.recent.length > 0) {
+                const recentLines = audit.recent.map((entry) => {
+                    const suffix = entry.userId ? String(entry.userId).slice(-4) : 'unknown';
+                    const who = `user#${suffix}`;
+                    const actionLabel = escapeMarkdown(entry.actionLabel || entry.capability || 'action');
+                    const role = escapeMarkdown(entry.role || 'unknown');
+                    const when = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : 'recent';
+                    return `• ${who} (${role}) blocked on ${actionLabel} at ${escapeMarkdown(when)}`;
+                });
+                message += `\n*🔐 Recent denials:*\n${recentLines.join('\n')}\n`;
+            }
+        }
+
+        if (health.adaptation_engine) {
+            message += `\n*🤖 AI Features:*\n`;
+            message += `${buildLine('🧠', 'Adaptation Engine', '✅ Active')}\n`;
+            message += `${buildLine('🧩', 'Function Scripts', health.adaptation_engine.available_scripts || 0)}\n`;
+            message += `${buildLine('⚙️', 'Active Systems', health.adaptation_engine.active_function_systems || 0)}\n`;
+        }
+
+        if (health.inbound_defaults || health.inbound_env_defaults) {
+            message += `\n*📥 Inbound Defaults:*\n`;
+            const inbound = health.inbound_defaults || {};
+            if (inbound.mode === 'script') {
+                message += `${buildLine('📄', 'Default Script', `${escapeMarkdown(inbound.name || 'Unnamed')} (${escapeMarkdown(String(inbound.script_id || ''))})`)}\n`;
+            } else {
+                message += `${buildLine('📄', 'Default Script', 'Built-in')}\n`;
+            }
+            const envDefaults = health.inbound_env_defaults || {};
+            const envPrompt = envDefaults.prompt ? 'set' : 'unset';
+            const envFirst = envDefaults.first_message ? 'set' : 'unset';
+            message += `${buildLine('⚙️', 'Env Defaults', `prompt: ${envPrompt}, first_message: ${envFirst}`)}\n`;
+        }
+
+        if (health.enhanced_features) {
+            message += `${buildLine('🚀', 'Enhanced Mode', '✅ Enabled')}\n`;
+        }
+
+        if (health.system_health && health.system_health.length > 0) {
+            message += `\n*🔍 Recent Activity:*\n`;
+            health.system_health.slice(0, 3).forEach(log => {
+                const status = log.status === 'error' ? '❌' : '✅';
+                message += `${status} ${escapeMarkdown(log.service_name)}: ${log.count} ${escapeMarkdown(log.status)}\n`;
+            });
+        }
+
+        message += `\n${buildLine('⏰','Last Updated', escapeMarkdown(new Date(health.timestamp).toLocaleString()))}`;
+        message += `\n${buildLine('📡','API Endpoint', escapeMarkdown(config.apiUrl))}`;
+
+        await ctx.reply(message, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    } catch (error) {
+        console.error('Status command error:', error);
+        const message = `${httpClient.getUserMessage(error, 'System status check failed.')}\nAPI: ${config.apiUrl}`;
+        await ctx.reply(message, {
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    }
+}
+
+async function handleHealthCommand(ctx) {
+    try {
+        const access = await getAccessProfile(ctx);
+        if (!access?.isAuthorized) {
+            return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
+        }
+
+        const startTime = Date.now();
+
         try {
-            // Check if user is authorized and is admin
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-
-            const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
-            if (!adminStatus) {
-                return ctx.reply('❌ This command is for administrators only.');
-            }
-
-            await ctx.reply('🧪 Testing API connection...');
-
-            console.log('Testing API connection to:', config.apiUrl);
-            const startTime = Date.now();
-            const response = await axios.get(`${config.apiUrl}/health`, {
-                timeout: 10000,
+            const response = await httpClient.get(null, `${config.apiUrl}/health`, {
+                timeout: 8000,
                 headers: {
                     'Accept': 'application/json',
                     'Content-Type': 'application/json'
                 }
             });
             const responseTime = Date.now() - startTime;
-            
+
             const health = response.data;
-            console.log('API Health Response:', health);
-            
-            let message = `✅ *API Status: ${health.status || 'healthy'}*\n\n`;
-            message += `🔗 URL: ${config.apiUrl}\n`;
+
+            let message = `🏥 *Health Check*\n\n`;
+            message += `🤖 Bot: ✅ Responsive\n`;
+            message += `🌐 API: ${health.status === 'healthy' ? '✅' : '⚠️'} ${health.status || 'responding'}\n`;
             message += `⚡ Response Time: ${responseTime}ms\n`;
-            message += `📊 Active Calls: ${health.active_calls || 0}\n`;
-            
-            // Handle different response structures
-            if (health.services) {
-                const db = health.services.database;
-                const webhook = health.services.webhook_service;
-                
-                message += `🗄️ Database: ${db?.connected ? '✅ Connected' : '❌ Disconnected'}\n`;
-                message += `📋 Recent Calls: ${db?.recent_calls || 0}\n`;
-                message += `📡 Webhook Service: ${webhook?.status || 'Unknown'}\n`;
-                
-                if (health.adaptation_engine) {
-                    message += `🤖 Adaptation Engine: ✅ Active\n`;
-                    message += `🧩 Function Templates: ${health.adaptation_engine.available_templates || 0}\n`;
-                }
-            } else {
-                // Fallback for simpler health responses
-                message += `🗄️ Database: ${health.database_connected ? '✅ Connected' : '❌ Unknown'}\n`;
-            }
-            
-            message += `⏰ Timestamp: ${new Date(health.timestamp).toLocaleString()}\n`;
-            
-            // Add enhanced features info if available
-            if (health.enhanced_features) {
-                message += `\n🚀 Enhanced Features: ✅ Active`;
-            }
-            
-            await ctx.reply(message, { parse_mode: 'Markdown' });
-        } catch (error) {
-            console.error('API test failed:', error);
-            
-            let errorMessage = `❌ *API Test Failed*\n\nURL: ${config.apiUrl}\n`;
-            
-            if (error.response) {
-                errorMessage += `Status: ${error.response.status} - ${error.response.statusText}\n`;
-                errorMessage += `Error: ${error.response.data?.error || error.message}`;
-            } else if (error.code === 'ECONNREFUSED') {
-                errorMessage += `Error: Connection refused - API server may be down`;
-            } else if (error.code === 'ENOTFOUND') {
-                errorMessage += `Error: Host not found - Check API URL`;
-            } else if (error.code === 'ETIMEDOUT') {
-                errorMessage += `Error: Request timeout - API server is not responding`;
-            } else {
-                errorMessage += `Error: ${error.message}`;
-            }
-            
-            await ctx.reply(errorMessage, { parse_mode: 'Markdown' });
-        }
-    });
 
-    // Status command (admin only) - Enhanced version
-    bot.command('status', async (ctx) => {
-        try {
-            // Check if user is admin
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
-            
-            if (!user || !adminStatus) {
-                return ctx.reply('❌ This command is for administrators only.');
+            if (health.active_calls !== undefined) {
+                message += `📞 Active Calls: ${health.active_calls}\n`;
             }
 
-            await ctx.reply('🔍 Checking system status...');
+            if (health.services?.database?.connected !== undefined) {
+                message += `🗄️ Database: ${health.services.database.connected ? '✅' : '❌'} ${health.services.database.connected ? 'Connected' : 'Disconnected'}\n`;
+            }
 
-            const startTime = Date.now();
-            const response = await axios.get(`${config.apiUrl}/health`, {
-                timeout: 15000,
-                headers: {
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json'
-                }
+            message += `⏰ Checked: ${new Date().toLocaleTimeString()}`;
+
+            await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                reply_markup: buildMainMenuReplyMarkup(ctx)
             });
-            const responseTime = Date.now() - startTime;
-            
-            const health = response.data;
-            
-            let message = `🔍 *System Status Report*\n\n`;
-            message += `🤖 Bot: ✅ Online & Responsive\n`;
-            message += `🌐 API: ${health.status === 'healthy' ? '✅' : '❌'} ${health.status || 'healthy'}\n`;
-            message += `⚡ API Response Time: ${responseTime}ms\n\n`;
-            
-            // Enhanced service status
-            if (health.services) {
-                message += `*🔧 Services Status:*\n`;
-                
-                const db = health.services.database;
-                message += `🗄️ Database: ${db?.connected ? '✅ Connected' : '❌ Disconnected'}\n`;
-                if (db?.recent_calls !== undefined) {
-                    message += `📋 Recent DB Calls: ${db.recent_calls}\n`;
-                }
-                
-                const webhook = health.services.webhook_service;
-                if (webhook) {
-                    message += `📡 Webhook Service: ${webhook.status === 'running' ? '✅' : '⚠️'} ${webhook.status}\n`;
-                    if (webhook.processed_today !== undefined) {
-                        message += `📨 Webhooks Today: ${webhook.processed_today}\n`;
-                    }
-                }
-                
-                const notifications = health.services.notification_system;
-                if (notifications) {
-                    message += `🔔 Notifications: ${notifications.success_rate || 'N/A'} success rate\n`;
-                }
-                
-                message += `\n`;
-            }
-            
-            // Call statistics
-            message += `*📊 Call Statistics:*\n`;
-            message += `📞 Active Calls: ${health.active_calls || 0}\n`;
-            
-            // Enhanced features
-            if (health.adaptation_engine) {
-                message += `\n*🤖 AI Features:*\n`;
-                message += `🧠 Adaptation Engine: ✅ Active\n`;
-                message += `🧩 Function Templates: ${health.adaptation_engine.available_templates || 0}\n`;
-                message += `⚙️ Active Systems: ${health.adaptation_engine.active_function_systems || 0}\n`;
-            }
-            
-            if (health.enhanced_features) {
-                message += `🚀 Enhanced Features: ✅ Enabled\n`;
-            }
-            
-            // System health logs (if available)
-            if (health.system_health && health.system_health.length > 0) {
-                message += `\n*🔍 Recent Activity:*\n`;
-                health.system_health.slice(0, 3).forEach(log => {
-                    const status = log.status === 'error' ? '❌' : '✅';
-                    message += `${status} ${log.service_name}: ${log.count} ${log.status}\n`;
-                });
-            }
-            
-            message += `\n⏰ Last Updated: ${new Date(health.timestamp).toLocaleString()}`;
-            message += `\n📡 API Endpoint: ${config.apiUrl}`;
-            
-            await ctx.reply(message, { parse_mode: 'Markdown' });
-        } catch (error) {
-            console.error('Status command error:', error);
-            
-            let errorMessage = `❌ *System Status Check Failed*\n\n`;
-            errorMessage += `🤖 Bot: ✅ Online (you're seeing this message)\n`;
-            errorMessage += `🌐 API: ❌ Connection failed\n\n`;
-            
-            if (error.response) {
-                errorMessage += `📊 API Status: ${error.response.status} - ${error.response.statusText}\n`;
-                errorMessage += `📝 Error Details: ${error.response.data?.error || 'Unknown API error'}\n`;
-            } else if (error.code === 'ECONNREFUSED') {
-                errorMessage += `📝 Error: API server connection refused\n`;
-                errorMessage += `💡 Suggestion: Check if the API server is running\n`;
-            } else if (error.code === 'ENOTFOUND') {
-                errorMessage += `📝 Error: API server not found\n`;
-                errorMessage += `💡 Suggestion: Verify API URL configuration\n`;
-            } else {
-                errorMessage += `📝 Error: ${error.message}\n`;
-            }
-            
-            errorMessage += `\n📡 API Endpoint: ${config.apiUrl}`;
-            
-            await ctx.reply(errorMessage, { parse_mode: 'Markdown' });
+        } catch (apiError) {
+            const message = `${httpClient.getUserMessage(apiError, 'API unreachable.')}\nAPI: ${config.apiUrl}`;
+            await ctx.reply(message, {
+                reply_markup: buildMainMenuReplyMarkup(ctx)
+            });
         }
-    });
+    } catch (error) {
+        console.error('Health command error:', error);
+        await replyApiError(ctx, error, 'Health check failed.', {
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    }
+}
 
-    // Health check command (simple version for all users) - Enhanced
-    bot.command(['health', 'ping'], async (ctx) => {
-        try {
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
+function registerApiCommands(bot) {
+    bot.command('status', handleStatusCommand);
+    bot.command(['health', 'ping'], handleHealthCommand);
+}
 
-            const startTime = Date.now();
-            
-            try {
-                const response = await axios.get(`${config.apiUrl}/health`, {
-                    timeout: 8000,
-                    headers: {
-                        'Accept': 'application/json',
-                        'Content-Type': 'application/json'
-                    }
-                });
-                const responseTime = Date.now() - startTime;
-                
-                const health = response.data;
-                
-                let message = `🏥 *Health Check*\n\n`;
-                message += `🤖 Bot: ✅ Responsive\n`;
-                message += `🌐 API: ${health.status === 'healthy' ? '✅' : '⚠️'} ${health.status || 'responding'}\n`;
-                message += `⚡ Response Time: ${responseTime}ms\n`;
-                
-                // Add basic stats if available
-                if (health.active_calls !== undefined) {
-                    message += `📞 Active Calls: ${health.active_calls}\n`;
-                }
-                
-                // Add database status if available
-                if (health.services?.database?.connected !== undefined) {
-                    message += `🗄️ Database: ${health.services.database.connected ? '✅' : '❌'} ${health.services.database.connected ? 'Connected' : 'Disconnected'}\n`;
-                }
-                
-                message += `⏰ Checked: ${new Date().toLocaleTimeString()}`;
-                
-                await ctx.reply(message, { parse_mode: 'Markdown' });
-            } catch (apiError) {
-                const responseTime = Date.now() - startTime;
-                
-                let message = `🏥 *Health Check*\n\n`;
-                message += `🤖 Bot: ✅ Responsive\n`;
-                message += `🌐 API: ❌ Connection failed\n`;
-                message += `⚡ Response Time: ${responseTime}ms (timeout)\n`;
-                message += `⏰ Checked: ${new Date().toLocaleTimeString()}\n\n`;
-                
-                if (apiError.code === 'ECONNREFUSED') {
-                    message += `📝 API server appears to be down`;
-                } else if (apiError.code === 'ETIMEDOUT') {
-                    message += `📝 API server is not responding (timeout)`;
-                } else {
-                    message += `📝 ${apiError.message}`;
-                }
-                
-                await ctx.reply(message, { parse_mode: 'Markdown' });
-            }
-        } catch (error) {
-            console.error('Health command error:', error);
-            await ctx.reply(`🏥 *Health Check*\n\n🤖 Bot: ✅ Responsive\n🌐 API: ❌ Error\n⏰ Checked: ${new Date().toLocaleTimeString()}\n\n📝 ${error.message}`, { parse_mode: 'Markdown' });
-        }
-    });
+module.exports = {
+    registerApiCommands,
+    handleStatusCommand,
+    handleHealthCommand
 };

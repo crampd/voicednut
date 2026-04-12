@@ -1,6 +1,8 @@
 const axios = require('axios');
 const config = require('../config');
-const { getUser, isAdmin } = require('../db/db');
+const { withRetry } = require('../utils/httpClient');
+const { getAccessProfile } = require('../utils/capabilities');
+const { attachHmacAuth } = require('../utils/apiAuth');
 const {
   startOperation,
   ensureOperationActive,
@@ -11,7 +13,6 @@ const {
 } = require('../utils/sessionState');
 const {
   askOptionWithButtons,
-  getOptionLabel,
   MOOD_OPTIONS,
   URGENCY_OPTIONS,
   TECH_LEVEL_OPTIONS,
@@ -19,11 +20,29 @@ const {
   getBusinessOptions
 } = require('../utils/persona');
 
+const {
+  section
+} = require('../utils/ui');
+
 const personaApi = axios.create({
   baseURL: config.apiUrl.replace(/\/+$/, ''),
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' }
 });
+
+let apiOrigin;
+try {
+  apiOrigin = new URL(config.apiUrl).origin;
+} catch (_) {
+  apiOrigin = null;
+}
+if (apiOrigin) {
+  attachHmacAuth(personaApi, {
+    secret: config.apiAuth?.hmacSecret,
+    allowedOrigins: [apiOrigin],
+    defaultBaseUrl: config.apiUrl
+  });
+}
 
 const CANCEL_KEYWORDS = new Set(['cancel', 'exit', 'stop']);
 
@@ -38,10 +57,10 @@ async function personaApiRequest(ctx, ensureActive, options) {
   const controller = new AbortController();
   const release = registerAbortController(ctx, controller);
   try {
-    const response = await personaApi.request({
+    const response = await withRetry(() => personaApi.request({
       ...options,
       signal: controller.signal
-    });
+    }), options.retry || {});
     ensureActive();
     return response.data;
   } finally {
@@ -65,30 +84,39 @@ async function deletePersona(ctx, ensureActive, slug) {
   return personaApiRequest(ctx, ensureActive, { method: 'delete', url: `/api/personas/${encodeURIComponent(slug)}` });
 }
 
-async function fetchCallTemplatesSummary(ctx, ensureActive) {
+async function fetchCallScriptsSummary(ctx, ensureActive) {
   try {
-    const data = await personaApiRequest(ctx, ensureActive, { method: 'get', url: '/api/call-templates' });
-    return Array.isArray(data.templates) ? data.templates : [];
+    const data = await personaApiRequest(ctx, ensureActive, { method: 'get', url: '/api/call-scripts' });
+    return Array.isArray(data.scripts) ? data.scripts : [];
   } catch (error) {
-    console.error('Failed to fetch call templates for persona command:', error?.message);
+    console.error('Failed to fetch call scripts for persona command:', error?.message);
     return [];
   }
 }
 
-async function fetchSmsTemplatesSummary(ctx, ensureActive) {
+async function fetchSmsScriptsSummary(ctx, ensureActive) {
   try {
     const data = await personaApiRequest(ctx, ensureActive, {
       method: 'get',
-      url: '/api/sms/templates',
+      url: '/api/sms/scripts',
       params: { include_builtins: true }
     });
-    const custom = Array.isArray(data.templates) ? data.templates : [];
+    const custom = Array.isArray(data.scripts) ? data.scripts : [];
     const builtin = Array.isArray(data.builtin) ? data.builtin : [];
     return [...custom, ...builtin];
   } catch (error) {
-    console.error('Failed to fetch SMS templates for persona command:', error?.message);
+    console.error('Failed to fetch SMS scripts for persona command:', error?.message);
     return [];
   }
+}
+
+function styledSection(ctx, title, lines) {
+  const content = Array.isArray(lines) ? lines : [lines];
+  return ctx.reply(section(title, content));
+}
+
+function styledAlert(ctx, text, title = '⚠️ Attention') {
+  return ctx.reply(section(title, [text]));
 }
 
 async function promptForText(conversation, ctx, message, options = {}) {
@@ -110,8 +138,8 @@ async function promptForText(conversation, ctx, message, options = {}) {
   }
   hints.push('Type cancel to abort');
 
-  const promptText = hints.length ? `${message}\n_${hints.join(' | ')}_` : message;
-  await ctx.reply(promptText, { parse_mode: 'Markdown' });
+  const promptText = hints.length ? `${message} (${hints.join(' | ')})` : message;
+  await styledSection(ctx, '📝 Provide Input', [promptText]);
 
   const update = await conversation.wait();
   safeEnsureActive();
@@ -120,13 +148,13 @@ async function promptForText(conversation, ctx, message, options = {}) {
   if (text) {
     await guardAgainstCommandInterrupt(ctx, text);
   }
-  if (!text) {
-    if (required) {
-      await ctx.reply('❌ Please provide a response or type cancel.');
-      return promptForText(conversation, ctx, message, options);
+    if (!text) {
+      if (required) {
+        await styledAlert(ctx, 'Please provide a response or type cancel.');
+        return promptForText(conversation, ctx, message, options);
+      }
+      return '';
     }
-    return '';
-  }
 
   const lower = text.toLowerCase();
   if (CANCEL_KEYWORDS.has(lower)) {
@@ -140,7 +168,7 @@ async function promptForText(conversation, ctx, message, options = {}) {
   try {
     return parser(text);
   } catch (error) {
-    await ctx.reply(`❌ ${error.message || 'Invalid value supplied.'}`);
+    await styledAlert(ctx, error.message || 'Invalid value supplied.');
     return promptForText(conversation, ctx, message, options);
   }
 }
@@ -187,11 +215,11 @@ async function chooseTone(conversation, ctx, prompt, options, ensureActive, fall
   if (choice.id === 'skip') {
     return undefined;
   }
-  return choice.id;
+  return mapMoodSelection(choice, fallback);
 }
 
 async function createPersonaFlow(conversation, ctx, ensureActive) {
-  await ctx.reply('🆕 Creating a new persona profile. You can type cancel at any time.');
+  await ctx.reply(section('🆕 Persona Studio', ['Create a new persona profile. Type cancel anytime.']));
 
   const slug = await promptForText(
     conversation,
@@ -266,47 +294,47 @@ async function createPersonaFlow(conversation, ctx, ensureActive) {
     ensureActive
   );
 
-  const callTemplates = await fetchCallTemplatesSummary(ctx, ensureActive);
-  let callTemplateId = null;
-  if (callTemplates.length > 0) {
-    const options = callTemplates.slice(0, 10).map((template) => ({
-      id: template.id.toString(),
-      label: `📞 ${template.name}`
+  const callScripts = await fetchCallScriptsSummary(ctx, ensureActive);
+  let callScriptId = null;
+  if (callScripts.length > 0) {
+    const options = callScripts.slice(0, 10).map((script) => ({
+      id: script.id.toString(),
+      label: `📞 ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
 
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Select a default call template (or skip):',
+      'Select a default call script (or skip):',
       options,
-      { prefix: 'persona-call-template', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
+      { prefix: 'persona-call-script', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id !== 'skip') {
-      callTemplateId = Number(selection.id);
+      callScriptId = Number(selection.id);
     }
   }
 
-  const smsTemplates = await fetchSmsTemplatesSummary(ctx, ensureActive);
-  let smsTemplateName = null;
-  if (smsTemplates.length > 0) {
-    const options = smsTemplates.slice(0, 10).map((template) => ({
-      id: template.name,
-      label: `${template.is_builtin ? '📦' : '📝'} ${template.name}`
+  const smsScripts = await fetchSmsScriptsSummary(ctx, ensureActive);
+  let smsScriptName = null;
+  if (smsScripts.length > 0) {
+    const options = smsScripts.slice(0, 10).map((script) => ({
+      id: script.name,
+      label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
 
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      'Select a default SMS template (or skip):',
+      'Select a default SMS script (or skip):',
       options,
-      { prefix: 'persona-sms-template', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
+      { prefix: 'persona-sms-script', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id !== 'skip') {
-      smsTemplateName = selection.id;
+      smsScriptName = selection.id;
     }
   }
 
@@ -329,26 +357,29 @@ async function createPersonaFlow(conversation, ctx, ensureActive) {
     default_emotion: defaultEmotion || null,
     default_urgency: defaultUrgency || null,
     default_technical_level: defaultTech || null,
-    call_template_id: callTemplateId,
-    sms_template_name: smsTemplateName,
+    call_script_id: callScriptId,
+    sms_script_name: smsScriptName,
     created_by: ctx.from.id.toString()
   };
 
   try {
     const response = await createPersona(ctx, ensureActive, payload);
-    await ctx.reply(`✅ Persona *${response.persona.label}* created.`, { parse_mode: 'Markdown' });
+    await ctx.reply(section('✅ Persona Created', [
+      `Persona *${response.persona.label}* is ready.`,
+      'Use /persona to manage or edit it anytime.'
+    ]));
     invalidatePersonaCache();
     await getBusinessOptions(true);
   } catch (error) {
     console.error('Failed to create persona:', error?.response?.data || error.message);
     const details = error.response?.data?.error || error.message;
-    await ctx.reply(`❌ Failed to create persona: ${details}`);
+    await styledAlert(ctx, `Failed to create persona: ${details}`);
   }
 }
 
 async function selectCustomPersona(conversation, ctx, ensureActive, personas) {
   if (!personas.length) {
-    await ctx.reply('ℹ️ No custom personas available yet.');
+    await styledSection(ctx, 'ℹ️ Persona Library', ['No custom personas available yet.']);
     return null;
   }
 
@@ -374,7 +405,9 @@ async function selectCustomPersona(conversation, ctx, ensureActive, personas) {
 }
 
 async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
-  await ctx.reply(`✏️ Editing persona *${persona.label}* (slug: ${persona.slug}).`);
+  await styledSection(ctx, '✏️ Persona Editor', [
+    `Editing persona *${persona.label}* (slug: ${persona.slug}).`
+  ]);
 
   const updates = {};
   const description = await promptForText(
@@ -406,11 +439,11 @@ async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
     updates.default_technical_level = defaultTech || null;
   }
 
-  const callTemplates = await fetchCallTemplatesSummary(ctx, ensureActive);
-  if (callTemplates.length > 0) {
-    const options = callTemplates.slice(0, 10).map((template) => ({
-      id: template.id.toString(),
-      label: `📞 ${template.name}`
+  const callScripts = await fetchCallScriptsSummary(ctx, ensureActive);
+  if (callScripts.length > 0) {
+    const options = callScripts.slice(0, 10).map((script) => ({
+      id: script.id.toString(),
+      label: `📞 ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
     options.push({ id: 'clear', label: '🗑️ Clear' });
@@ -418,23 +451,23 @@ async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      `Select default call template (current: ${persona.call_template_id || 'none'})`,
+      `Select default call script (current: ${persona.call_script_id || 'none'})`,
       options,
       { prefix: 'persona-edit-call', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id === 'clear') {
-      updates.call_template_id = null;
+      updates.call_script_id = null;
     } else if (selection.id !== 'skip') {
-      updates.call_template_id = Number(selection.id);
+      updates.call_script_id = Number(selection.id);
     }
   }
 
-  const smsTemplates = await fetchSmsTemplatesSummary(ctx, ensureActive);
-  if (smsTemplates.length > 0) {
-    const options = smsTemplates.slice(0, 10).map((template) => ({
-      id: template.name,
-      label: `${template.is_builtin ? '📦' : '📝'} ${template.name}`
+  const smsScripts = await fetchSmsScriptsSummary(ctx, ensureActive);
+  if (smsScripts.length > 0) {
+    const options = smsScripts.slice(0, 10).map((script) => ({
+      id: script.name,
+      label: `${script.is_builtin ? '📦' : '📝'} ${script.name}`
     }));
     options.push({ id: 'skip', label: '⏭️ Skip' });
     options.push({ id: 'clear', label: '🗑️ Clear' });
@@ -442,20 +475,20 @@ async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
     const selection = await askOptionWithButtons(
       conversation,
       ctx,
-      `Select default SMS template (current: ${persona.sms_template_name || 'none'})`,
+      `Select default SMS script (current: ${persona.sms_script_name || 'none'})`,
       options,
       { prefix: 'persona-edit-sms', columns: 1, ensureActive: safeEnsureActiveFactory(ctx, ensureActive) }
     );
 
     if (selection.id === 'clear') {
-      updates.sms_template_name = null;
+      updates.sms_script_name = null;
     } else if (selection.id !== 'skip') {
-      updates.sms_template_name = selection.id;
+      updates.sms_script_name = selection.id;
     }
   }
 
   if (!Object.keys(updates).length) {
-    await ctx.reply('ℹ️ No changes made.');
+    await styledAlert(ctx, 'No changes made.');
     return;
   }
 
@@ -463,13 +496,15 @@ async function editPersonaFlow(conversation, ctx, ensureActive, persona) {
 
   try {
     const response = await updatePersona(ctx, ensureActive, persona.slug, updates);
-    await ctx.reply(`✅ Persona *${response.persona.label}* updated.`, { parse_mode: 'Markdown' });
+    await styledSection(ctx, '✅ Persona Updated', [
+      `Persona *${response.persona.label}* saved successfully.`
+    ]);
     invalidatePersonaCache();
     await getBusinessOptions(true);
   } catch (error) {
     console.error('Failed to update persona:', error?.response?.data || error.message);
     const details = error.response?.data?.error || error.message;
-    await ctx.reply(`❌ Failed to update persona: ${details}`);
+    await styledAlert(ctx, `Failed to update persona: ${details}`);
   }
 }
 
@@ -482,19 +517,21 @@ async function deletePersonaFlow(conversation, ctx, ensureActive, persona) {
   );
 
   if (!confirmed) {
-    await ctx.reply('Deletion cancelled.');
+    await styledAlert(ctx, 'Deletion cancelled.');
     return;
   }
 
   try {
     await deletePersona(ctx, ensureActive, persona.slug);
-    await ctx.reply(`🗑️ Persona *${persona.label}* deleted.`, { parse_mode: 'Markdown' });
+    await styledSection(ctx, '🗑️ Persona Deleted', [
+      `Persona *${persona.label}* removed from the registry.`
+    ]);
     invalidatePersonaCache();
     await getBusinessOptions(true);
   } catch (error) {
     console.error('Failed to delete persona:', error?.response?.data || error.message);
     const details = error.response?.data?.error || error.message;
-    await ctx.reply(`❌ Failed to delete persona: ${details}`);
+    await styledAlert(ctx, `Failed to delete persona: ${details}`);
   }
 }
 
@@ -503,17 +540,17 @@ async function personaFlow(conversation, ctx) {
   const ensureActive = () => ensureOperationActive(ctx, opId);
 
   try {
-    const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+    const access = await getAccessProfile(ctx);
     ensureActive();
-    if (!user) {
-      await ctx.reply('❌ You are not authorized to use this bot.');
+    if (!access.isAuthorized) {
+      await styledAlert(ctx, 'Access denied. Your account is not authorized for this action.');
       return;
     }
 
-    const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
+    const adminStatus = Boolean(access.isAdmin);
     ensureActive();
     if (!adminStatus) {
-      await ctx.reply('❌ This command is for administrators only.');
+      await styledAlert(ctx, 'Access denied. This action is available to administrators only.');
       return;
     }
 
@@ -536,6 +573,11 @@ async function personaFlow(conversation, ctx) {
         { prefix: 'persona-menu', columns: 2, ensureActive }
       );
 
+      if (!choice?.id) {
+        await styledAlert(ctx, 'Selection expired. Please choose an option again.');
+        continue;
+      }
+
       switch (choice.id) {
         case 'list': {
           try {
@@ -543,26 +585,24 @@ async function personaFlow(conversation, ctx) {
             const builtin = data.builtin || [];
             const custom = data.custom || [];
 
-            let message = '🎭 *Persona Profiles*\n\n';
-            message += `Built-in (${builtin.length}):\n`;
-            builtin.forEach((persona) => {
-              message += `• ${persona.label} (${persona.id})\n`;
-            });
-
+            const lines = [
+              `Built-in (${builtin.length}):`,
+              ...builtin.map((persona) => `• ${persona.label} (${persona.id})`)
+            ];
             if (custom.length) {
-              message += `\nCustom (${custom.length}):\n`;
-              custom.forEach((persona) => {
-                message += `• ${persona.label} (${persona.slug})\n`;
-              });
+              lines.push('');
+              lines.push(`Custom (${custom.length}):`);
+              lines.push(...custom.map((persona) => `• ${persona.label} (${persona.slug})`));
             } else {
-              message += '\nNo custom personas yet.\n';
+              lines.push('');
+              lines.push('No custom personas yet.');
             }
 
-            await ctx.reply(message, { parse_mode: 'Markdown' });
-          } catch (error) {
+            await ctx.reply(section('🎭 Persona Profiles', lines));
+            } catch (error) {
             console.error('Failed to list personas:', error?.response?.data || error.message);
             const details = error.response?.data?.error || error.message;
-            await ctx.reply(`❌ Failed to list personas: ${details}`);
+            await styledAlert(ctx, `Failed to list personas: ${details}`);
           }
           break;
         }
@@ -575,12 +615,12 @@ async function personaFlow(conversation, ctx) {
             const custom = data.custom || [];
             const slug = await selectCustomPersona(conversation, ctx, ensureActive, custom);
             if (!slug) {
-              await ctx.reply('ℹ️ Edit cancelled.');
+              await styledAlert(ctx, 'Edit cancelled.');
               break;
             }
             const persona = custom.find((profile) => profile.slug === slug);
             if (!persona) {
-              await ctx.reply('❌ Persona not found. Try refreshing the cache.');
+              await styledAlert(ctx, 'Persona not found. Try refreshing the cache.');
               break;
             }
             await editPersonaFlow(conversation, ctx, ensureActive, persona);
@@ -590,7 +630,7 @@ async function personaFlow(conversation, ctx) {
             }
             console.error('Failed during persona edit:', error?.response?.data || error.message);
             const details = error.response?.data?.error || error.message;
-            await ctx.reply(`❌ Failed to edit persona: ${details}`);
+            await styledAlert(ctx, `Failed to edit persona: ${details}`);
           }
           break;
         }
@@ -600,12 +640,12 @@ async function personaFlow(conversation, ctx) {
             const custom = data.custom || [];
             const slug = await selectCustomPersona(conversation, ctx, ensureActive, custom);
             if (!slug) {
-              await ctx.reply('ℹ️ Deletion cancelled.');
+              await styledAlert(ctx, 'Deletion cancelled.');
               break;
             }
             const persona = custom.find((profile) => profile.slug === slug);
             if (!persona) {
-              await ctx.reply('❌ Persona not found. Try refreshing the cache.');
+              await styledAlert(ctx, 'Persona not found. Try refreshing the cache.');
               break;
             }
             await deletePersonaFlow(conversation, ctx, ensureActive, persona);
@@ -615,14 +655,14 @@ async function personaFlow(conversation, ctx) {
             }
             console.error('Failed during persona deletion:', error?.response?.data || error.message);
             const details = error.response?.data?.error || error.message;
-            await ctx.reply(`❌ Failed to delete persona: ${details}`);
+            await styledAlert(ctx, `Failed to delete persona: ${details}`);
           }
           break;
         }
         case 'cache':
           invalidatePersonaCache();
           await getBusinessOptions(true);
-          await ctx.reply('🔄 Persona cache refreshed.');
+          await styledSection(ctx, '🔄 Persona Cache', ['Persona cache refreshed.']);
           break;
         case 'exit':
           active = false;
@@ -632,14 +672,14 @@ async function personaFlow(conversation, ctx) {
       }
     }
 
-    await ctx.reply('✅ Persona manager closed.');
+    await styledSection(ctx, '🏁 Persona Manager', ['Closed — come back anytime.']);
   } catch (error) {
     if (error instanceof OperationCancelledError) {
       console.log('Persona flow cancelled:', error.message);
       return;
     }
     console.error('Persona flow error:', error);
-    await ctx.reply('❌ An error occurred in persona manager. Please try again.');
+    await styledAlert(ctx, 'An error occurred in persona manager. Please try again.');
   } finally {
     if (ctx.session?.currentOp?.id === opId) {
       ctx.session.currentOp = null;
@@ -650,10 +690,19 @@ async function personaFlow(conversation, ctx) {
 function registerPersonaCommand(bot) {
   bot.command('persona', async (ctx) => {
     try {
+      const access = await getAccessProfile(ctx);
+      if (!access.isAuthorized) {
+        return ctx.reply('❌ Access denied. Your account is not authorized for this action.');
+      }
+
+      if (!access.isAdmin) {
+        return ctx.reply('❌ Access denied. This action is available to administrators only.');
+      }
+
       await ctx.conversation.enter('persona-conversation');
     } catch (error) {
       console.error('Failed to start persona conversation:', error);
-      await ctx.reply('❌ Unable to start persona manager. Please try again.');
+      await styledAlert(ctx, 'Unable to start persona manager. Please try again.');
     }
   });
 }

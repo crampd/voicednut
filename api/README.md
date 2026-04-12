@@ -17,6 +17,12 @@ Features:
 - 🛠️ Allows the GPT to call external tools.
 - 🎭 Persona composer tailors tone, mood, and phrasing across business domains, channels, and urgency levels.
 
+## Digit Capture Roadmap
+
+For the phased enterprise hardening plan of digit-capture profiles (reprompts, retries, timeout/failure handling, state machine, observability, and security), see:
+
+- `api/docs/digit-capture-enterprise-roadmap.md`
+
 ## AWS Connect Mode
 
 Twilio Media Streams is still supported, but the API now ships with an AWS-native path that uses Amazon Connect, Kinesis/Transcribe, and Polly for end-to-end audio orchestration. Flip the provider by setting `CALL_PROVIDER=aws` and providing the following environment variables:
@@ -24,6 +30,9 @@ Twilio Media Streams is still supported, but the API now ships with an AWS-nativ
 - `AWS_REGION`, `AWS_CONNECT_INSTANCE_ID`, and `AWS_CONNECT_CONTACT_FLOW_ID`
 - `AWS_POLLY_OUTPUT_BUCKET` (Polly audio will be persisted here for Connect to play)
 - `AWS_PINPOINT_APPLICATION_ID` and `AWS_PINPOINT_ORIGINATION_NUMBER` for SMS
+- `AWS_WEBHOOK_VALIDATION` and one of:
+  - API HMAC headers (`x-api-timestamp`, `x-api-signature`) on `POST /webhook/aws/status` and `POST /aws/transcripts`
+  - or `AWS_WEBHOOK_SECRET` sent as `x-aws-webhook-secret` for callback forwarders
 - Optional: `AWS_TRANSCRIBE_LANGUAGE_CODE`, custom queue/phone routing, and vocabulary filters
 
 When running in AWS mode:
@@ -32,16 +41,118 @@ When running in AWS mode:
 - Real-time transcriptions should be forwarded to the API via the new `POST /aws/transcripts` endpoint (used by the StreamAdapter worker).
 - Contact state changes from Connect can be normalized by posting to `POST /aws/contact-events`.
 - AI responses are synthesized with Polly and queued for playback through contact attributes, so the contact flow can fetch the latest S3 object and play it back to the caller.
+- `WS /aws/stream` requires stream auth query params (`token`, `ts`) or the `AWS_WEBHOOK_SECRET` query/header fallback.
 
 Keep the Twilio credentials in place if you want a rapid rollback path—switching the provider back to `twilio` will re-enable the original websocket-based flow without redeploying code.
 
+## Provider Preflight Gate and Parity Smoke
+
+Provider activation is fail-closed for `twilio` and `vonage` on `call` and `sms` channels:
+
+- `POST /admin/provider` now runs provider preflight before activation.
+- On preflight failure, activation is blocked and the currently active provider remains in place.
+- `GET /admin/provider/preflight` runs read-only preflight checks and returns a detailed report.
+
+Preflight checks include:
+
+- Credential/auth probe (minimal safe provider API call).
+- Webhook auth mode + signing secret + validation guard coverage.
+- Callback URL configuration and optional reachability probe.
+- Required route registration for voice and SMS webhooks.
+
+CLI helper:
+
+```bash
+npm run preflight:provider -- --channel call --provider twilio --network 1 --reachability 1
+```
+
+Provider parity smoke suite (no Jest):
+
+```bash
+# Fast deterministic offline checks (default)
+npm run parity:providers
+
+# Optional live provider auth checks
+LIVE_SMOKE=1 npm run parity:providers
+```
+
+## Worker Reliability Controls
+
+- `CALL_JOB_TIMEOUT_MS` limits each call job execution window.
+- `CALL_JOB_DLQ_ALERT_THRESHOLD` emits health alerts when open call-job DLQ entries exceed the threshold.
+- `CALL_JOB_DLQ_MAX_REPLAYS` limits replay attempts for a single call-job DLQ entry.
+- `WEBHOOK_TELEGRAM_TIMEOUT_MS` sets Telegram send/edit timeout for notification delivery.
+- `EMAIL_REQUEST_TIMEOUT_MS` sets HTTP timeout for SendGrid/Mailgun/SES provider calls.
+- `EMAIL_DLQ_ALERT_THRESHOLD` emits health alerts when open email DLQ entries exceed the threshold.
+- `EMAIL_DLQ_MAX_REPLAYS` limits replay attempts for a single email DLQ entry.
+- Admin DLQ control endpoints:
+  - `GET /admin/call-jobs/dlq`
+  - `POST /admin/call-jobs/dlq/:id/replay`
+  - `GET /admin/email/dlq`
+  - `POST /admin/email/dlq/:id/replay`
+
+## Telegram Mini App Replay Validation
+
+Mini App session bootstrap now supports replay validation modes:
+
+- `MINI_APP_REPLAY_VALIDATION=warn` (default): replay is detected and logged, but session issuance continues.
+- `MINI_APP_REPLAY_VALIDATION=strict`: replay is rejected with HTTP `409` and code `miniapp_replay_detected`.
+- `MINI_APP_REPLAY_VALIDATION=off`: replay detection is disabled.
+
+Related controls:
+
+- `MINI_APP_REPLAY_WINDOW_SECONDS` defines the dedupe window.
+- `MINI_APP_INITDATA_MAX_AGE_SECONDS` controls Telegram init-data freshness validation during session bootstrap (recommended: `86400` for production operator consoles to avoid frequent relaunch expiry).
+- `MINI_APP_INITDATA_EXPIRY_GRACE_SECONDS` allows bounded post-expiry session bootstrap grace (recommended: `604800` for operator consoles to reduce forced Telegram relaunch loops while replay checks remain enabled).
+
+Recommended rollout:
+
+1. Start with `warn` in production and monitor `miniapp_route` and `miniapp_alert` health events.
+2. Switch to `strict` after validating there are no legitimate duplicate launch flows.
+3. Keep `off` only for short-term troubleshooting.
+
+## API HMAC Replay Validation
+
+API request HMAC verification now supports replay-validation modes:
+
+- `API_HMAC_REPLAY_VALIDATION=warn` (default): replay is detected and logged, request is still accepted.
+- `API_HMAC_REPLAY_VALIDATION=strict`: replay is rejected during HMAC verification.
+- `API_HMAC_REPLAY_VALIDATION=off`: replay detection is disabled.
+
+Related controls:
+
+- `API_HMAC_REPLAY_WINDOW_MS` sets the replay dedupe window.
+- `API_HMAC_MAX_SKEW_MS` keeps timestamp tolerance bounded.
+
+Recommended rollout:
+
+1. Run `warn` first and monitor `api_auth` health events for replay noise.
+2. Move to `strict` only after verifying callers sign each retry with a fresh timestamp.
+
+## Post-Call QA Scoring (Feature-Flagged)
+
+Post-call QA evaluation can now run at call-end with default-safe gates:
+
+- `POST_CALL_QA_ENABLED=false`
+- `POST_CALL_QA_SHADOW_MODE=true`
+- `POST_CALL_QA_ROLLOUT_PERCENT=0`
+- `POST_CALL_QA_ALLOWLIST=`
+- `POST_CALL_QA_KILL_SWITCH=false`
+- `POST_CALL_QA_PROFILE_THRESHOLDS=` (optional: `collections:78,support:72,sales:74,verification:80`)
+- `POST_CALL_QA_RUBRIC_WEIGHTS=` (optional JSON object for rubric weighting)
+
+Manual API controls:
+
+- `GET /api/qa/summary`
+- `GET /api/calls/:callSid/qa`
+- `POST /api/calls/:callSid/qa/evaluate?force=1`
+
 ## Adaptive Persona and Mood Profiles
 
-The API ships with a persona composer that inspects call metadata (business domain, purpose, channel, urgency, and mood signals) and produces the appropriate system prompt and greeting. Editable templates live in:
+The API ships with adaptive persona handling that inspects call metadata (business domain, purpose, channel, urgency, and mood signals) and produces the appropriate system prompt and greeting. Personality and profile logic currently live in:
 
-- `api/config/business.js` – domain-specific copy, channel/purpose openers, and capability hints.
-- `api/config/personalityTemplates.js` – mood, urgency, and channel tone guides.
-- `api/services/PersonaComposer.js` – combines the templates and removes voice-only cues when switching to SMS or alerts.
+- `api/functions/PersonalityEngine.js`
+- `api/routes/gpt.js`
 
 Voice calls and SMS conversations automatically fall back to the default adaptive prompt when no persona is supplied, so free-form prompts continue to work as before.
 
@@ -63,7 +174,8 @@ ngrok http 3000
 Ngrok will give you a unique URL, like `abc123.ngrok.io`. Copy the URL without http:// or https://. You'll need this URL in the next step.
 
 ### 2. Configure Environment Variables
-Copy `.env.example` to `.env` and configure the following environment variables:
+Copy `.env.example` to `.env` and configure the minimal variables first.
+If you need runtime tuning, copy specific overrides from `.env.advanced.example`.
 
 ```bash
 # Your ngrok or server URL
@@ -71,15 +183,15 @@ Copy `.env.example` to `.env` and configure the following environment variables:
 SERVER="yourserverdomain.com"
 
 # Service API Keys
-OPENAI_API_KEY="sk-XXXXXX"
+OPENROUTER_API_KEY="YOUR-OPENROUTER-API-KEY"
 DEEPGRAM_API_KEY="YOUR-DEEPGRAM-API-KEY"
+API_SECRET="change-me"
 
 # Configure your Twilio credentials if you want
 # to make test calls using '$ npm test'.
 TWILIO_ACCOUNT_SID="YOUR-ACCOUNT-SID"
 TWILIO_AUTH_TOKEN="YOUR-AUTH-TOKEN"
 FROM_NUMBER='+12223334444'
-TO_NUMBER='+13334445555'
 ```
 
 ### 3. Install Dependencies with NPM

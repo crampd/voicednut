@@ -1,0 +1,8029 @@
+'use strict';
+
+const crypto = require('crypto');
+const { resolvePaymentExecutionMode } = require('../adapters/providerFlowPolicy');
+
+const DIGIT_WORD_MAP = {
+  zero: '0',
+  oh: '0',
+  o: '0',
+  one: '1',
+  two: '2',
+  three: '3',
+  four: '4',
+  five: '5',
+  six: '6',
+  seven: '7',
+  eight: '8',
+  nine: '9'
+};
+
+const SPOKEN_DIGIT_PATTERN = new RegExp(
+  `\\b(?:${Object.keys(DIGIT_WORD_MAP).join('|')})(?:\\s+(?:${Object.keys(DIGIT_WORD_MAP).join('|')})){3,}\\b`,
+  'gi'
+);
+
+const SAFE_TIMEOUT_MIN_S = 3;
+const SAFE_TIMEOUT_MAX_S = 60;
+const SAFE_RETRY_MAX = 5;
+const DEFAULT_TIMEOUT_GRACE_MS = 1200;
+const MAX_DIGITS_BUFFER = 50;  // Prevent unbounded buffer growth
+const PROFILE_TIMEOUT_FLOORS_S = Object.freeze({
+  generic: 8,
+  verification: 12,
+  otp: 12,
+  pin: 10,
+  ssn: 12,
+  dob: 12,
+  routing_number: 12,
+  account_number: 14,
+  account: 12,
+  phone: 12,
+  tax_id: 12,
+  ein: 12,
+  claim_number: 10,
+  reservation_number: 10,
+  ticket_number: 10,
+  case_number: 10,
+  amount: 10,
+  callback_confirm: 12,
+  cvv: 10,
+  card_number: 18,
+  card_expiry: 12,
+  zip: 10,
+  extension: 8
+});
+const DEFAULT_RISK_THRESHOLDS = {
+  confirm: 0.55,
+  dtmf_only: 0.7,
+  route_agent: 0.9
+};
+const INTENT_PREDICT_MIN_SCORE = 0.8;
+const SMS_FALLBACK_MIN_RETRIES = 2;
+const DEFAULT_HEALTH_THRESHOLDS = {
+  degraded: 30,
+  overloaded: 60
+};
+const DEFAULT_CIRCUIT_BREAKER = {
+  windowMs: 60000,
+  minSamples: 8,
+  errorRate: 0.3,
+  cooldownMs: 60000
+};
+const DEFAULT_CAPTURE_ADAPTIVE_POLICY = Object.freeze({
+  poorJitterMs: 20,
+  poorRttMs: 250,
+  poorPacketLossPct: 1,
+  severeJitterMs: 35,
+  severeRttMs: 350,
+  severePacketLossPct: 2.5
+});
+const PLAN_STATES = Object.freeze({
+  INIT: 'INIT',
+  PLAY_FIRST_MESSAGE: 'PLAY_FIRST_MESSAGE',
+  COLLECT_STEP: 'COLLECT_STEP',
+  ADVANCE: 'ADVANCE',
+  COMPLETE: 'COMPLETE',
+  FAIL: 'FAIL'
+});
+const CAPTURE_STATES = Object.freeze({
+  IDLE: 'idle',
+  PROMPTED: 'prompted',
+  WAITING: 'waiting',
+  SOFT_TIMEOUT: 'soft_timeout',
+  COLLECTING: 'collecting',
+  RETRYING: 'retrying',
+  FINAL_ATTEMPT: 'final_attempt',
+  FALLBACK_CHANNEL: 'fallback_channel',
+  COMPLETED: 'completed',
+  ABORTED: 'aborted'
+});
+const CAPTURE_EVENTS = Object.freeze({
+  START_COLLECT: 'start_collect',
+  PROMPT_PLAYED: 'prompt_played',
+  WAIT_FOR_INPUT: 'wait_for_input',
+  SOFT_TIMEOUT: 'soft_timeout',
+  FINAL_ATTEMPT_WARN: 'final_attempt_warn',
+  PROMPT_RETRY: 'prompt_retry',
+  RESUME_COLLECT: 'resume_collect',
+  FALLBACK: 'fallback',
+  COMPLETE: 'complete',
+  ABORT: 'abort',
+  RESET: 'reset'
+});
+const CAPTURE_TRANSITIONS = Object.freeze({
+  [CAPTURE_STATES.IDLE]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.PROMPT_PLAYED]: CAPTURE_STATES.PROMPTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.PROMPTED]: {
+    [CAPTURE_EVENTS.WAIT_FOR_INPUT]: CAPTURE_STATES.WAITING,
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.WAITING]: {
+    [CAPTURE_EVENTS.PROMPT_PLAYED]: CAPTURE_STATES.PROMPTED,
+    [CAPTURE_EVENTS.SOFT_TIMEOUT]: CAPTURE_STATES.SOFT_TIMEOUT,
+    [CAPTURE_EVENTS.PROMPT_RETRY]: CAPTURE_STATES.RETRYING,
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.SOFT_TIMEOUT]: {
+    [CAPTURE_EVENTS.PROMPT_PLAYED]: CAPTURE_STATES.PROMPTED,
+    [CAPTURE_EVENTS.RESUME_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.PROMPT_RETRY]: CAPTURE_STATES.RETRYING,
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.COLLECTING]: {
+    [CAPTURE_EVENTS.PROMPT_PLAYED]: CAPTURE_STATES.PROMPTED,
+    [CAPTURE_EVENTS.WAIT_FOR_INPUT]: CAPTURE_STATES.WAITING,
+    [CAPTURE_EVENTS.SOFT_TIMEOUT]: CAPTURE_STATES.SOFT_TIMEOUT,
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.FINAL_ATTEMPT_WARN]: CAPTURE_STATES.FINAL_ATTEMPT,
+    [CAPTURE_EVENTS.PROMPT_RETRY]: CAPTURE_STATES.RETRYING,
+    [CAPTURE_EVENTS.FALLBACK]: CAPTURE_STATES.FALLBACK_CHANNEL,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.RETRYING]: {
+    [CAPTURE_EVENTS.PROMPT_PLAYED]: CAPTURE_STATES.PROMPTED,
+    [CAPTURE_EVENTS.WAIT_FOR_INPUT]: CAPTURE_STATES.WAITING,
+    [CAPTURE_EVENTS.SOFT_TIMEOUT]: CAPTURE_STATES.SOFT_TIMEOUT,
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESUME_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.FINAL_ATTEMPT_WARN]: CAPTURE_STATES.FINAL_ATTEMPT,
+    [CAPTURE_EVENTS.PROMPT_RETRY]: CAPTURE_STATES.RETRYING,
+    [CAPTURE_EVENTS.FALLBACK]: CAPTURE_STATES.FALLBACK_CHANNEL,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.FINAL_ATTEMPT]: {
+    [CAPTURE_EVENTS.PROMPT_PLAYED]: CAPTURE_STATES.PROMPTED,
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESUME_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.FALLBACK_CHANNEL]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESUME_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.COMPLETE]: CAPTURE_STATES.COMPLETED,
+    [CAPTURE_EVENTS.ABORT]: CAPTURE_STATES.ABORTED,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.COMPLETED]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  },
+  [CAPTURE_STATES.ABORTED]: {
+    [CAPTURE_EVENTS.START_COLLECT]: CAPTURE_STATES.COLLECTING,
+    [CAPTURE_EVENTS.RESET]: CAPTURE_STATES.IDLE
+  }
+});
+const PAYMENT_STATES = Object.freeze({
+  DISABLED: 'disabled',
+  READY: 'ready',
+  REQUESTED: 'requested',
+  ACTIVE: 'active',
+  COMPLETED: 'completed',
+  FAILED: 'failed'
+});
+const PAYMENT_STATE_ALIASES = Object.freeze({
+  disabled: PAYMENT_STATES.DISABLED,
+  ready: PAYMENT_STATES.READY,
+  requested: PAYMENT_STATES.REQUESTED,
+  pending: PAYMENT_STATES.REQUESTED,
+  active: PAYMENT_STATES.ACTIVE,
+  started: PAYMENT_STATES.ACTIVE,
+  collecting: PAYMENT_STATES.ACTIVE,
+  in_progress: PAYMENT_STATES.ACTIVE,
+  completed: PAYMENT_STATES.COMPLETED,
+  success: PAYMENT_STATES.COMPLETED,
+  failed: PAYMENT_STATES.FAILED,
+  error: PAYMENT_STATES.FAILED
+});
+const PAYMENT_TRANSITIONS = Object.freeze({
+  [PAYMENT_STATES.DISABLED]: new Set([PAYMENT_STATES.READY]),
+  [PAYMENT_STATES.READY]: new Set([
+    PAYMENT_STATES.REQUESTED,
+    PAYMENT_STATES.ACTIVE,
+    PAYMENT_STATES.COMPLETED,
+    PAYMENT_STATES.FAILED,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.REQUESTED]: new Set([
+    PAYMENT_STATES.ACTIVE,
+    PAYMENT_STATES.COMPLETED,
+    PAYMENT_STATES.FAILED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.ACTIVE]: new Set([
+    PAYMENT_STATES.COMPLETED,
+    PAYMENT_STATES.FAILED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.COMPLETED]: new Set([
+    PAYMENT_STATES.REQUESTED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ]),
+  [PAYMENT_STATES.FAILED]: new Set([
+    PAYMENT_STATES.REQUESTED,
+    PAYMENT_STATES.READY,
+    PAYMENT_STATES.DISABLED
+  ])
+});
+const PAYMENT_TERMINAL_STATES = new Set([
+  PAYMENT_STATES.COMPLETED,
+  PAYMENT_STATES.FAILED,
+  PAYMENT_STATES.DISABLED
+]);
+const PAYMENT_PROVIDER_ADAPTERS = Object.freeze({
+  twilio: {
+    id: 'twilio',
+    label: 'Twilio Pay',
+    buildStartUrl: (host, callSid, paymentId) => `https://${host}/webhook/twilio-pay/start?callSid=${encodeURIComponent(callSid)}&paymentId=${encodeURIComponent(paymentId)}`,
+    buildCompleteUrl: (host, callSid, paymentId) => `https://${host}/webhook/twilio-pay/complete?callSid=${encodeURIComponent(callSid)}&paymentId=${encodeURIComponent(paymentId)}`,
+    buildStatusUrl: (host, callSid, paymentId) => `https://${host}/webhook/twilio-pay/status?callSid=${encodeURIComponent(callSid)}&paymentId=${encodeURIComponent(paymentId)}`
+  }
+});
+const GROUP_MIN_SCORE = 2;
+const GROUP_MIN_CONFIDENCE = 0.75;
+const GLOBAL_IDEMPOTENCY_TTL_MS = 120000;
+const GLOBAL_IDEMPOTENCY_MAX_ENTRIES = 12000;
+const CROSS_CHANNEL_INPUT_TTL_MS = 2500;
+const CAPTURE_SESSION_TERMINAL_STATES = new Set(['completed', 'aborted']);
+const CAPTURE_VAULT_MAX_ENTRIES = 5000;
+const CAPTURE_VAULT_DEFAULT_TTL_MS = 10 * 60 * 1000;
+const CHANNEL_SESSION_ROTATE_MIN_MS = 1500;
+const DEFAULT_CAPTURE_SLO = Object.freeze({
+  windowSize: 200,
+  successRateMin: 0.78,
+  medianCaptureMsMax: 45000,
+  duplicateSuppressionRateMax: 0.35,
+  timeoutErrorRateMax: 0.2
+});
+const GROUP_KEYWORDS = {
+  banking: {
+    positive: {
+      strong: ['routing', 'aba', 'checking', 'savings'],
+      weak: ['bank account', 'account']
+    },
+    negative: ['card', 'cvv', 'expiry', 'expiration', 'zip']
+  },
+  card: {
+    positive: {
+      strong: ['card number', 'cvv', 'expiry', 'expiration', 'zip'],
+      weak: ['card', 'security code']
+    },
+    negative: ['routing', 'aba', 'checking', 'savings', 'bank account', 'account']
+  }
+};
+const DIGIT_CAPTURE_GROUPS = {
+  banking: {
+    id: 'banking',
+    label: 'Banking',
+    steps: [
+      { profile: 'routing_number' },
+      { profile: 'account_number' }
+    ]
+  },
+  card: {
+    id: 'card',
+    label: 'Card Details',
+    steps: [
+      {
+        profile: 'card_number',
+        min_digits: 16,
+        max_digits: 16,
+        force_exact_length: 16,
+        prompt: 'Please enter the 16 digits of your card number now.'
+      },
+      {
+        profile: 'card_expiry',
+        min_digits: 4,
+        max_digits: 4,
+        force_exact_length: 4,
+        prompt: 'Please enter the expiration date: 2 digits for month and 2 digits for year. For example, zero seven two seven.'
+      },
+      {
+        profile: 'cvv',
+        min_digits: 3,
+        max_digits: 3,
+        force_exact_length: 3,
+        prompt: 'Please enter the 3 digit security code on the back of your card.'
+      },
+      {
+        profile: 'zip',
+        min_digits: 5,
+        max_digits: 5,
+        force_exact_length: 5,
+        prompt: 'Please enter your 5 digit billing ZIP code now.'
+      }
+    ]
+  }
+};
+
+const SUPPORTED_DIGIT_PROFILES = new Set([
+  'generic',
+  'verification',
+  'otp',
+  'pin',
+  'ssn',
+  'dob',
+  'routing_number',
+  'account_number',
+  'phone',
+  'tax_id',
+  'ein',
+  'claim_number',
+  'reservation_number',
+  'ticket_number',
+  'case_number',
+  'account',
+  'extension',
+  'zip',
+  'amount',
+  'callback_confirm',
+  'card_number',
+  'cvv',
+  'card_expiry'
+]);
+
+function createDigitCollectionService(options = {}) {
+  const {
+    db,
+    webhookService,
+    callConfigurations,
+    config,
+    twilioClient,
+    VoiceResponse,
+    getCurrentProvider,
+    speakAndEndCall,
+    clearSilenceTimer,
+    queuePendingDigitAction,
+    getTwilioTtsAudioUrl,
+    callEndMessages = {},
+    closingMessage = 'Thank you for your time. Goodbye.',
+    settings = {},
+    logger = console,
+    smsService = null,
+    riskEvaluator = null,
+    healthProvider = null,
+    setCallFlowState = null,
+    getPaymentFeatureConfig = null,
+    buildPaymentSmsFallbackLink = null,
+    buildPaymentSmsFallbackMessage = null
+  } = options;
+
+  const {
+    otpLength = 6,
+    otpMaxRetries = 3,
+    otpDisplayMode = 'masked',
+    defaultCollectDelayMs = 1200,
+    fallbackToVoiceOnFailure = true,
+    showRawDigitsLive = true,
+    sendRawDigitsToUser = true,
+    minDtmfGapMs = 200,
+    riskThresholds = DEFAULT_RISK_THRESHOLDS,
+    smsFallbackEnabled = true,
+    smsFallbackMinRetries = SMS_FALLBACK_MIN_RETRIES,
+    smsFallbackMessage = 'I have sent you a text message. Please reply with the digits to continue.',
+    smsFallbackConfirmationMessage = 'Thanks, your reply was received.',
+    smsFallbackFailureMessage = 'I could not verify the digits via SMS. Please try again later.',
+    captureVaultTtlMs = CAPTURE_VAULT_DEFAULT_TTL_MS,
+    captureSlo = DEFAULT_CAPTURE_SLO,
+    adaptivePolicy = DEFAULT_CAPTURE_ADAPTIVE_POLICY,
+    intentPredictor = null,
+    healthThresholds = DEFAULT_HEALTH_THRESHOLDS,
+    circuitBreaker = DEFAULT_CIRCUIT_BREAKER
+  } = settings;
+
+  const strictTimeoutGraceMs = Number.isFinite(Number(settings.strictTimeoutGraceMs))
+    ? Number(settings.strictTimeoutGraceMs)
+    : DEFAULT_TIMEOUT_GRACE_MS;
+
+  const sanitizeMetricValue = (key, value) => {
+    const keyName = String(key || '').toLowerCase();
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'string') {
+      if (
+        keyName.includes('digit')
+        || keyName.includes('otp')
+        || keyName.includes('cvv')
+        || keyName.includes('card')
+        || keyName.includes('ssn')
+        || keyName.includes('phone')
+        || keyName.includes('token')
+        || keyName.includes('raw')
+      ) {
+        if (value.startsWith('vault://')) return value;
+        const trimmed = value.replace(/\s+/g, '');
+        if (/^\d{4,}$/.test(trimmed)) {
+          return `${'*'.repeat(Math.max(2, Math.min(8, trimmed.length - 2)))}${trimmed.slice(-2)}`;
+        }
+      }
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => sanitizeMetricValue(key, entry));
+    }
+    if (typeof value === 'object') {
+      const out = {};
+      Object.entries(value).forEach(([childKey, childValue]) => {
+        out[childKey] = sanitizeMetricValue(childKey, childValue);
+      });
+      return out;
+    }
+    return value;
+  };
+
+  const sanitizeMetricPayload = (payload = {}) => {
+    const out = {};
+    Object.entries(payload || {}).forEach(([key, value]) => {
+      out[key] = sanitizeMetricValue(key, value);
+    });
+    return out;
+  };
+
+  const logDigitMetric = (event, meta = {}) => {
+    const payload = sanitizeMetricPayload({ event, ...meta });
+    try {
+      if (logger && typeof logger.info === 'function') {
+        logger.info(`[digits] ${event}`, payload);
+      } else if (logger && typeof logger.log === 'function') {
+        logger.log(`[digits] ${event}`, payload);
+      } else {
+        console.log(`[digits] ${event}`, payload);
+      }
+    } catch (_) {}
+  };
+
+  const REMOVED_DIGIT_PROFILES = new Set([
+    'menu',
+    'member_id',
+    'survey',
+    'policy_number',
+    'invoice_number',
+    'confirmation_code'
+  ]);
+  const RELATIONSHIP_PROFILE_HINTS = new Set([
+    'dating',
+    'friendship',
+    'creator',
+    'celebrity',
+    'fan',
+    'community',
+    'networking',
+    'relationship',
+    'romance',
+    'social'
+  ]);
+
+  function normalizeProfileId(profile) {
+    if (!profile) return null;
+    let normalized = String(profile || '').toLowerCase().trim();
+    normalized = normalized.replace(/[\s-]+/g, '_');
+    if (normalized === 'bank_account') normalized = 'account_number';
+    if (normalized === 'routing') normalized = 'routing_number';
+    if (normalized === 'account_num') normalized = 'account_number';
+    if (normalized === 'routing_num') normalized = 'routing_number';
+    if (normalized === 'expiry_date' || normalized === 'expiration_date' || normalized === 'exp_date' || normalized === 'expiry') {
+      normalized = 'card_expiry';
+    }
+    if (normalized === 'zip_code' || normalized === 'postal_code') normalized = 'zip';
+    if (normalized === 'cvc' || normalized === 'cvc2' || normalized === 'card_cvv' || normalized === 'security_code') {
+      normalized = 'cvv';
+    }
+    if (REMOVED_DIGIT_PROFILES.has(normalized)) return 'generic';
+    return normalized;
+  }
+
+  function isSupportedProfile(profile) {
+    const normalized = normalizeProfileId(profile);
+    if (!normalized) return false;
+    return SUPPORTED_DIGIT_PROFILES.has(normalized);
+  }
+
+  function maskDigitsForPreview(digits = '') {
+    if (showRawDigitsLive) return digits || '';
+    const len = String(digits || '').length;
+    if (!len) return '••';
+    const masked = '•'.repeat(Math.max(2, Math.min(6, len)));
+    return len > 6 ? `${masked}…` : masked;
+  }
+
+  function labelForProfile(profile = 'generic') {
+    const normalizedProfile = normalizeProfileId(profile) || 'generic';
+    const map = {
+      verification: 'OTP',
+      otp: 'OTP',
+      pin: 'PIN',
+      ssn: 'SSN',
+      dob: 'DOB',
+      routing_number: 'Routing',
+      account_number: 'Account #',
+      phone: 'Phone',
+      tax_id: 'Tax ID',
+      ein: 'EIN',
+      claim_number: 'Claim',
+      reservation_number: 'Reservation',
+      ticket_number: 'Ticket',
+      case_number: 'Case',
+      account: 'Account',
+      zip: 'ZIP',
+      extension: 'Ext',
+      amount: 'Amount',
+      callback_confirm: 'Callback',
+      card_number: 'Card',
+      cvv: 'CVV',
+      card_expiry: 'Expiry',
+      generic: 'Digits'
+    };
+    return map[normalizedProfile] || normalizedProfile || 'Digits';
+  }
+
+  function titleCaseLabel(value = '') {
+    const text = String(value || '').trim();
+    if (!text) return text;
+    return text
+      .split(/\s+/)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
+  }
+
+  function formatPlanStepLabel(expectation = {}) {
+    const stepIndex = expectation?.plan_step_index;
+    const totalSteps = expectation?.plan_total_steps;
+    if (!Number.isFinite(stepIndex) || !Number.isFinite(totalSteps) || totalSteps <= 0) return '';
+    const label = buildExpectedLabel(expectation);
+    const stepLabel = titleCaseLabel(label);
+    return `Step ${stepIndex}/${totalSteps}: ${stepLabel}`;
+  }
+
+  function labelForClosing(profile = 'generic') {
+    const normalizedProfile = normalizeProfileId(profile) || 'generic';
+    const map = {
+      verification: 'one-time password',
+      otp: 'one-time password',
+      pin: 'PIN',
+      reservation_number: 'reservation number',
+      ticket_number: 'ticket number',
+      case_number: 'case number',
+      claim_number: 'claim number',
+      extension: 'extension',
+      account_number: 'account number',
+      account: 'account number',
+      routing_number: 'routing number',
+      ssn: 'social security number',
+      dob: 'date of birth',
+      zip: 'ZIP code',
+      phone: 'phone number',
+      tax_id: 'tax ID',
+      ein: 'employer ID',
+      card_number: 'card number',
+      cvv: 'card security code',
+      card_expiry: 'card expiry',
+      amount: 'amount'
+    };
+    return map[normalizedProfile] || null;
+  }
+
+  function buildClosingMessage(profile) {
+    const normalized = normalizeProfileId(profile) || 'generic';
+    const tailored = {
+      verification: 'Thank you. Your verification code has been confirmed. Your request is complete. Goodbye.',
+      otp: 'Thank you. Your one-time password has been confirmed. Your request is complete. Goodbye.',
+      pin: 'Thank you. Your PIN input has been confirmed. Your request is complete. Goodbye.',
+      ssn: 'Thank you. Your social security number input has been confirmed. Your request is complete. Goodbye.',
+      dob: 'Thank you. Your date of birth input has been confirmed. Your request is complete. Goodbye.',
+      routing_number: 'Thank you. Your routing number input has been confirmed. Your request is complete. Goodbye.',
+      account_number: 'Thank you. Your account number input has been confirmed. Your request is complete. Goodbye.',
+      account: 'Thank you. Your account number input has been confirmed. Your request is complete. Goodbye.',
+      phone: 'Thank you. Your phone number input has been confirmed. Your request is complete. Goodbye.',
+      tax_id: 'Thank you. Your tax ID input has been confirmed. Your request is complete. Goodbye.',
+      ein: 'Thank you. Your employer ID input has been confirmed. Your request is complete. Goodbye.',
+      claim_number: 'Thank you. Your claim number input has been confirmed. Your request is complete. Goodbye.',
+      reservation_number: 'Thank you. Your reservation number input has been confirmed. Your request is complete. Goodbye.',
+      ticket_number: 'Thank you. Your ticket number input has been confirmed. Your request is complete. Goodbye.',
+      case_number: 'Thank you. Your case number input has been confirmed. Your request is complete. Goodbye.',
+      amount: 'Thank you. Your amount entry has been confirmed. Your request is complete. Goodbye.',
+      callback_confirm: 'Thank you. Your callback number has been confirmed. Your request is complete. Goodbye.',
+      cvv: 'Thank you. Your security code input has been confirmed. Your request is complete. Goodbye.',
+      card_number: 'Thank you. Your card number input has been confirmed. Your request is complete. Goodbye.',
+      card_expiry: 'Thank you. Your card expiry input has been confirmed. Your request is complete. Goodbye.',
+      zip: 'Thank you. Your ZIP code input has been confirmed. Your request is complete. Goodbye.',
+      extension: 'Thank you. Your extension input has been confirmed. Your request is complete. Goodbye.'
+    };
+    if (tailored[normalized]) {
+      return tailored[normalized];
+    }
+    const label = labelForClosing(normalized);
+    if (!label) {
+      return 'Thank you. Your input has been received. Your request is complete. Goodbye.';
+    }
+    return `Thank you. Your ${label} has been received and verified. Your request is complete. Goodbye.`;
+  }
+
+  function estimateSpeechDurationMs(text = '') {
+    const words = String(text || '')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean).length;
+    if (!words) return 0;
+    const wordsPerMinute = 150;
+    return Math.ceil((words / wordsPerMinute) * 60000);
+  }
+
+  function buildExpectedLabel(expectation = {}) {
+    const min = expectation.min_digits || 1;
+    const max = expectation.max_digits || min;
+    const digitLabel = min === max ? `${min}-digit` : `${min}-${max} digit`;
+    const profile = normalizeProfileId(expectation.profile) || 'generic';
+    switch (profile) {
+      case 'extension':
+        return 'extension';
+      case 'zip':
+        return 'ZIP code';
+      case 'account':
+        return 'account number';
+      case 'cvv':
+        return 'security code';
+      case 'card_number':
+        return 'card number';
+      case 'card_expiry':
+        return 'expiry date';
+      case 'amount':
+        return 'amount';
+      case 'account_number':
+        return 'account number';
+      case 'callback_confirm':
+        return 'phone number';
+      case 'ssn':
+        return 'social security number';
+      case 'dob':
+        return 'date of birth';
+      case 'routing_number':
+        return 'routing number';
+      case 'phone':
+        return 'phone number';
+      case 'tax_id':
+        return 'tax ID';
+      case 'ein':
+        return 'employer ID';
+      case 'claim_number':
+        return 'claim number';
+      case 'reservation_number':
+        return 'reservation number';
+      case 'ticket_number':
+        return 'ticket number';
+      case 'case_number':
+        return 'case number';
+      case 'verification':
+      case 'otp':
+        return `${digitLabel} code`;
+      default:
+        return `${digitLabel} code`;
+    }
+  }
+
+  function buildRepromptDetail(expectation = {}) {
+    const profile = normalizeProfileId(expectation.profile) || 'generic';
+    const min = expectation.min_digits || 1;
+    const max = expectation.max_digits || min;
+    const lengthHint = min === max ? `${min} digits` : `${min} to ${max} digits`;
+
+    switch (profile) {
+      case 'card_expiry':
+        if (min === 4 && max === 4) return 'Use MMYY (4 digits).';
+        return max >= 6 ? 'Use MMYY or MMYYYY.' : 'Use MMYY (4 digits).';
+      case 'dob':
+        return max >= 8 ? 'Use MMDDYY or MMDDYYYY.' : 'Use MMDDYY.';
+      case 'cvv':
+        if (min === max) return `Use ${min} digits.`;
+        return 'Use 3 or 4 digits.';
+      case 'zip':
+        if (min === max) return `Use ${min} digits.`;
+        return max >= 9 ? 'Use 5 or 9 digits.' : 'Use 5 digits.';
+      case 'card_number':
+        if (min === max) return `Use exactly ${min} digits.`;
+        return `Use ${min} to ${max} digits.`;
+      case 'routing_number':
+        return 'Use 9 digits.';
+      case 'phone':
+        return 'Use 10 digits.';
+      case 'ssn':
+        return 'Use 9 digits.';
+      case 'pin':
+        return 'Use 4 to 8 digits.';
+      default:
+        return `Expected ${lengthHint}.`;
+    }
+  }
+
+  const PROFILE_PROMPT_POLICY = Object.freeze({
+    generic: {
+      initial: 'Enter the {label} now.{terminatorSuffix}',
+      invalid: [
+        'Enter the {label} now.',
+        'Please enter the {label}. {detail}',
+        'Last attempt: enter the {label} now.'
+      ],
+      timeout: [
+        'I did not receive any input. Enter the {label} now.',
+        'Still waiting for input. Enter the {label} now.',
+        'Final reminder: enter the {label} now.'
+      ],
+      soft_timeout: [
+        'Just a reminder: enter the {label} when you are ready.',
+        'Still waiting for the {label}. Enter it now.',
+        'Final reminder: enter the {label} now.'
+      ],
+      failure: 'We could not verify the {label}. Thank you for your time. Goodbye.',
+      timeout_failure: 'No input received for the {label}. Thank you for your time. Goodbye.'
+    },
+    verification: {
+      initial: 'Enter your verification code now.{terminatorSuffix}'
+    },
+    otp: {
+      initial: 'Enter your one-time password now.{terminatorSuffix}'
+    },
+    pin: {
+      initial: 'Enter your PIN now.{terminatorSuffix}'
+    },
+    cvv: {
+      initial: 'Enter your card security code now.{terminatorSuffix}'
+    },
+    card_number: {
+      initial: 'Enter your card number now.{terminatorSuffix}'
+    },
+    card_expiry: {
+      initial: 'Enter your card expiry now.{terminatorSuffix}'
+    },
+    zip: {
+      initial: 'Enter your ZIP code now.{terminatorSuffix}'
+    }
+  });
+
+  const renderPromptTemplate = (template, expectation = {}) => {
+    const label = buildExpectedLabel(expectation);
+    const detail = buildRepromptDetail(expectation);
+    const terminatorSuffix = expectation?.allow_terminator
+      ? ` You can end with ${expectation?.terminator_char || '#'} when finished.`
+      : '';
+    return String(template || '')
+      .replace(/\{label\}/g, label)
+      .replace(/\{detail\}/g, detail)
+      .replace(/\{terminatorSuffix\}/g, terminatorSuffix)
+      .replace(/\{profile\}/g, String(expectation?.profile || 'generic'))
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  const resolveProfilePromptPolicy = (expectation = {}) => {
+    const profile = normalizeProfileId(expectation?.profile) || 'generic';
+    const base = PROFILE_PROMPT_POLICY.generic || {};
+    const override = PROFILE_PROMPT_POLICY[profile] || {};
+    return {
+      initial: override.initial || base.initial || '',
+      invalid: Array.isArray(override.invalid) && override.invalid.length ? override.invalid : (base.invalid || []),
+      timeout: Array.isArray(override.timeout) && override.timeout.length ? override.timeout : (base.timeout || []),
+      soft_timeout: Array.isArray(override.soft_timeout) && override.soft_timeout.length ? override.soft_timeout : (base.soft_timeout || []),
+      failure: override.failure || base.failure || '',
+      timeout_failure: override.timeout_failure || base.timeout_failure || ''
+    };
+  };
+
+  function resolveRetryStage(expectation = {}, attempt = 1) {
+    const maxRetries = Number.isFinite(expectation?.max_retries) ? expectation.max_retries : 0;
+    const safeAttempt = Math.max(1, Number(attempt) || 1);
+    if (maxRetries <= 0) return 'early';
+    if (safeAttempt > maxRetries) return 'terminal';
+    if (safeAttempt === maxRetries) return 'final';
+    if (safeAttempt >= Math.max(2, maxRetries - 1)) return 'middle';
+    return 'early';
+  }
+
+  function buildDefaultReprompts(expectation = {}) {
+    const policy = resolveProfilePromptPolicy(expectation);
+    const invalid = (policy.invalid || []).map((item) => renderPromptTemplate(item, expectation)).filter(Boolean);
+    const timeout = (policy.timeout || []).map((item) => renderPromptTemplate(item, expectation)).filter(Boolean);
+    const failure = renderPromptTemplate(policy.failure, expectation);
+    const timeoutFailure = renderPromptTemplate(policy.timeout_failure, expectation);
+    return {
+      invalid: invalid.length ? invalid : ['Enter the code now.'],
+      timeout: timeout.length ? timeout : ['I did not receive any input. Enter the code now.'],
+      failure: failure || 'We could not verify the input. Thank you for your time. Goodbye.',
+      timeout_failure: timeoutFailure || 'No input received. Thank you for your time. Goodbye.'
+    };
+  }
+
+  function normalizeRepromptValue(value) {
+    if (Array.isArray(value)) {
+      const trimmed = value.map((item) => String(item || '').trim()).filter(Boolean);
+      return trimmed.length ? trimmed : '';
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed || '';
+    }
+    return '';
+  }
+
+  function normalizeTerminalMessageValue(value) {
+    if (Array.isArray(value)) {
+      const trimmed = value.map((item) => String(item || '').trim()).filter(Boolean);
+      if (!trimmed.length) return '';
+      return trimmed[trimmed.length - 1];
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed || '';
+    }
+    return '';
+  }
+
+  function chooseReprompt(expectation = {}, kind = 'invalid', attempt = 1) {
+    const key = kind === 'timeout'
+      ? expectation.reprompt_timeout
+      : kind === 'incomplete'
+        ? expectation.reprompt_incomplete
+        : expectation.reprompt_invalid;
+    if (Array.isArray(key) && key.length) {
+      const idx = Math.max(0, Math.min(key.length - 1, (attempt || 1) - 1));
+      return key[idx];
+    }
+    if (typeof key === 'string' && key.trim()) return key.trim();
+    return '';
+  }
+
+  const isAdaptiveRepromptReason = (reason = '') => {
+    if (!reason) return false;
+    if (reason === 'incomplete' || reason === 'too_short' || reason === 'too_long') return true;
+    return String(reason).startsWith('invalid');
+  };
+
+  function buildAdaptiveReprompt(expectation = {}, reason = '', attemptCount = 1) {
+    const policy = resolveProfilePromptPolicy(expectation);
+    const shortPrompt = renderPromptTemplate((policy.invalid || [])[0] || 'Enter the {label} now.', expectation);
+    const detailedPrompt = renderPromptTemplate((policy.invalid || [])[1] || 'Please enter the {label}. {detail}', expectation);
+    const finalPrompt = renderPromptTemplate((policy.invalid || [])[2] || 'Last attempt: enter the {label} now.', expectation);
+    const kind = reason === 'incomplete' || reason === 'too_short' || reason === 'too_long' ? 'incomplete' : 'invalid';
+    const custom = chooseReprompt(expectation, kind, attemptCount);
+    const retryStage = resolveRetryStage(expectation, attemptCount);
+
+    if (retryStage === 'final') {
+      if (custom) {
+        return /last|final/i.test(custom)
+          ? custom
+          : `${custom}${custom.endsWith('.') ? '' : '.'} This is your last attempt.`;
+      }
+      return finalPrompt;
+    }
+
+    if (custom) {
+      return custom;
+    }
+
+    if (attemptCount >= 2) {
+      return detailedPrompt;
+    }
+
+    return shortPrompt;
+  }
+
+  function buildTimeoutPrompt(expectation = {}, attempt = 1) {
+    const retryStage = resolveRetryStage(expectation, attempt);
+    const policy = resolveProfilePromptPolicy(expectation);
+    const label = buildExpectedLabel(expectation);
+    if (retryStage === 'final') {
+      const custom = Array.isArray(expectation?.reprompt_timeout) && expectation.reprompt_timeout.length
+        ? expectation.reprompt_timeout[expectation.reprompt_timeout.length - 1]
+        : chooseReprompt(expectation, 'timeout', attempt);
+      if (custom) {
+        return /last|final/i.test(custom)
+          ? custom
+          : `${custom}${custom.endsWith('.') ? '' : '.'} This is your last attempt.`;
+      }
+      const finalPolicyPrompt = renderPromptTemplate((policy.timeout || [])[2] || 'Final attempt: enter the {label} now.', expectation);
+      return finalPolicyPrompt || `Final attempt: please enter the ${label} now.`;
+    }
+    const policyPrompt = renderPromptTemplate((policy.timeout || [])[Math.max(0, Math.min(1, Math.max(1, attempt) - 1))], expectation);
+    return chooseReprompt(expectation, 'timeout', attempt)
+      || policyPrompt
+      || `I did not receive any input. Please enter the ${label} now.`;
+  }
+
+  function buildSoftTimeoutPrompt(expectation = {}) {
+    const label = buildExpectedLabel(expectation);
+    const stage = Math.max(1, Number(expectation?.soft_timeout_stage) || 1);
+    if (Array.isArray(expectation?.soft_timeout_prompt) && expectation.soft_timeout_prompt.length) {
+      const idx = Math.max(
+        0,
+        Math.min(expectation.soft_timeout_prompt.length - 1, stage - 1),
+      );
+      return expectation.soft_timeout_prompt[idx];
+    }
+    if (typeof expectation?.soft_timeout_prompt === 'string' && expectation.soft_timeout_prompt.trim()) {
+      return expectation.soft_timeout_prompt.trim();
+    }
+    const policy = resolveProfilePromptPolicy(expectation);
+    const defaults = (policy.soft_timeout || [
+      'Just a reminder: enter the {label} when you are ready.',
+      'Still waiting for the {label}. Enter it now.',
+      'Final reminder: enter the {label} now.'
+    ]).map((tpl) => renderPromptTemplate(tpl, expectation));
+    const idx = Math.max(0, Math.min(defaults.length - 1, stage - 1));
+    return defaults[idx] || `Still waiting for the ${label}. Please enter it now.`;
+  }
+
+  const OTP_REGEX = /\b\d{4,8}\b/g;
+
+  const digitTimeouts = new Map();
+  const digitFallbackStates = new Map();
+  const digitCollectionPlans = new Map();
+  const captureLifecycle = new Map();
+  const globalIdempotency = new Map();
+  const captureSessions = new Map();
+  const captureVault = new Map();
+  const captureSloState = {
+    sessions: [],
+    input_events: 0,
+    duplicate_suppressed: 0,
+    timeout_events: 0,
+    error_events: 0,
+    updated_at: Date.now(),
+    lastMitigationAt: 0
+  };
+  const lastDtmfTimestamps = new Map();
+  const pendingDigits = new Map();
+  const recentAccepted = new Map();
+  const recentInputEvents = new Map();
+  const recentCrossChannelInputs = new Map();
+  const callerAffect = new Map();
+  const sessionState = new Map();
+  const intentHistory = new Map();
+  const riskSignals = new Map();
+  const smsSessions = new Map();
+  const smsSessionsByPhone = new Map();
+  const breakerState = {
+    open: false,
+    opened_at: 0,
+    window_start: Date.now(),
+    total: 0,
+    errors: 0
+  };
+
+  const DUPLICATE_INPUT_TTL_MS = 1500;
+
+  const buildGlobalIdempotencyKey = ({
+    scope = 'digit_capture',
+    callSid = 'unknown',
+    stepId = 'step',
+    attemptId = '0',
+    inputHash = 'na'
+  } = {}) => `${scope}:${callSid}:${stepId}:${attemptId}:${inputHash}`;
+
+  const cleanupGlobalIdempotency = (now = Date.now(), ttlMs = GLOBAL_IDEMPOTENCY_TTL_MS) => {
+    if (globalIdempotency.size < GLOBAL_IDEMPOTENCY_MAX_ENTRIES) return;
+    for (const [key, entry] of globalIdempotency.entries()) {
+      if (!entry?.at || now - entry.at > ttlMs) {
+        globalIdempotency.delete(key);
+      }
+    }
+  };
+
+  const markIdempotentAction = (key, ttlMs = GLOBAL_IDEMPOTENCY_TTL_MS) => {
+    if (!key) return false;
+    const now = Date.now();
+    const existing = globalIdempotency.get(key);
+    if (existing && now - existing.at < ttlMs) {
+      return true;
+    }
+    globalIdempotency.set(key, { at: now });
+    cleanupGlobalIdempotency(now, ttlMs);
+    return false;
+  };
+
+  const clearIdempotencyForCall = (callSid) => {
+    if (!callSid) return;
+    const token = `:${callSid}:`;
+    for (const key of globalIdempotency.keys()) {
+      if (key.includes(token)) {
+        globalIdempotency.delete(key);
+      }
+    }
+  };
+
+  const normalizeCaptureChannel = (source = 'dtmf') => {
+    const value = String(source || '').toLowerCase();
+    if (value === 'sms' || value === 'secure_sms_link' || value === 'link') return 'secure_sms_link';
+    if (value === 'spoken' || value === 'speech' || value === 'voice') return 'spoken';
+    if (value === 'agent' || value === 'handoff') return 'human_agent_handoff';
+    return 'dtmf';
+  };
+
+  const ensureCaptureSession = (callSid, expectation = {}, meta = {}) => {
+    if (!callSid) return null;
+    const existing = captureSessions.get(callSid);
+    const now = Date.now();
+    if (existing && !CAPTURE_SESSION_TERMINAL_STATES.has(existing.status || 'active')) {
+      existing.updated_at = now;
+      existing.last_profile = expectation?.profile || existing.last_profile || 'generic';
+      if (expectation?.plan_id) existing.plan_id = expectation.plan_id;
+      if (Number.isFinite(expectation?.plan_step_index)) existing.plan_step_index = expectation.plan_step_index;
+      if (meta.channel) {
+        const channel = normalizeCaptureChannel(meta.channel);
+        existing.active_channel = channel;
+        if (!existing.channels.includes(channel)) existing.channels.push(channel);
+      }
+      captureSessions.set(callSid, existing);
+      return existing;
+    }
+
+    const channel = normalizeCaptureChannel(meta.channel || expectation?.channel || 'dtmf');
+    const created = {
+      id: `cap_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      call_sid: callSid,
+      status: 'active',
+      active_channel: channel,
+      channels: [channel],
+      last_profile: expectation?.profile || 'generic',
+      started_at: now,
+      updated_at: now,
+      completed_at: null,
+      duration_ms: null,
+      attempts: 0,
+      duplicate_hits: 0,
+      timeout_count: 0,
+      error_count: 0,
+      fallback_count: 0,
+      policy_overrides: {}
+    };
+    if (expectation?.plan_id) created.plan_id = expectation.plan_id;
+    if (Number.isFinite(expectation?.plan_step_index)) created.plan_step_index = expectation.plan_step_index;
+    captureSessions.set(callSid, created);
+    return created;
+  };
+
+  const updateCaptureSessionChannel = (callSid, channel, meta = {}) => {
+    const session = ensureCaptureSession(callSid, {}, { channel });
+    if (!session) return null;
+    const normalized = normalizeCaptureChannel(channel);
+    session.active_channel = normalized;
+    if (!session.channels.includes(normalized)) session.channels.push(normalized);
+    session.updated_at = Date.now();
+    if (meta.reason) session.last_channel_reason = meta.reason;
+    captureSessions.set(callSid, session);
+    return session;
+  };
+
+  const captureSloWindowSize = Math.max(10, Number(captureSlo?.windowSize || DEFAULT_CAPTURE_SLO.windowSize));
+  const captureSloThresholds = {
+    successRateMin: Number.isFinite(Number(captureSlo?.successRateMin))
+      ? Number(captureSlo.successRateMin)
+      : DEFAULT_CAPTURE_SLO.successRateMin,
+    medianCaptureMsMax: Number.isFinite(Number(captureSlo?.medianCaptureMsMax))
+      ? Number(captureSlo.medianCaptureMsMax)
+      : DEFAULT_CAPTURE_SLO.medianCaptureMsMax,
+    duplicateSuppressionRateMax: Number.isFinite(Number(captureSlo?.duplicateSuppressionRateMax))
+      ? Number(captureSlo.duplicateSuppressionRateMax)
+      : DEFAULT_CAPTURE_SLO.duplicateSuppressionRateMax,
+    timeoutErrorRateMax: Number.isFinite(Number(captureSlo?.timeoutErrorRateMax))
+      ? Number(captureSlo.timeoutErrorRateMax)
+      : DEFAULT_CAPTURE_SLO.timeoutErrorRateMax
+  };
+
+  const computeCaptureSloSnapshot = () => {
+    const sessions = captureSloState.sessions.slice(-captureSloWindowSize);
+    const completed = sessions.length;
+    const successful = sessions.filter((entry) => entry.status === 'completed').length;
+    const durations = sessions
+      .map((entry) => Number(entry.duration_ms))
+      .filter((value) => Number.isFinite(value) && value >= 0)
+      .sort((a, b) => a - b);
+    const mid = Math.floor(durations.length / 2);
+    const medianCaptureMs = durations.length
+      ? (durations.length % 2 === 0 ? Math.round((durations[mid - 1] + durations[mid]) / 2) : durations[mid])
+      : null;
+    const inputEvents = Math.max(1, captureSloState.input_events);
+    const successRate = completed ? successful / completed : 1;
+    const duplicateSuppressionRate = captureSloState.duplicate_suppressed / inputEvents;
+    const timeoutErrorRate = (captureSloState.timeout_events + captureSloState.error_events) / inputEvents;
+    return {
+      windowSize: captureSloWindowSize,
+      sessions: completed,
+      successRate,
+      medianCaptureMs,
+      duplicateSuppressionRate,
+      timeoutErrorRate,
+      thresholds: captureSloThresholds,
+      updatedAt: captureSloState.updated_at
+    };
+  };
+
+  const maybeRecordCaptureSlo = async (callSid, session) => {
+    captureSloState.updated_at = Date.now();
+    const snapshot = computeCaptureSloSnapshot();
+    if (!db?.addCallMetric) return snapshot;
+    try {
+      await db.addCallMetric(callSid, 'capture_success_rate', Number(snapshot.successRate.toFixed(4)), {
+        window: snapshot.windowSize,
+        sessions: snapshot.sessions
+      });
+      if (Number.isFinite(snapshot.medianCaptureMs)) {
+        await db.addCallMetric(callSid, 'capture_median_ms', snapshot.medianCaptureMs, {
+          window: snapshot.windowSize
+        });
+      }
+      await db.addCallMetric(callSid, 'capture_duplicate_suppression_rate', Number(snapshot.duplicateSuppressionRate.toFixed(4)), {
+        window: snapshot.windowSize
+      });
+      await db.addCallMetric(callSid, 'capture_timeout_error_rate', Number(snapshot.timeoutErrorRate.toFixed(4)), {
+        window: snapshot.windowSize
+      });
+    } catch (_) {}
+    if (
+      snapshot.successRate < captureSloThresholds.successRateMin
+      || (Number.isFinite(snapshot.medianCaptureMs) && snapshot.medianCaptureMs > captureSloThresholds.medianCaptureMsMax)
+      || snapshot.duplicateSuppressionRate > captureSloThresholds.duplicateSuppressionRateMax
+      || snapshot.timeoutErrorRate > captureSloThresholds.timeoutErrorRateMax
+    ) {
+      try {
+        await db?.logServiceHealth?.('digit_capture_slo', 'degraded', {
+          call_sid: callSid,
+          session_id: session?.id || null,
+          snapshot
+        });
+      } catch (_) {}
+    }
+    return snapshot;
+  };
+
+  const applySloMitigationPolicy = (callSid, expectation = {}, snapshot = null) => {
+    const current = snapshot || computeCaptureSloSnapshot();
+    const next = { ...expectation };
+    const callConfig = callConfigurations.get(callSid) || {};
+    const mitigation = {};
+
+    if (current.successRate < captureSloThresholds.successRateMin || current.timeoutErrorRate > captureSloThresholds.timeoutErrorRateMax) {
+      next.allow_sms_fallback = true;
+      next.allow_spoken_fallback = false;
+      next.max_retries = Math.min(next.max_retries || 0, 1);
+      mitigation.mode = 'sms_or_agent';
+      mitigation.reason = 'capture_reliability';
+      if (getCurrentProvider && typeof getCurrentProvider === 'function' && String(getCurrentProvider() || '').toLowerCase() !== 'twilio') {
+        mitigation.provider_switch = 'twilio';
+      }
+    }
+    if (Number.isFinite(current.medianCaptureMs) && current.medianCaptureMs > captureSloThresholds.medianCaptureMsMax) {
+      next.prompt = `Please enter the ${buildExpectedLabel(next)} now.`;
+      mitigation.prompt_mode = 'brief';
+    }
+    if (current.duplicateSuppressionRate > captureSloThresholds.duplicateSuppressionRateMax) {
+      next.min_collect_delay_ms = Math.max(next.min_collect_delay_ms || 0, 1400);
+      mitigation.dedupe_mode = 'strict';
+    }
+
+    if (Object.keys(mitigation).length) {
+      callConfig.capture_slo_mitigation = {
+        ...mitigation,
+        updated_at: new Date().toISOString()
+      };
+      callConfigurations.set(callSid, callConfig);
+      const session = captureSessions.get(callSid);
+      if (session) {
+        session.policy_overrides = { ...(session.policy_overrides || {}), ...mitigation };
+        captureSessions.set(callSid, session);
+      }
+      logDigitMetric('capture_slo_mitigation_applied', {
+        callSid,
+        mitigation,
+        snapshot: {
+          successRate: current.successRate,
+          medianCaptureMs: current.medianCaptureMs,
+          duplicateSuppressionRate: current.duplicateSuppressionRate,
+          timeoutErrorRate: current.timeoutErrorRate
+        }
+      });
+    }
+    return next;
+  };
+
+  const updateCaptureSloCounters = (type = 'input') => {
+    captureSloState.input_events += 1;
+    if (type === 'duplicate') captureSloState.duplicate_suppressed += 1;
+    if (type === 'timeout') captureSloState.timeout_events += 1;
+    if (type === 'error') captureSloState.error_events += 1;
+    captureSloState.updated_at = Date.now();
+  };
+
+  const completeCaptureSession = async (callSid, status = 'completed', meta = {}) => {
+    const session = captureSessions.get(callSid);
+    if (!session || CAPTURE_SESSION_TERMINAL_STATES.has(session.status)) return session || null;
+    const endedAt = Date.now();
+    session.status = status;
+    session.completed_at = endedAt;
+    session.updated_at = endedAt;
+    session.duration_ms = Math.max(0, endedAt - (session.started_at || endedAt));
+    if (meta.channel) {
+      const channel = normalizeCaptureChannel(meta.channel);
+      session.active_channel = channel;
+      if (!session.channels.includes(channel)) session.channels.push(channel);
+    }
+    if (meta.reason) session.end_reason = meta.reason;
+    captureSessions.set(callSid, session);
+    captureSloState.sessions.push({
+      id: session.id,
+      call_sid: callSid,
+      status: session.status,
+      duration_ms: session.duration_ms,
+      channels: [...session.channels],
+      ended_at: session.completed_at
+    });
+    if (captureSloState.sessions.length > captureSloWindowSize) {
+      captureSloState.sessions.splice(0, captureSloState.sessions.length - captureSloWindowSize);
+    }
+    await maybeRecordCaptureSlo(callSid, session);
+    return session;
+  };
+
+  const getVaultKey = () => {
+    const source = config?.compliance?.encryptionKey || process.env.DTMF_ENCRYPTION_KEY || 'voxly-local-vault-key';
+    return crypto.createHash('sha256').update(String(source)).digest();
+  };
+
+  const cleanupCaptureVault = (now = Date.now()) => {
+    for (const [token, item] of captureVault.entries()) {
+      if (!item?.expires_at || item.expires_at <= now) {
+        captureVault.delete(token);
+      }
+    }
+    if (captureVault.size > CAPTURE_VAULT_MAX_ENTRIES) {
+      const overBy = captureVault.size - CAPTURE_VAULT_MAX_ENTRIES;
+      const entries = Array.from(captureVault.entries()).sort((a, b) => (a[1]?.created_at || 0) - (b[1]?.created_at || 0));
+      for (let i = 0; i < overBy; i += 1) {
+        captureVault.delete(entries[i][0]);
+      }
+    }
+  };
+
+  const storeSensitiveToken = (callSid, profile, value, meta = {}) => {
+    const raw = String(value || '');
+    if (!raw) return null;
+    const now = Date.now();
+    const iv = crypto.randomBytes(12);
+    const key = getVaultKey();
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const enc = Buffer.concat([cipher.update(raw, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const token = `tok_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}`;
+    const ttl = Math.max(60000, Number(meta.ttl_ms || captureVaultTtlMs || CAPTURE_VAULT_DEFAULT_TTL_MS));
+    captureVault.set(token, {
+      call_sid: callSid,
+      profile,
+      created_at: now,
+      expires_at: now + ttl,
+      payload: enc.toString('base64'),
+      iv: iv.toString('base64'),
+      tag: tag.toString('base64'),
+      meta: {
+        reason: meta.reason || null,
+        channel: meta.channel || null
+      }
+    });
+    cleanupCaptureVault(now);
+    return {
+      token,
+      ref: `vault://digits/${callSid}/${token}`
+    };
+  };
+
+  const parseSensitiveTokenRef = (tokenRef) => {
+    const raw = String(tokenRef || '').trim();
+    if (!raw) return null;
+    const decoded = (() => {
+      try {
+        return decodeURIComponent(raw);
+      } catch (_) {
+        return raw;
+      }
+    })();
+    if (decoded.startsWith('tok_')) {
+      return { token: decoded, callSid: null };
+    }
+    const match = decoded.match(/^vault:\/\/digits\/([^/]+)\/([^/]+)$/);
+    if (!match) return null;
+    return {
+      callSid: match[1],
+      token: match[2]
+    };
+  };
+
+  const validateSecureCaptureToken = (callSid, tokenRef) => {
+    cleanupCaptureVault();
+    const parsed = parseSensitiveTokenRef(tokenRef);
+    if (!parsed?.token) {
+      return { ok: false, reason: 'invalid_token' };
+    }
+    const entry = captureVault.get(parsed.token);
+    if (!entry) {
+      return { ok: false, reason: 'token_not_found' };
+    }
+    if (!entry.expires_at || entry.expires_at <= Date.now()) {
+      captureVault.delete(parsed.token);
+      return { ok: false, reason: 'token_expired' };
+    }
+    const resolvedCallSid = String(callSid || '').trim() || entry.call_sid;
+    if (!resolvedCallSid) {
+      return { ok: false, reason: 'missing_call_sid' };
+    }
+    if (parsed.callSid && parsed.callSid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+    if (entry.call_sid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+    return {
+      ok: true,
+      callSid: resolvedCallSid,
+      token: parsed.token,
+      profile: entry.profile || null,
+      expiresAt: entry.expires_at || null,
+      meta: entry.meta || {}
+    };
+  };
+
+  const resolveSensitiveTokenRef = (callSid, tokenRef) => {
+    cleanupCaptureVault();
+    const parsed = parseSensitiveTokenRef(tokenRef);
+    if (!parsed?.token) {
+      return { ok: false, reason: 'invalid_token' };
+    }
+    const entry = captureVault.get(parsed.token);
+    if (!entry) {
+      return { ok: false, reason: 'token_not_found' };
+    }
+    if (!entry.expires_at || entry.expires_at <= Date.now()) {
+      captureVault.delete(parsed.token);
+      return { ok: false, reason: 'token_expired' };
+    }
+
+    const resolvedCallSid = String(callSid || '').trim() || parsed.callSid || entry.call_sid;
+    if (parsed.callSid && resolvedCallSid && parsed.callSid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+    if (entry.call_sid && resolvedCallSid && entry.call_sid !== resolvedCallSid) {
+      return { ok: false, reason: 'token_call_mismatch' };
+    }
+
+    try {
+      const key = getVaultKey();
+      const iv = Buffer.from(entry.iv || '', 'base64');
+      const payload = Buffer.from(entry.payload || '', 'base64');
+      const tag = Buffer.from(entry.tag || '', 'base64');
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAuthTag(tag);
+      const value = Buffer.concat([decipher.update(payload), decipher.final()]).toString('utf8');
+      return {
+        ok: true,
+        value,
+        callSid: entry.call_sid || resolvedCallSid || null,
+        profile: entry.profile || null,
+        token: parsed.token,
+        expiresAt: entry.expires_at || null
+      };
+    } catch (_) {
+      return { ok: false, reason: 'decrypt_failed' };
+    }
+  };
+
+  const normalizeSourceForIdempotency = (source = 'dtmf') => {
+    const normalized = normalizeCaptureChannel(source || 'dtmf');
+    if (['dtmf', 'gather', 'spoken', 'secure_sms_link'].includes(normalized)) {
+      return 'capture_input';
+    }
+    return normalized;
+  };
+
+  const buildInputFingerprint = (callSid, expectation, digits, source) => {
+    const planId = expectation?.plan_id || 'no_plan';
+    const step = Number.isFinite(expectation?.plan_step_index) ? expectation.plan_step_index : 'no_step';
+    const profile = expectation?.profile || 'generic';
+    const normalizedSource = normalizeSourceForIdempotency(source || 'dtmf');
+    return `${callSid}:${planId}:${step}:${profile}:${normalizedSource}:${digits}`;
+  };
+
+  const buildCrossChannelInputKey = (callSid, expectation, digits = '') => {
+    const planId = expectation?.plan_id || 'no_plan';
+    const step = Number.isFinite(expectation?.plan_step_index) ? expectation.plan_step_index : 'no_step';
+    const profile = expectation?.profile || 'generic';
+    const hash = hashInput(String(digits || ''));
+    return `${callSid}:${planId}:${step}:${profile}:${hash}`;
+  };
+
+  const shouldSuppressCrossChannelInput = (callSid, expectation, digits, source, now = Date.now()) => {
+    if (!callSid || !digits) return false;
+    const key = buildCrossChannelInputKey(callSid, expectation, digits);
+    const sourceNormalized = normalizeCaptureChannel(source || 'dtmf');
+    const existing = recentCrossChannelInputs.get(key);
+    if (existing && now - existing.at < CROSS_CHANNEL_INPUT_TTL_MS) {
+      return true;
+    }
+    recentCrossChannelInputs.set(key, { source: sourceNormalized, at: now });
+    if (recentCrossChannelInputs.size > 3000) {
+      const threshold = CROSS_CHANNEL_INPUT_TTL_MS * 4;
+      for (const [entryKey, value] of recentCrossChannelInputs.entries()) {
+        if (!value?.at || now - value.at > threshold) {
+          recentCrossChannelInputs.delete(entryKey);
+        }
+      }
+    }
+    return false;
+  };
+
+  const cleanupRecentInputs = (now, ttlMs = DUPLICATE_INPUT_TTL_MS) => {
+    if (recentInputEvents.size < 2000) return;
+    const threshold = ttlMs * 4;
+    for (const [key, timestamp] of recentInputEvents.entries()) {
+      if (!timestamp || now - timestamp > threshold) {
+        recentInputEvents.delete(key);
+      }
+    }
+  };
+
+  const isDuplicateInput = (callSid, expectation, digits, source, ttlMs = DUPLICATE_INPUT_TTL_MS) => {
+    if (!callSid || !digits) return false;
+    const now = Date.now();
+    if (shouldSuppressCrossChannelInput(callSid, expectation, digits, source, now)) {
+      return true;
+    }
+    const key = buildInputFingerprint(callSid, expectation, digits, source);
+    const lastSeen = recentInputEvents.get(key);
+    if (lastSeen && now - lastSeen < ttlMs) {
+      return true;
+    }
+    recentInputEvents.set(key, now);
+    cleanupRecentInputs(now, ttlMs);
+    return false;
+  };
+
+  const emitAuditEvent = async (callSid, eventType, payload = {}) => {
+    if (!callSid || !eventType) return;
+    if (!db?.addCallDigitEvent) return;
+    const metadata = {
+      event_type: eventType,
+      ...payload,
+      digits_stored: false,
+      recorded_at: new Date().toISOString()
+    };
+    try {
+      await db.addCallDigitEvent({
+        call_sid: callSid,
+        source: payload.source || 'system',
+        profile: payload.profile || 'generic',
+        digits: null,
+        len: payload.len || null,
+        accepted: payload.accepted === true,
+        reason: payload.reason || null,
+        metadata
+      });
+    } catch (err) {
+      logDigitMetric('audit_log_failed', { callSid, event: eventType, error: err.message });
+    }
+  };
+
+  const normalizeGroupId = (value = '') => {
+    const raw = String(value || '').toLowerCase().trim();
+    if (!raw) return null;
+    if (['banking', 'bank', 'banking_group', 'bank_details', 'bank_account'].includes(raw)) return 'banking';
+    if (['card', 'card_details', 'card_group', 'payment_card', 'card_info'].includes(raw)) return 'card';
+    return null;
+  };
+
+  const resolveGroupFromProfile = (profile = '') => normalizeGroupId(profile);
+
+  const normalizeCaptureText = (text = '') => {
+    let normalized = String(text || '').toLowerCase();
+    normalized = normalized.replace(/[“”"']/g, '');
+    normalized = normalized.replace(/\bmm\s*[/\-]\s*yy\b/g, ' expiry ');
+    normalized = normalized.replace(/\bmm\s*yy\b/g, ' expiry ');
+    normalized = normalized.replace(/\bexp(?:iration)?\s*date?\b/g, ' expiry ');
+    normalized = normalized.replace(/\bsecurity code\b/g, ' cvv ');
+    normalized = normalized.replace(/\bcvc2?\b/g, ' cvv ');
+    normalized = normalized.replace(/\baba\b/g, ' routing ');
+    normalized = normalized.replace(/\brouting number\b/g, ' routing ');
+    normalized = normalized.replace(/\bchecking account\b/g, ' checking ');
+    normalized = normalized.replace(/\bsavings account\b/g, ' savings ');
+    normalized = normalized.replace(/\bzip code\b/g, ' zip ');
+    normalized = normalized.replace(/\bpostal code\b/g, ' zip ');
+    normalized = normalized.replace(/\baccount number\b/g, ' account ');
+    normalized = normalized.replace(/[^a-z0-9\s]/g, ' ');
+    normalized = normalized.replace(/\s+/g, ' ').trim();
+    return normalized;
+  };
+
+  const scoreGroupMatch = (normalizedText, groupId) => {
+    const config = GROUP_KEYWORDS[groupId];
+    if (!config || !normalizedText) {
+      return {
+        groupId,
+        score: 0,
+        confidence: 0,
+        matches: { strong: [], weak: [], negative: [] }
+      };
+    }
+    const matches = { strong: [], weak: [], negative: [] };
+    const addMatches = (keywords, bucket) => {
+      keywords.forEach((keyword) => {
+        if (!keyword) return;
+        if (normalizedText.includes(keyword)) {
+          matches[bucket].push(keyword);
+        }
+      });
+    };
+    addMatches(config.positive?.strong || [], 'strong');
+    addMatches(config.positive?.weak || [], 'weak');
+    addMatches(config.negative || [], 'negative');
+
+    const positiveScore = matches.strong.length * 2 + matches.weak.length;
+    const negativeScore = matches.negative.length * 1.5;
+    const total = positiveScore + negativeScore;
+    const confidence = total > 0 ? positiveScore / total : 0;
+    return {
+      groupId,
+      score: positiveScore,
+      confidence,
+      matches
+    };
+  };
+
+  const resolveGroupFromPrompt = (text = '') => {
+    const normalized = normalizeCaptureText(text);
+    if (!normalized) {
+      return { groupId: null, reason: 'empty_prompt', confidence: 0, matches: {} };
+    }
+    const bankingScore = scoreGroupMatch(normalized, 'banking');
+    const cardScore = scoreGroupMatch(normalized, 'card');
+    const candidates = [bankingScore, cardScore].filter((entry) => entry.score > 0);
+    const eligible = candidates.filter((entry) => entry.score >= GROUP_MIN_SCORE && entry.confidence >= GROUP_MIN_CONFIDENCE);
+    if (eligible.length === 1) {
+      return {
+        groupId: eligible[0].groupId,
+        reason: 'keyword_match',
+        confidence: eligible[0].confidence,
+        matches: eligible[0].matches
+      };
+    }
+    if (eligible.length > 1) {
+      return {
+        groupId: null,
+        reason: 'ambiguous',
+        confidence: Math.max(bankingScore.confidence, cardScore.confidence),
+        matches: { banking: bankingScore.matches, card: cardScore.matches }
+      };
+    }
+    if (candidates.length) {
+      return {
+        groupId: null,
+        reason: 'low_confidence',
+        confidence: Math.max(bankingScore.confidence, cardScore.confidence),
+        matches: { banking: bankingScore.matches, card: cardScore.matches }
+      };
+    }
+    return { groupId: null, reason: 'no_match', confidence: 0, matches: {} };
+  };
+
+  const resolveExplicitGroup = (callConfig = {}) => {
+    const strictSources = [
+      { value: callConfig.capture_group, source: 'capture_group' },
+      { value: callConfig.captureGroup, source: 'capture_group' },
+      { value: callConfig.capture_plan, source: 'capture_plan' },
+      { value: callConfig.capturePlan, source: 'capture_plan' },
+      { value: callConfig.digit_plan_id, source: 'digit_plan_id' },
+      { value: callConfig.digitPlanId, source: 'digit_plan_id' }
+    ];
+    for (const entry of strictSources) {
+      if (!entry.value) continue;
+      const normalized = normalizeGroupId(entry.value);
+      if (!normalized) {
+        return { provided: true, groupId: null, reason: 'invalid_explicit_group', source: entry.source };
+      }
+      return { provided: true, groupId: normalized, reason: 'explicit', source: entry.source };
+    }
+
+    const optionalSources = [
+      { value: callConfig.collection_profile, source: 'collection_profile' },
+      { value: callConfig.digit_profile_id, source: 'digit_profile_id' },
+      { value: callConfig.digitProfileId, source: 'digit_profile_id' },
+      { value: callConfig.digit_profile, source: 'digit_profile' }
+    ];
+    for (const entry of optionalSources) {
+      if (!entry.value) continue;
+      const normalized = normalizeGroupId(entry.value);
+      if (normalized) {
+        return { provided: true, groupId: normalized, reason: 'explicit', source: entry.source };
+      }
+    }
+    return { provided: false, groupId: null, reason: 'none', source: null };
+  };
+
+  const lockGroupForCall = (callSid, callConfig, groupId, reason, meta = {}) => {
+    if (!callSid || !callConfig || !groupId) return;
+    const current = normalizeGroupId(callConfig.capture_group || callConfig.captureGroup);
+    if (callConfig.group_locked && current && current !== groupId) {
+      logDigitMetric('group_lock_conflict', { callSid, current, next: groupId, reason });
+      return;
+    }
+    callConfig.capture_group = groupId;
+    callConfig.group_locked = true;
+    callConfig.capture_group_reason = reason;
+    callConfigurations.set(callSid, callConfig);
+    logDigitMetric('group_locked', {
+      callSid,
+      group: groupId,
+      reason,
+      confidence: meta.confidence || null,
+      matched_keywords: meta.matched_keywords || null
+    });
+  };
+
+  const applyGroupOverrides = (step = {}, callConfig = {}) => {
+    const overrides = {};
+    const timeout = Number(callConfig.collection_timeout_s);
+    if (Number.isFinite(timeout)) {
+      overrides.timeout_s = timeout;
+    }
+    const retries = Number(callConfig.collection_max_retries);
+    if (Number.isFinite(retries)) {
+      overrides.max_retries = retries;
+    }
+    if (typeof callConfig.collection_mask_for_gpt === 'boolean') {
+      overrides.mask_for_gpt = callConfig.collection_mask_for_gpt;
+    }
+    if (typeof callConfig.collection_speak_confirmation === 'boolean') {
+      overrides.speak_confirmation = callConfig.collection_speak_confirmation;
+    }
+    return { ...step, ...overrides };
+  };
+
+  const buildGroupPlanSteps = (groupId, callConfig = {}) => {
+    const group = DIGIT_CAPTURE_GROUPS[groupId];
+    if (!group) return [];
+    return group.steps.map((step) => applyGroupOverrides(step, callConfig));
+  };
+
+  const buildGroupIntent = (groupId, reason, callConfig = {}) => {
+    const steps = buildGroupPlanSteps(groupId, callConfig);
+    if (!steps.length) return null;
+    return {
+      mode: 'dtmf',
+      reason,
+      confidence: 0.98,
+      group_id: groupId,
+      plan_steps: steps
+    };
+  };
+
+  const buildCollectionFingerprint = (collection, expectation) => {
+    if (!collection?.digits) return null;
+    const hash = crypto.createHash('sha256').update(String(collection.digits)).digest('hex');
+    const stepKey = expectation?.plan_step_index || 'single';
+    return `${collection.profile || 'generic'}|${collection.len || 0}|${stepKey}|${hash}`;
+  };
+
+  const resolveCaptureStepId = (expectation = {}, meta = {}) => {
+    const explicitStep = meta.step_id || meta.stepId;
+    if (explicitStep) return String(explicitStep);
+    if (expectation?.plan_id || Number.isFinite(expectation?.plan_step_index)) {
+      return `${expectation.plan_id || 'plan'}:${Number.isFinite(expectation?.plan_step_index) ? expectation.plan_step_index : 'step'}`;
+    }
+    return String(expectation?.profile || 'single');
+  };
+
+  const hashInput = (value = '') => crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 16);
+
+  const getCaptureState = (callSid) => captureLifecycle.get(callSid)?.state || CAPTURE_STATES.IDLE;
+
+  const transitionCaptureState = (callSid, event, meta = {}) => {
+    if (!callSid || !event) return false;
+    const prev = getCaptureState(callSid);
+    const next = CAPTURE_TRANSITIONS[prev]?.[event];
+    if (!next) {
+      logDigitMetric('capture_state_ignored', {
+        callSid,
+        event,
+        state: prev
+      });
+      void emitAuditEvent(callSid, 'DigitCaptureStateInvalidTransition', {
+        source: 'system',
+        reason: meta.reason || 'invalid_transition',
+        state_from: prev,
+        attempted_event: event
+      });
+      return false;
+    }
+    const snapshot = {
+      state: next,
+      previous_state: prev,
+      event,
+      updated_at: Date.now(),
+      reason: meta.reason || null
+    };
+    captureLifecycle.set(callSid, snapshot);
+    logDigitMetric('capture_state_transition', {
+      callSid,
+      from: prev,
+      to: next,
+      event,
+      reason: meta.reason || null
+    });
+    void emitAuditEvent(callSid, 'DigitCaptureStateTransition', {
+      source: 'system',
+      reason: meta.reason || null,
+      state_from: prev,
+      state_to: next,
+      transition_event: event
+    });
+    return true;
+  };
+
+  const canAcceptCaptureInput = (callSid) => {
+    const state = getCaptureState(callSid);
+    return [
+      CAPTURE_STATES.PROMPTED,
+      CAPTURE_STATES.WAITING,
+      CAPTURE_STATES.SOFT_TIMEOUT,
+      CAPTURE_STATES.COLLECTING,
+      CAPTURE_STATES.RETRYING,
+      CAPTURE_STATES.FINAL_ATTEMPT
+    ].includes(state);
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const setCaptureActive = (callSid, active, meta = {}) => {
+    if (!callSid) return;
+    const callConfig = callConfigurations.get(callSid) || {};
+    const updatedAt = new Date().toISOString();
+    if (active) {
+      ensureCaptureSession(callSid, {}, { channel: meta.channel || 'dtmf' });
+      if (getCaptureState(callSid) === CAPTURE_STATES.IDLE) {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.START_COLLECT, { reason: meta.reason || 'set_active' });
+      }
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'capture_active',
+            reason: meta.reason || 'set_active',
+            call_mode: 'dtmf_capture',
+            digit_capture_active: true,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCaptureActive' }
+        );
+      } else {
+        callConfig.digit_capture_active = true;
+        callConfig.call_mode = 'dtmf_capture';
+        callConfig.flow_state = 'capture_active';
+        callConfig.flow_state_updated_at = updatedAt;
+        if (meta.reason) {
+          callConfig.flow_state_reason = meta.reason;
+        }
+      }
+      if (meta.group_id) {
+        callConfig.capture_group = meta.group_id;
+        callConfig.group_locked = true;
+      }
+    } else {
+      transitionCaptureState(callSid, CAPTURE_EVENTS.RESET, { reason: meta.reason || 'set_inactive' });
+      if (meta.complete === true) {
+        void completeCaptureSession(callSid, 'completed', { reason: meta.reason || 'set_inactive', channel: meta.channel || null });
+      }
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: meta.flow_state || 'normal',
+            reason: meta.reason || 'set_inactive',
+            call_mode: callConfig.call_mode === 'dtmf_capture' ? 'normal' : callConfig.call_mode,
+            digit_capture_active: false,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCaptureActive' }
+        );
+      } else {
+        callConfig.digit_capture_active = false;
+        if (callConfig.call_mode === 'dtmf_capture') {
+          callConfig.call_mode = 'normal';
+        }
+        callConfig.flow_state = meta.flow_state || 'normal';
+        callConfig.flow_state_updated_at = updatedAt;
+        if (meta.reason) {
+          callConfig.flow_state_reason = meta.reason;
+        }
+      }
+    }
+    callConfigurations.set(callSid, callConfig);
+  };
+
+  const updatePlanState = (callSid, plan, state, meta = {}) => {
+    if (!plan || !state) return;
+    plan.state = state;
+    plan.state_updated_at = new Date().toISOString();
+    if (meta.step_index !== undefined) {
+      plan.state_step_index = meta.step_index;
+    }
+    if (meta.reason) {
+      plan.state_reason = meta.reason;
+    }
+    digitCollectionPlans.set(callSid, plan);
+    logDigitMetric('plan_state', {
+      callSid,
+      state,
+      step: meta.step_index ?? plan.index ?? null,
+      reason: meta.reason || null,
+      group: plan.group_id || null
+    });
+  };
+
+  const getCallerAffect = (callSid) => {
+    const state = callerAffect.get(callSid) || { attempts: 0, impatience: 0, started_at: Date.now() };
+    const patience = state.impatience >= 2 || state.attempts >= 2 ? 'low' : 'high';
+    return { ...state, patience };
+  };
+
+  const recordCallerAffect = (callSid, reason = '') => {
+    const state = callerAffect.get(callSid) || { attempts: 0, impatience: 0, started_at: Date.now() };
+    state.attempts += 1;
+    if (['too_fast', 'timeout', 'spam_pattern', 'low_confidence'].includes(reason)) {
+      state.impatience += 1;
+    }
+    callerAffect.set(callSid, state);
+    return getCallerAffect(callSid);
+  };
+
+  const getSystemHealth = (callSid = null) => {
+    let health = null;
+    if (typeof healthProvider === 'function') {
+      try {
+        health = healthProvider(callSid);
+      } catch (err) {
+        logDigitMetric('health_provider_error', { callSid, error: err.message });
+      }
+    }
+    const load = Number(health?.load ?? callConfigurations.size ?? 0);
+    const thresholds = { ...DEFAULT_HEALTH_THRESHOLDS, ...(healthThresholds || {}) };
+    const status = health?.status
+      || (load >= thresholds.overloaded ? 'overloaded' : load >= thresholds.degraded ? 'degraded' : 'healthy');
+    return {
+      status,
+      load,
+      meta: health?.meta || null
+    };
+  };
+
+  const getCallQualityScore = (callSid) => {
+    if (!callSid || !webhookService || typeof webhookService.getCallQualityScore !== 'function') {
+      return null;
+    }
+    try {
+      const score = webhookService.getCallQualityScore(callSid);
+      return Number.isFinite(score) ? score : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const readNumber = (...values) => {
+    for (const value of values) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+
+  const getChannelConditions = (callSid, source = 'dtmf') => {
+    const callConfig = callConfigurations.get(callSid) || {};
+    const qualityScore = getCallQualityScore(callSid);
+    let jitterMs = null;
+    let rttMs = null;
+    let packetLossPct = null;
+    try {
+      if (webhookService && typeof webhookService.getQualityMetrics === 'function') {
+        const entry = webhookService.liveConsoleByCallSid?.get?.(callSid);
+        if (entry) {
+          const metrics = webhookService.getQualityMetrics(entry) || {};
+          jitterMs = readNumber(metrics.jitterMs, jitterMs);
+          rttMs = readNumber(metrics.latencyMs, metrics.rttMs, rttMs);
+          packetLossPct = readNumber(metrics.packetLossPct, packetLossPct);
+        }
+      }
+    } catch (_) {}
+    const configMetrics = callConfig.channel_metrics || callConfig.network_metrics || callConfig.media_metrics || {};
+    jitterMs = readNumber(jitterMs, configMetrics.jitterMs, configMetrics.jitter_ms);
+    rttMs = readNumber(rttMs, configMetrics.rttMs, configMetrics.rtt_ms, configMetrics.latencyMs, configMetrics.latency_ms);
+    packetLossPct = readNumber(packetLossPct, configMetrics.packetLossPct, configMetrics.packet_loss_pct);
+
+    const thresholds = {
+      ...DEFAULT_CAPTURE_ADAPTIVE_POLICY,
+      ...(adaptivePolicy || {})
+    };
+    const poor = Boolean(
+      (Number.isFinite(jitterMs) && jitterMs >= thresholds.poorJitterMs)
+      || (Number.isFinite(rttMs) && rttMs >= thresholds.poorRttMs)
+      || (Number.isFinite(packetLossPct) && packetLossPct >= thresholds.poorPacketLossPct)
+      || (Number.isFinite(qualityScore) && qualityScore <= 3)
+    );
+    const severe = Boolean(
+      (Number.isFinite(jitterMs) && jitterMs >= thresholds.severeJitterMs)
+      || (Number.isFinite(rttMs) && rttMs >= thresholds.severeRttMs)
+      || (Number.isFinite(packetLossPct) && packetLossPct >= thresholds.severePacketLossPct)
+      || (Number.isFinite(qualityScore) && qualityScore <= 1)
+    );
+    return {
+      source,
+      qualityScore,
+      jitterMs,
+      rttMs,
+      packetLossPct,
+      poor,
+      severe
+    };
+  };
+
+  const computeChannelTimeoutMultiplier = (conditions = null) => {
+    if (!conditions) return 1;
+    let multiplier = 1;
+    if (conditions.poor) multiplier += 0.15;
+    if (conditions.severe) multiplier += 0.15;
+    if (Number.isFinite(conditions.jitterMs) && conditions.jitterMs > 35) multiplier += 0.05;
+    if (Number.isFinite(conditions.rttMs) && conditions.rttMs > 320) multiplier += 0.05;
+    if (Number.isFinite(conditions.packetLossPct) && conditions.packetLossPct > 2) multiplier += 0.05;
+    return Math.min(1.45, multiplier);
+  };
+
+  const applyChannelTimeoutAdjustments = (expectation = {}, conditions = null) => {
+    const next = { ...expectation };
+    if (!conditions) return next;
+    const baseResponse = Number.isFinite(Number(next.response_timeout_s))
+      ? Number(next.response_timeout_s)
+      : (Number.isFinite(Number(next.timeout_s)) ? Number(next.timeout_s) : 10);
+    if (conditions.poor) {
+      next.response_timeout_s = Math.min(SAFE_TIMEOUT_MAX_S, Math.round(baseResponse * 1.15));
+    }
+    if (conditions.severe) {
+      const severeBase = Number.isFinite(Number(next.response_timeout_s))
+        ? Number(next.response_timeout_s)
+        : baseResponse;
+      next.response_timeout_s = Math.min(SAFE_TIMEOUT_MAX_S, Math.round(severeBase * 1.3));
+      next.max_retries = Math.min(SAFE_RETRY_MAX, (next.max_retries || 0) + 1);
+    }
+    next.timeout_s = next.response_timeout_s;
+    return next;
+  };
+
+  const resolveEffectiveTimeoutSeconds = (expectation = {}, options = {}) => {
+    const profile = normalizeProfileId(expectation?.profile) || 'generic';
+    const floor = getProfileTimeoutFloor(profile);
+    const responseTimeout = Number.isFinite(Number(expectation?.response_timeout_s))
+      ? Number(expectation.response_timeout_s)
+      : (Number.isFinite(Number(expectation?.timeout_s)) ? Number(expectation.timeout_s) : 10);
+    const interDigitTimeout = Number.isFinite(Number(expectation?.inter_digit_timeout_s))
+      ? Number(expectation.inter_digit_timeout_s)
+      : null;
+    const hasPartialInput = options.hasPartialInput === true;
+    const base = hasPartialInput && interDigitTimeout
+      ? interDigitTimeout
+      : responseTimeout;
+    const effective = Math.max(floor, Math.max(SAFE_TIMEOUT_MIN_S, base));
+    return {
+      timeout_s: Math.min(SAFE_TIMEOUT_MAX_S, effective),
+      mode: hasPartialInput && interDigitTimeout ? 'inter_digit' : 'response',
+      floor_s: floor
+    };
+  };
+
+  const buildChannelSessionId = (callSid, source = 'dtmf') => {
+    const sid = String(callSid || 'call').slice(-8);
+    const src = normalizeCaptureChannel(source);
+    return `${src}_${sid}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+  };
+
+  const syncChannelSession = (expectation, source = 'dtmf', options = {}) => {
+    if (!expectation) return null;
+    const now = Date.now();
+    const normalizedSource = normalizeCaptureChannel(source || expectation.channel || 'dtmf');
+    const previous = expectation.channel_session_id || null;
+    const previousSource = normalizeCaptureChannel(expectation.channel || normalizedSource);
+    const rotateBySource = previousSource !== normalizedSource;
+    const rotateByPrompt = options.forceRotate === true;
+    const rotateByAge = Number.isFinite(Number(expectation.channel_session_started_at))
+      && now - Number(expectation.channel_session_started_at) > Math.max(CHANNEL_SESSION_ROTATE_MIN_MS, Number(expectation.timeout_s || 10) * 1000);
+    if (!previous || rotateBySource || rotateByPrompt || rotateByAge) {
+      expectation.channel_session_id = buildChannelSessionId(options.callSid || 'call', normalizedSource);
+      expectation.channel_session_started_at = now;
+    }
+    expectation.channel = normalizedSource;
+    return expectation.channel_session_id;
+  };
+
+  const applyHealthPolicy = (callSid, expectation) => {
+    if (!expectation) return expectation;
+    const health = getSystemHealth(callSid);
+    if (!health || health.status === 'healthy') return expectation;
+    const next = { ...expectation };
+    if (health.status === 'overloaded') {
+      next.max_retries = Math.min(next.max_retries || 0, 1);
+      next.response_timeout_s = Math.min(next.response_timeout_s || next.timeout_s || SAFE_TIMEOUT_MAX_S, 10);
+      next.timeout_s = next.response_timeout_s;
+      if (!next.confirmation_locked) {
+        next.speak_confirmation = false;
+        next.confirmation_style = 'none';
+      }
+      next.prompt = `Please enter the ${buildExpectedLabel(next)} now.`;
+    } else if (health.status === 'degraded') {
+      next.max_retries = Math.min(next.max_retries || 0, 2);
+      next.response_timeout_s = Math.min(next.response_timeout_s || next.timeout_s || SAFE_TIMEOUT_MAX_S, 15);
+      next.timeout_s = next.response_timeout_s;
+      if (!next.confirmation_locked && next.speak_confirmation) {
+        next.speak_confirmation = false;
+      }
+    }
+    logDigitMetric('health_policy_applied', {
+      callSid,
+      status: health.status,
+      max_retries: next.max_retries,
+      timeout_s: next.timeout_s
+    });
+    return next;
+  };
+
+  const resetCircuitWindow = () => {
+    breakerState.window_start = Date.now();
+    breakerState.total = 0;
+    breakerState.errors = 0;
+  };
+
+  const recordCircuitAttempt = () => {
+    const now = Date.now();
+    const windowMs = Number(circuitBreaker?.windowMs || DEFAULT_CIRCUIT_BREAKER.windowMs);
+    if (now - breakerState.window_start > windowMs) {
+      resetCircuitWindow();
+    }
+    breakerState.total += 1;
+  };
+
+  const recordCircuitError = () => {
+    breakerState.errors += 1;
+    const minSamples = Number(circuitBreaker?.minSamples || DEFAULT_CIRCUIT_BREAKER.minSamples);
+    const errorRate = Number(circuitBreaker?.errorRate || DEFAULT_CIRCUIT_BREAKER.errorRate);
+    if (!breakerState.open && breakerState.total >= minSamples) {
+      const rate = breakerState.errors / Math.max(1, breakerState.total);
+      if (rate >= errorRate) {
+        breakerState.open = true;
+        breakerState.opened_at = Date.now();
+        logDigitMetric('circuit_opened', { error_rate: rate.toFixed(2), total: breakerState.total });
+      }
+    }
+  };
+
+  const isCircuitOpen = () => {
+    if (!breakerState.open) return false;
+    const cooldownMs = Number(circuitBreaker?.cooldownMs || DEFAULT_CIRCUIT_BREAKER.cooldownMs);
+    if (Date.now() - breakerState.opened_at >= cooldownMs) {
+      breakerState.open = false;
+      breakerState.opened_at = 0;
+      resetCircuitWindow();
+      logDigitMetric('circuit_closed', { recovered_at: Date.now() });
+      return false;
+    }
+    return true;
+  };
+
+  const formatDigitsForSpeech = (digits = '', maxDigits = 6) => {
+    const value = String(digits || '').replace(/\D/g, '').slice(0, maxDigits);
+    if (!value) return '';
+    return value.split('').join('-');
+  };
+
+  const isSensitiveProfile = (profile = '') => {
+    const normalized = normalizeProfileId(profile);
+    return new Set([
+      'verification',
+      'otp',
+      'pin',
+      'ssn',
+      'cvv',
+      'card_number',
+      'routing_number',
+      'account_number',
+      'tax_id',
+      'ein',
+      'dob'
+    ]).has(normalized);
+  };
+
+  const HIGH_RISK_VERTICALS = new Set([
+    'finance',
+    'financial_services',
+    'banking',
+    'fintech',
+    'healthcare',
+    'medical',
+    'government',
+    'public_sector',
+    'insurance'
+  ]);
+
+  const resolveCallVertical = (callConfig = {}) => {
+    const raw = callConfig?.vertical
+      || callConfig?.industry
+      || callConfig?.business_vertical
+      || callConfig?.businessType
+      || '';
+    return String(raw || '').toLowerCase().trim().replace(/[\s-]+/g, '_');
+  };
+
+  const normalizeInputChannel = (value = '') => {
+    const raw = String(value || '').toLowerCase().trim();
+    if (!raw) return 'dtmf';
+    if (raw === 'voice' || raw === 'spoken' || raw === 'speech') return 'speech';
+    if (raw === 'text') return 'sms';
+    if (raw === 'url' || raw === 'web') return 'link';
+    if (raw === 'sms' || raw === 'dtmf' || raw === 'link') return raw;
+    return 'dtmf';
+  };
+
+  const updateSessionState = (callSid, updates = {}) => {
+    if (!callSid) return null;
+    const existing = sessionState.get(callSid) || {
+      partialDigits: '',
+      lastCandidate: null,
+      lastUpdatedAt: Date.now()
+    };
+    const next = {
+      ...existing,
+      ...updates,
+      lastUpdatedAt: Date.now()
+    };
+    sessionState.set(callSid, next);
+    return next;
+  };
+
+  const getSessionState = (callSid) => sessionState.get(callSid) || null;
+
+  const normalizeRiskScore = (value) => {
+    const score = Number(value);
+    if (!Number.isFinite(score)) return null;
+    return Math.max(0, Math.min(1, score));
+  };
+
+  const resolveRiskSignal = (callSid, callConfig = {}) => {
+    const cached = riskSignals.get(callSid);
+    if (cached && Date.now() - cached.updated_at < 30000) {
+      return cached;
+    }
+    let score = null;
+    let reason = null;
+    try {
+      if (typeof riskEvaluator === 'function') {
+        const result = riskEvaluator(callSid, callConfig) || {};
+        score = normalizeRiskScore(result.score ?? result.riskScore ?? result.value);
+        reason = result.reason || result.source || null;
+      }
+    } catch (err) {
+      logDigitMetric('risk_evaluator_error', { callSid, error: err.message });
+    }
+    if (score === null) {
+      score = normalizeRiskScore(callConfig.voice_biometric_risk_score ?? callConfig.risk_score);
+    }
+    if (score === null) {
+      return null;
+    }
+    const signal = {
+      score,
+      reason: reason || callConfig.voice_biometric_risk_reason || callConfig.risk_reason || null,
+      updated_at: Date.now()
+    };
+    riskSignals.set(callSid, signal);
+    logDigitMetric('risk_signal', { callSid, score, reason: signal.reason });
+    return signal;
+  };
+
+  const applyRiskPolicy = (callSid, expectation) => {
+    if (!expectation) return expectation;
+    const callConfig = callConfigurations.get(callSid) || {};
+    const signal = resolveRiskSignal(callSid, callConfig);
+    if (!signal) return expectation;
+    const thresholds = { ...DEFAULT_RISK_THRESHOLDS, ...(riskThresholds || {}) };
+    let applied = false;
+    if (signal.score >= thresholds.confirm) {
+      expectation.speak_confirmation = true;
+      if (!expectation.confirmation_locked) {
+        if (isSensitiveProfile(expectation.profile)) {
+          expectation.confirmation_style = signal.score >= thresholds.dtmf_only ? 'last2' : 'last4';
+        } else if (!expectation.confirmation_style || expectation.confirmation_style === 'none') {
+          expectation.confirmation_style = 'last4';
+        }
+      }
+      applied = true;
+    }
+    if (signal.score >= thresholds.dtmf_only) {
+      expectation.allow_spoken_fallback = false;
+      if (!expectation.confirmation_locked && isSensitiveProfile(expectation.profile)) {
+        expectation.confirmation_style = 'last2';
+      }
+      applied = true;
+    }
+    if (signal.score >= thresholds.route_agent) {
+      expectation.risk_action = 'route_to_agent';
+      expectation.risk_score = signal.score;
+      expectation.risk_reason = signal.reason || 'risk_threshold';
+      applied = true;
+    }
+    if (applied) {
+      logDigitMetric('risk_policy_applied', {
+        callSid,
+        score: signal.score,
+        action: expectation.risk_action || null,
+        confirmation: expectation.speak_confirmation === true,
+        dtmf_only: expectation.allow_spoken_fallback === false
+      });
+    }
+    return expectation;
+  };
+
+  const applyCapturePolicy = (callSid, expectation, params = {}) => {
+    if (!expectation) return expectation;
+    const next = { ...expectation };
+    const profile = normalizeProfileId(next.profile) || 'generic';
+    const rules = PROFILE_RULES[profile] || PROFILE_RULES.generic;
+    const callConfig = callConfigurations.get(callSid) || {};
+    const vertical = resolveCallVertical(callConfig);
+    const highRiskVertical = HIGH_RISK_VERTICALS.has(vertical);
+    const callPolicy = callConfig.capture_policy && typeof callConfig.capture_policy === 'object'
+      ? callConfig.capture_policy
+      : {};
+    const allowSensitiveRawPersistence = params.allow_sensitive_raw_persistence === true
+      && params.persist_raw_digits === true
+      && (callPolicy.allow_sensitive_raw_persistence === true || callConfig.allow_sensitive_raw_persistence === true);
+
+    const normalizedMin = Math.max(1, Number(next.min_digits) || 1);
+    const normalizedMax = Math.max(normalizedMin, Number(next.max_digits) || normalizedMin);
+    next.min_digits = normalizedMin;
+    next.max_digits = normalizedMax;
+
+    const requestedChannels = Array.isArray(params.allowed_input_channels)
+      ? params.allowed_input_channels.map((entry) => normalizeInputChannel(entry))
+      : null;
+    const channelPolicy = rules.channel_policy || {};
+    const allowed = {
+      dtmf: channelPolicy.dtmf !== false,
+      sms: channelPolicy.sms !== false && smsFallbackEnabled,
+      speech: channelPolicy.voice !== false && next.allow_spoken_fallback !== false,
+      link: requestedChannels ? requestedChannels.includes('link') : params.allow_link_input === true
+    };
+    if (requestedChannels && requestedChannels.length) {
+      allowed.dtmf = requestedChannels.includes('dtmf') && allowed.dtmf;
+      allowed.sms = requestedChannels.includes('sms') && allowed.sms;
+      allowed.speech = requestedChannels.includes('speech') && allowed.speech;
+    }
+
+    if (highRiskVertical) {
+      allowed.speech = false;
+      next.allow_spoken_fallback = false;
+      next.mask_for_gpt = true;
+      next.storage_class = 'restricted';
+      next.persist_raw_digits = false;
+      next.allow_sensitive_raw_persistence = false;
+      next.escalation_policy = 'route_to_agent';
+      if (allowSensitiveRawPersistence) {
+        next.persist_raw_digits = true;
+        next.allow_sensitive_raw_persistence = true;
+      }
+    } else {
+      next.storage_class = isSensitiveProfile(profile) ? 'sensitive' : 'standard';
+      next.persist_raw_digits = params.persist_raw_digits !== false;
+      next.allow_sensitive_raw_persistence = false;
+      if (isSensitiveProfile(profile) && params.persist_raw_digits !== true) {
+        next.persist_raw_digits = false;
+      }
+    }
+
+    if (rules.mask_strategy === 'masked' || rules.mask_strategy === 'last4') {
+      next.mask_for_gpt = true;
+    }
+    next.mask_strategy = rules.mask_strategy || 'masked';
+    next.allowed_input_channels = allowed;
+    next.allow_sms_fallback = next.allow_sms_fallback === true && allowed.sms;
+    next.allow_spoken_fallback = next.allow_spoken_fallback === true && allowed.speech;
+    next.vertical = vertical || null;
+
+    const preferredChannel = normalizeInputChannel(next.channel || params.channel || 'dtmf');
+    if (allowed[preferredChannel]) {
+      next.channel = preferredChannel;
+    } else if (allowed.dtmf) {
+      next.channel = 'dtmf';
+    } else if (allowed.sms) {
+      next.channel = 'sms';
+    } else if (allowed.speech) {
+      next.channel = 'speech';
+    } else {
+      next.channel = 'dtmf';
+    }
+
+    if (highRiskVertical) {
+      logDigitMetric('capture_policy_high_risk', {
+        callSid,
+        profile,
+        vertical,
+        storage_class: next.storage_class,
+        channel: next.channel
+      });
+      if (next.allow_sensitive_raw_persistence === true) {
+        logDigitMetric('capture_policy_high_risk_override', {
+          callSid,
+          profile,
+          vertical,
+          storage_class: next.storage_class
+        });
+      }
+    }
+    return next;
+  };
+
+  const resolveCallPhone = async (callSid) => {
+    const callConfig = callConfigurations.get(callSid);
+    const direct = callConfig?.phone_number || callConfig?.number || callConfig?.to;
+    if (direct) return String(direct).trim();
+    if (db?.getCall) {
+      try {
+        const callRecord = await db.getCall(callSid);
+        if (callRecord?.phone_number) {
+          return String(callRecord.phone_number).trim();
+        }
+      } catch (_) {}
+    }
+    return null;
+  };
+
+  const buildSecureCaptureLink = (callSid, tokenRef = '') => {
+    const host = config?.server?.hostname;
+    if (!host || !tokenRef) return '';
+    const encodedRef = encodeURIComponent(tokenRef);
+    return `https://${host}/capture/secure?callSid=${encodeURIComponent(callSid)}&token=${encodedRef}`;
+  };
+
+  const buildSmsPrompt = (expectation, correlationId = '', secureLink = '') => {
+    const label = buildExpectedLabel(expectation);
+    const suffix = correlationId ? ` Ref: ${correlationId}` : '';
+    const linkHint = secureLink
+      ? ` You can also use this secure link: ${secureLink}`
+      : '';
+    return `Reply with your ${label} using digits only.${suffix}${linkHint}`;
+  };
+
+  const buildSmsStepPrompt = (expectation) => {
+    const label = buildExpectedLabel(expectation);
+    const stepIndex = expectation?.plan_step_index;
+    const totalSteps = expectation?.plan_total_steps;
+    const stepPrefix = Number.isFinite(stepIndex) && Number.isFinite(totalSteps)
+      ? `Step ${stepIndex} of ${totalSteps}. `
+      : '';
+    return `${stepPrefix}Reply with your ${label} using digits only.`;
+  };
+
+  const createSmsSession = async (callSid, expectation, reason = 'fallback') => {
+    if (!smsService || !smsFallbackEnabled) return null;
+    const phone = await resolveCallPhone(callSid);
+    if (!phone) {
+      logDigitMetric('sms_fallback_no_phone', { callSid });
+      return null;
+    }
+    const correlationId = `SMS-${callSid.slice(-6)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+    const secureToken = storeSensitiveToken(callSid, expectation?.profile || 'generic', `${callSid}:${correlationId}`, {
+      reason: 'sms_link_bootstrap',
+      channel: 'secure_sms_link'
+    });
+    const secureLink = buildSecureCaptureLink(callSid, secureToken?.ref || '');
+    const prompt = buildSmsPrompt(expectation, correlationId, secureLink);
+    try {
+      await smsService.sendSMS(phone, prompt, null, { idempotencyKey: `${callSid}:${correlationId}` });
+      const session = {
+        callSid,
+        phone,
+        correlationId,
+        secureLink,
+        secureLinkToken: secureToken?.ref || null,
+        expectation: { ...expectation },
+        created_at: Date.now(),
+        reason,
+        attempts: 0,
+        active: true
+      };
+      smsSessions.set(callSid, session);
+      smsSessionsByPhone.set(phone, session);
+      const plan = digitCollectionPlans.get(callSid);
+      if (plan?.active) {
+        plan.channel = 'sms';
+      }
+      updateCaptureSessionChannel(callSid, 'secure_sms_link', { reason: 'sms_fallback' });
+      logDigitMetric('sms_fallback_sent', { callSid, phone, correlationId, profile: expectation.profile });
+      await db.updateCallState(callSid, 'digit_collection_sms_sent', {
+        phone,
+        correlation_id: correlationId,
+        reason,
+        fallback_reason_code: buildFallbackReasonCode('sms', reason),
+        secure_link: secureLink || null
+      }).catch(() => {});
+      return session;
+    } catch (err) {
+      logDigitMetric('sms_fallback_failed', { callSid, error: err.message });
+      return null;
+    }
+  };
+
+  const shouldUseSmsFallback = (expectation, collection) => {
+    if (!smsService || !smsFallbackEnabled || !expectation) return false;
+    if (expectation.sms_fallback_used) return false;
+    const retries = collection?.retries || 0;
+    if (retries < smsFallbackMinRetries) return false;
+    const reason = collection?.reason || '';
+    return ['low_confidence', 'timeout', 'spam_pattern', 'too_fast'].includes(reason);
+  };
+
+  const clearSmsSession = (callSid) => {
+    const session = smsSessions.get(callSid);
+    if (session) {
+      smsSessions.delete(callSid);
+      smsSessionsByPhone.delete(session.phone);
+    }
+  };
+
+  const getSmsSessionByPhone = (phone) => smsSessionsByPhone.get(String(phone || '').trim()) || null;
+
+  const parseDigitsFromText = (text = '') => String(text || '').replace(/\D/g, '');
+
+  const buildSmsReplyForResult = (collection) => {
+    if (!collection) return '';
+    if (collection.accepted) {
+      return smsFallbackConfirmationMessage;
+    }
+    if (collection.fallback) {
+      return smsFallbackFailureMessage;
+    }
+    if (collection.reason === 'incomplete') {
+      return 'I only received part of the digits. Please reply with the full number.';
+    }
+    return 'Please reply with the digits only.';
+  };
+
+  const handleCircuitFallback = async (callSid, expectation, allowCallEnd, deferCallEnd, source = 'system') => {
+    const profile = expectation?.profile || 'generic';
+    transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'circuit_open' });
+    await emitAuditEvent(callSid, 'DigitCaptureAborted', {
+      profile,
+      source,
+      reason: 'circuit_open'
+    });
+    if (expectation?.allow_sms_fallback && smsFallbackEnabled) {
+      const session = await createSmsSession(callSid, expectation, 'circuit_open');
+      if (session) {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'sms_fallback_circuit' });
+        expectation.sms_fallback_used = true;
+        expectation.channel = 'sms';
+        digitCollectionManager.expectations.set(callSid, expectation);
+        if (allowCallEnd) {
+          if (!deferCallEnd) {
+            await speakAndEndCall(callSid, smsFallbackMessage, 'digits_sms_fallback');
+          }
+          return true;
+        }
+        return true;
+      }
+    }
+    if (allowCallEnd) {
+      if (deferCallEnd) {
+        if (queuePendingDigitAction) {
+          queuePendingDigitAction(callSid, { type: 'end', text: callEndMessages.failure || 'We could not verify the digits. Goodbye.', reason: 'digit_service_unavailable' });
+        }
+        return true;
+      }
+      await speakAndEndCall(callSid, callEndMessages.failure || 'We could not verify the digits. Goodbye.', 'digit_service_unavailable');
+      return true;
+    }
+    return false;
+  };
+
+  const routeToAgentOnRisk = async (callSid, expectation, collection, allowCallEnd, deferCallEnd) => {
+    const score = expectation?.risk_score ?? null;
+    const reason = expectation?.risk_reason || 'risk_threshold';
+    const message = callEndMessages.risk
+      || 'For security reasons, we need to route this request to an agent. Goodbye.';
+    updateCaptureSessionChannel(callSid, 'human_agent_handoff', { reason });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'risk_route_to_agent' });
+    logDigitMetric('risk_route_agent', { callSid, score, reason });
+    void emitAuditEvent(callSid, 'RoutedToAgent', {
+      profile: expectation?.profile || collection?.profile || 'generic',
+      source: collection?.source || 'system',
+      reason,
+      confidence: collection?.confidence || null,
+      signals: collection?.confidence_signals || null
+    });
+    await db.updateCallState(callSid, 'digit_risk_escalation', {
+      score,
+      reason,
+      profile: expectation?.profile || collection?.profile || null,
+      fallback_reason_code: buildFallbackReasonCode('human_agent', reason)
+    }).catch(() => {});
+    if (allowCallEnd) {
+      if (deferCallEnd) {
+        if (queuePendingDigitAction) {
+          queuePendingDigitAction(callSid, { type: 'end', text: message, reason: 'risk_escalation' });
+        }
+        return true;
+      }
+      await speakAndEndCall(callSid, message, 'risk_escalation');
+      return true;
+    }
+    if (queuePendingDigitAction) {
+      queuePendingDigitAction(callSid, { type: 'end', text: message, reason: 'risk_escalation' });
+    }
+    return true;
+  };
+
+  const recordIntentHistory = (callSid, profile) => {
+    if (!callSid || !profile) return;
+    const entry = intentHistory.get(callSid) || { counts: {}, lastProfile: null };
+    entry.counts[profile] = (entry.counts[profile] || 0) + 1;
+    entry.lastProfile = profile;
+    intentHistory.set(callSid, entry);
+  };
+
+  const estimateIntentCandidates = (callSid, callConfig = {}) => {
+    const candidates = new Map();
+    const pushScore = (profile, score, source) => {
+      if (!profile || !isSupportedProfile(profile)) return;
+      const existing = candidates.get(profile) || { profile, score: 0, sources: [] };
+      existing.score += score;
+      existing.sources.push(source);
+      candidates.set(profile, existing);
+    };
+    const textSources = [
+      { text: callConfig.last_agent_prompt, weight: 0.6, label: 'last_agent_prompt' },
+      { text: callConfig.last_bot_prompt, weight: 0.6, label: 'last_bot_prompt' },
+      { text: callConfig.workflow_state, weight: 0.5, label: 'workflow_state' },
+      { text: callConfig.prompt, weight: 0.4, label: 'prompt' },
+      { text: callConfig.first_message, weight: 0.3, label: 'first_message' }
+    ].filter((entry) => entry.text);
+    const keywordRules = [
+      { profile: 'otp', regex: /\b(otp|one[-\s]?time|verification code|security code|code)\b/i, base: 0.7 },
+      { profile: 'pin', regex: /\b(pin|passcode)\b/i, base: 0.7 },
+      { profile: 'routing_number', regex: /\brouting\b/i, base: 0.8 },
+      { profile: 'account_number', regex: /\baccount number\b/i, base: 0.7 },
+      { profile: 'card_number', regex: /\b(card number|credit card|debit card)\b/i, base: 0.7 },
+      { profile: 'cvv', regex: /\b(cvv|cvc|security code)\b/i, base: 0.7 },
+      { profile: 'card_expiry', regex: /\b(expiry|expiration|exp date|mm\/yy)\b/i, base: 0.6 },
+      { profile: 'ssn', regex: /\b(ssn|social security)\b/i, base: 0.7 },
+      { profile: 'dob', regex: /\b(date of birth|dob)\b/i, base: 0.6 },
+      { profile: 'zip', regex: /\b(zip|postal)\b/i, base: 0.5 },
+      { profile: 'phone', regex: /\b(phone number|phone)\b/i, base: 0.5 }
+    ];
+    for (const source of textSources) {
+      const text = String(source.text || '');
+      for (const rule of keywordRules) {
+        if (rule.regex.test(text)) {
+          pushScore(rule.profile, rule.base * source.weight, source.label);
+        }
+      }
+    }
+    if (callConfig.script_policy?.default_profile) {
+      pushScore(callConfig.script_policy.default_profile, 0.9, 'script_policy');
+    }
+    const history = intentHistory.get(callSid);
+    if (history?.lastProfile) {
+      pushScore(history.lastProfile, 0.2, 'history');
+    }
+    let list = Array.from(candidates.values());
+    list = list.map((entry) => ({
+      ...entry,
+      score: Math.min(1, entry.score)
+    })).sort((a, b) => b.score - a.score);
+    return list.slice(0, 3);
+  };
+
+  const buildDigitCandidate = (collection, expectation, source = 'dtmf') => {
+    const reasonCodes = [];
+    const dtmfClarity = source === 'dtmf'
+      ? (collection.reason === 'too_fast' ? 0.2 : 0.9)
+      : 0.6;
+    const asrConfidence = source === 'spoken'
+      ? (Number.isFinite(collection.asr_confidence) ? collection.asr_confidence : 0.55)
+      : 1;
+    const consistency = (() => {
+      const exp = expectation || {};
+      if (Array.isArray(exp.collected) && exp.collected.length >= 2) {
+        const last = exp.collected[exp.collected.length - 1];
+        const prev = exp.collected[exp.collected.length - 2];
+        return last === prev ? 0.9 : 0.5;
+      }
+      return 0.7;
+    })();
+    const contextFit = (() => {
+      if (collection.reason === 'spam_pattern') return 0.1;
+      if (collection.reason === 'too_long') return 0.2;
+      if (collection.reason === 'too_short' || collection.reason === 'incomplete') return 0.4;
+      if (collection.reason && collection.reason.startsWith('invalid_')) return 0.2;
+      return collection.accepted ? 0.9 : 0.6;
+    })();
+    const confidence = Math.max(0, Math.min(1,
+      (dtmfClarity * 0.4) + (asrConfidence * 0.3) + (consistency * 0.2) + (contextFit * 0.1)
+    ));
+    if (dtmfClarity < 0.5) reasonCodes.push('low_dtmf_clarity');
+    if (asrConfidence < 0.5) reasonCodes.push('low_asr_confidence');
+    if (consistency < 0.6) reasonCodes.push('low_consistency');
+    if (contextFit < 0.6) reasonCodes.push('context_mismatch');
+    return {
+      confidence,
+      signals: {
+        dtmfClarity,
+        asrConfidence,
+        consistency,
+        contextFit
+      },
+      reasonCodes
+    };
+  };
+
+  const resolveRejectionCode = (reason = '', profile = 'generic', source = 'dtmf') => {
+    const normalizedReason = String(reason || '').toLowerCase().trim();
+    const normalizedProfile = normalizeProfileId(profile) || 'generic';
+    const normalizedSource = String(source || '').toLowerCase();
+    if (!normalizedReason) return null;
+    if (normalizedReason === 'idempotent_duplicate' || normalizedReason === 'duplicate') return 'DUPLICATE_INPUT';
+    if (normalizedReason === 'stale_channel_session') return 'STALE_CHANNEL_SESSION';
+    if (normalizedReason === 'stale_attempt') return 'STALE_ATTEMPT';
+    if (normalizedReason === 'stale_step' || normalizedReason === 'stale_plan') return 'STALE_PLAN_EVENT';
+    if (normalizedReason === 'invalid_state') return 'INVALID_CAPTURE_STATE';
+    if (normalizedReason === 'too_fast') return 'FRAUD_IMPOSSIBLE_TIMING';
+    if (normalizedReason === 'spam_pattern') return 'FRAUD_BOT_CADENCE';
+    if (normalizedReason === 'low_confidence') return 'MULTI_SIGNAL_LOW_CONFIDENCE';
+    if (normalizedReason.startsWith('invalid_card')) return 'VALIDATION_CARD_NUMBER';
+    if (normalizedReason === 'invalid_cvv') return 'VALIDATION_CVV';
+    if (normalizedReason.startsWith('invalid_expiry')) return 'VALIDATION_EXPIRY';
+    if (normalizedReason === 'invalid_routing') return 'VALIDATION_ROUTING_NUMBER';
+    if (normalizedReason === 'invalid_phone') return 'VALIDATION_PHONE_NUMBER';
+    if (normalizedReason === 'invalid_month' || normalizedReason === 'invalid_day') return 'VALIDATION_DOB';
+    if (normalizedReason === 'invalid_length' || normalizedReason === 'too_short' || normalizedReason === 'too_long' || normalizedReason === 'incomplete') {
+      if (normalizedProfile === 'cvv') return 'VALIDATION_CVV_LENGTH';
+      if (normalizedProfile === 'card_number') return 'VALIDATION_CARD_LENGTH';
+      if (normalizedProfile === 'card_expiry') return 'VALIDATION_EXPIRY_LENGTH';
+      return 'VALIDATION_LENGTH';
+    }
+    if (normalizedReason === 'risk_rejected') {
+      if (normalizedSource === 'spoken') return 'MULTI_SIGNAL_LOW_CONFIDENCE';
+      return 'RISK_SIGNAL_REJECTED';
+    }
+    return `VALIDATION_${normalizedReason.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+  };
+
+  const buildFallbackReasonCode = (channel, reason = '') => {
+    const normalizedChannel = String(channel || '').toLowerCase().trim();
+    const normalizedReason = String(reason || '').toLowerCase().trim();
+    if (normalizedChannel === 'sms') {
+      if (normalizedReason === 'circuit_open') return 'DIGIT_SMS_FALLBACK_CIRCUIT_OPEN';
+      return `DIGIT_SMS_FALLBACK_${(normalizedReason || 'MAX_RETRIES').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+    }
+    if (normalizedChannel === 'human_agent') {
+      return `DIGIT_AGENT_ESCALATION_${(normalizedReason || 'RISK').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+    }
+    if (normalizedChannel === 'voice') {
+      return `DIGIT_VOICE_FALLBACK_${(normalizedReason || 'MAX_RETRIES').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+    }
+    return `DIGIT_FALLBACK_${(normalizedReason || 'UNKNOWN').toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+  };
+
+  const evaluateCaptureRisk = ({ callSid, collection, expectation, source = 'dtmf', candidate = null }) => {
+    const profile = normalizeProfileId(collection?.profile || expectation?.profile || 'generic') || 'generic';
+    const callConfig = callConfigurations.get(callSid) || {};
+    const vertical = resolveCallVertical(callConfig);
+    const highRiskVertical = HIGH_RISK_VERTICALS.has(vertical);
+    const sensitive = isSensitiveProfile(profile) || highRiskVertical;
+    const normalizedSource = String(source || '').toLowerCase();
+    const reasons = [];
+    const conditions = getChannelConditions(callSid, normalizedSource);
+    const candidateConfidence = Number.isFinite(candidate?.confidence) ? candidate.confidence : null;
+    const asrConfidence = Number.isFinite(collection?.asr_confidence)
+      ? collection.asr_confidence
+      : (Number.isFinite(candidate?.signals?.asrConfidence) ? candidate.signals.asrConfidence : null);
+    if (Number.isFinite(collection?.dtmf_gap_ms) && collection.dtmf_gap_ms > 0 && collection.dtmf_gap_ms < Math.max(80, Math.round(minDtmfGapMs * 0.55))) {
+      reasons.push('impossible_timing');
+    }
+    if (collection?.reason === 'spam_pattern') {
+      reasons.push('bot_cadence');
+    }
+    if (normalizedSource === 'spoken') {
+      if (!Number.isFinite(asrConfidence) || asrConfidence < 0.65) {
+        reasons.push('low_asr_confidence');
+      }
+      if (Number.isFinite(candidateConfidence) && candidateConfidence < 0.62) {
+        reasons.push('low_candidate_confidence');
+      }
+    }
+    if (sensitive && normalizedSource === 'spoken' && conditions.poor) {
+      reasons.push('poor_channel_for_sensitive_input');
+    }
+    if (sensitive && (profile === 'card_number' || profile === 'cvv') && !['dtmf', 'gather', 'sms', 'link'].includes(normalizedSource)) {
+      reasons.push('blocked_sensitive_channel');
+    }
+
+    if (!reasons.length) {
+      return {
+        reject: false,
+        code: null,
+        reasons: [],
+        conditions
+      };
+    }
+
+    let code = 'RISK_SIGNAL_REJECTED';
+    if (reasons.includes('blocked_sensitive_channel')) code = 'SENSITIVE_CHANNEL_BLOCKED';
+    else if (reasons.includes('bot_cadence')) code = 'FRAUD_BOT_CADENCE';
+    else if (reasons.includes('impossible_timing')) code = 'FRAUD_IMPOSSIBLE_TIMING';
+    else if (reasons.includes('low_asr_confidence') || reasons.includes('low_candidate_confidence')) code = 'MULTI_SIGNAL_LOW_CONFIDENCE';
+
+    const reject = sensitive || reasons.includes('impossible_timing') || reasons.includes('bot_cadence');
+    return {
+      reject,
+      code,
+      reasons,
+      conditions
+    };
+  };
+
+  const buildRetryPolicy = ({ reason, attempt, expectation, affect, session, health, qualityScore, conditions = null }) => {
+    const label = buildExpectedLabel(expectation || {});
+    const patience = affect?.patience || 'high';
+    const partial = session?.partialDigits || '';
+    const allowPartialReplay = partial && !isSensitiveProfile(expectation?.profile);
+    const partialSpoken = allowPartialReplay ? formatDigitsForSpeech(partial) : '';
+    const status = health?.status || 'healthy';
+    const poorQuality = Boolean(
+      (Number.isFinite(qualityScore) && qualityScore <= 2)
+      || conditions?.poor
+    );
+    const severeQuality = Boolean(
+      (Number.isFinite(qualityScore) && qualityScore <= 1)
+      || conditions?.severe
+    );
+    if (status === 'overloaded') {
+      return {
+        delayMs: 0,
+        prompt: `Please enter the ${label} now.`
+      };
+    }
+    switch (reason) {
+      case 'too_fast':
+        return {
+          delayMs: Math.min(500, 250 + (attempt * 50)),
+          prompt: patience === 'low'
+            ? `Let's try once more—enter the ${label} slowly.`
+            : `No rush—enter the ${label} slowly.`
+        };
+      case 'timeout':
+        return {
+          delayMs: poorQuality ? 220 : 0,
+          prompt: `I did not receive any input. Please enter the ${label} now.`
+        };
+      case 'spam_pattern':
+        return {
+          delayMs: 0,
+          prompt: `That pattern does not look right. Please enter the ${label} now.`,
+          forceDtmfOnly: true
+        };
+      case 'low_confidence':
+        return {
+          delayMs: poorQuality ? 180 : 0,
+          prompt: `I may have missed that. Please enter the ${label} again.`
+        };
+      case 'too_short':
+      case 'incomplete': {
+        const expectedLen = expectation?.max_digits || expectation?.min_digits || '';
+        const lenText = expectedLen ? ` all ${expectedLen} digits` : ` the ${label}`;
+        if (allowPartialReplay && partialSpoken) {
+          const intro = patience === 'low'
+            ? `I have ${partialSpoken}.`
+            : `I heard ${partialSpoken}.`;
+          return {
+            delayMs: 0,
+            prompt: `${intro} If that is correct, enter the remaining digits. Otherwise, enter${lenText} now.`
+          };
+        }
+        return {
+          delayMs: poorQuality ? 120 : 0,
+          prompt: `I only got part of it. Please enter${lenText} now.`
+        };
+      }
+      default:
+        return {
+          delayMs: severeQuality ? 240 : (poorQuality ? 120 : 0)
+        };
+    }
+  };
+
+  const DIGIT_PROFILE_DEFAULTS = {
+    verification: { min_digits: 4, max_digits: 8, timeout_s: 20, response_timeout_s: 20, inter_digit_timeout_s: 8, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: true },
+    otp: { min_digits: 4, max_digits: 8, timeout_s: 20, response_timeout_s: 20, inter_digit_timeout_s: 8, max_retries: 2, min_collect_delay_ms: 1500, end_call_on_success: true },
+    pin: { min_digits: 4, max_digits: 8, timeout_s: 15, response_timeout_s: 15, inter_digit_timeout_s: 6, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    ssn: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    dob: { min_digits: 6, max_digits: 8, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    routing_number: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    account_number: { min_digits: 6, max_digits: 17, timeout_s: 18, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    account: { min_digits: 6, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, confirmation_style: 'last4', end_call_on_success: true },
+    phone: { min_digits: 10, max_digits: 10, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    tax_id: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    ein: { min_digits: 9, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    claim_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    reservation_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    ticket_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    case_number: { min_digits: 4, max_digits: 12, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    amount: { min_digits: 1, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    callback_confirm: { min_digits: 10, max_digits: 10, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    cvv: { min_digits: 3, max_digits: 4, timeout_s: 12, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    card_number: { min_digits: 13, max_digits: 19, timeout_s: 25, response_timeout_s: 25, inter_digit_timeout_s: 10, max_retries: 2, min_collect_delay_ms: 1500, confirmation_style: 'last4', end_call_on_success: true },
+    card_expiry: { min_digits: 4, max_digits: 6, timeout_s: 20, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    zip: { min_digits: 5, max_digits: 9, timeout_s: 15, max_retries: 2, min_collect_delay_ms: 1200, end_call_on_success: true },
+    extension: { min_digits: 1, max_digits: 6, timeout_s: 10, max_retries: 2, min_collect_delay_ms: 800, end_call_on_success: true }
+  };
+
+  const PROFILE_RULES = {
+    generic: { validation: 'none', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'none' },
+    verification: { validation: 'otp', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: true, voice: false }, confirmation: 'none' },
+    otp: { validation: 'otp', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: true, voice: false }, confirmation: 'none' },
+    pin: { validation: 'pin', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    ssn: { validation: 'ssn', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    dob: { validation: 'dob', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    routing_number: { validation: 'routing', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    account_number: { validation: 'account', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    account: { validation: 'account', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'last4' },
+    phone: { validation: 'phone', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'last4' },
+    tax_id: { validation: 'tax_id', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    ein: { validation: 'ein', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    claim_number: { validation: 'claim', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'none' },
+    reservation_number: { validation: 'reservation', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'none' },
+    ticket_number: { validation: 'ticket', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'none' },
+    case_number: { validation: 'case', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'none' },
+    extension: { validation: 'extension', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'none' },
+    zip: { validation: 'zip', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'none' },
+    amount: { validation: 'amount', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'spoken_amount' },
+    callback_confirm: { validation: 'callback', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: true, voice: true }, confirmation: 'last4' },
+    card_number: { validation: 'luhn', mask_strategy: 'last4', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'last4' },
+    cvv: { validation: 'cvv', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' },
+    card_expiry: { validation: 'expiry', mask_strategy: 'masked', channel_policy: { dtmf: true, sms: false, voice: false }, confirmation: 'none' }
+  };
+
+  const generatedProfileDefaults = new Map();
+  const buildGeneratedProfileDefaults = (profile) => {
+    const normalized = normalizeProfileId(profile) || 'generic';
+    if (generatedProfileDefaults.has(normalized)) {
+      return generatedProfileDefaults.get(normalized);
+    }
+    const base = DIGIT_PROFILE_DEFAULTS[normalized] || {};
+    const rules = PROFILE_RULES[normalized] || PROFILE_RULES.generic;
+    const generated = Object.freeze({
+      ...base,
+      profile: normalized,
+      validation: rules.validation,
+      mask_strategy: rules.mask_strategy,
+      channel_policy: rules.channel_policy,
+      confirmation_strategy: rules.confirmation
+    });
+    generatedProfileDefaults.set(normalized, generated);
+    return generated;
+  };
+
+  const sanitizedProfileDefaults = new Map();
+  const sanitizeProfileDefaults = (profile, defaults = {}) => {
+    const minDigits = Math.max(1, Number.isFinite(defaults.min_digits) ? defaults.min_digits : 1);
+    const maxDigits = Math.max(minDigits, Number.isFinite(defaults.max_digits) ? defaults.max_digits : minDigits);
+    const timeout = Number.isFinite(defaults.timeout_s) ? defaults.timeout_s : 15;
+    const responseTimeout = Number.isFinite(defaults.response_timeout_s) ? defaults.response_timeout_s : timeout;
+    const interDigitTimeout = Number.isFinite(defaults.inter_digit_timeout_s)
+      ? defaults.inter_digit_timeout_s
+      : Math.max(SAFE_TIMEOUT_MIN_S, Math.round(responseTimeout * 0.6));
+    const maxRetries = Number.isFinite(defaults.max_retries) ? defaults.max_retries : 2;
+    const minCollectDelay = Number.isFinite(defaults.min_collect_delay_ms)
+      ? defaults.min_collect_delay_ms
+      : defaultCollectDelayMs;
+    return {
+      ...defaults,
+      min_digits: minDigits,
+      max_digits: maxDigits,
+      timeout_s: Math.min(SAFE_TIMEOUT_MAX_S, Math.max(SAFE_TIMEOUT_MIN_S, timeout)),
+      response_timeout_s: Math.min(SAFE_TIMEOUT_MAX_S, Math.max(SAFE_TIMEOUT_MIN_S, responseTimeout)),
+      inter_digit_timeout_s: Math.min(SAFE_TIMEOUT_MAX_S, Math.max(SAFE_TIMEOUT_MIN_S, interDigitTimeout)),
+      max_retries: Math.min(SAFE_RETRY_MAX, Math.max(0, maxRetries)),
+      min_collect_delay_ms: Math.max(800, minCollectDelay)
+    };
+  };
+
+  const validateProfileDefaults = () => {
+    Object.keys(DIGIT_PROFILE_DEFAULTS).forEach((profile) => {
+      if (!SUPPORTED_DIGIT_PROFILES.has(profile)) {
+        logDigitMetric('profile_default_unsupported', { profile });
+        return;
+      }
+      const generated = buildGeneratedProfileDefaults(profile);
+      sanitizedProfileDefaults.set(profile, sanitizeProfileDefaults(profile, generated));
+    });
+  };
+
+  validateProfileDefaults();
+
+  function setCallDigitIntent(callSid, intent) {
+    const callConfig = callConfigurations.get(callSid);
+    if (!callConfig) return;
+    const updatedAt = new Date().toISOString();
+    callConfig.digit_intent = intent;
+    if (intent?.mode === 'dtmf') {
+      const hasActiveCapture = digitCollectionManager.expectations.has(callSid)
+        || digitCollectionPlans.has(callSid);
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: hasActiveCapture ? 'capture_active' : 'capture_pending',
+            reason: intent.reason || 'digit_intent',
+            call_mode: 'dtmf_capture',
+            digit_capture_active: true,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCallDigitIntent' }
+        );
+      } else {
+        callConfig.digit_capture_active = true;
+        callConfig.flow_state = hasActiveCapture ? 'capture_active' : 'capture_pending';
+        callConfig.flow_state_reason = intent.reason || 'digit_intent';
+        callConfig.flow_state_updated_at = updatedAt;
+      }
+    } else if (intent?.mode === 'normal') {
+      if (digitCollectionManager.expectations.has(callSid) || digitCollectionPlans.has(callSid)) {
+        callConfig.digit_intent = { mode: 'dtmf', reason: 'capture_active', confidence: 1 };
+        if (typeof setCallFlowState === 'function') {
+          setCallFlowState(
+            callSid,
+            {
+              flow_state: 'capture_active',
+              reason: 'capture_active',
+              call_mode: 'dtmf_capture',
+              digit_capture_active: true,
+              flow_state_updated_at: updatedAt
+            },
+            { callConfig, source: 'digit.setCallDigitIntent' }
+          );
+        } else {
+          callConfig.digit_capture_active = true;
+          callConfig.flow_state = 'capture_active';
+          callConfig.flow_state_reason = 'capture_active';
+          callConfig.flow_state_updated_at = updatedAt;
+        }
+        callConfigurations.set(callSid, callConfig);
+        return;
+      }
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            reason: intent.reason || 'normal',
+            call_mode: 'normal',
+            digit_capture_active: false,
+            flow_state_updated_at: updatedAt
+          },
+          { callConfig, source: 'digit.setCallDigitIntent' }
+        );
+      } else {
+        callConfig.digit_capture_active = false;
+        callConfig.flow_state = 'normal';
+        callConfig.flow_state_reason = intent.reason || 'normal';
+        callConfig.flow_state_updated_at = updatedAt;
+      }
+    }
+    callConfigurations.set(callSid, callConfig);
+  }
+
+  function clearDigitIntent(callSid, reason = 'digits_captured') {
+    if (digitCollectionManager.expectations.has(callSid) || digitCollectionPlans.has(callSid)) {
+      return;
+    }
+    setCallDigitIntent(callSid, { mode: 'normal', reason, confidence: 1 });
+  }
+
+  function getDigitProfileDefaults(profile = 'generic') {
+    const key = String(profile || 'generic').toLowerCase();
+    if (sanitizedProfileDefaults.has(key)) {
+      return sanitizedProfileDefaults.get(key);
+    }
+    return DIGIT_PROFILE_DEFAULTS[key] || {};
+  }
+
+  function getProfileTimeoutFloor(profile = 'generic') {
+    const normalized = normalizeProfileId(profile) || 'generic';
+    return PROFILE_TIMEOUT_FLOORS_S[normalized]
+      || PROFILE_TIMEOUT_FLOORS_S.generic
+      || SAFE_TIMEOUT_MIN_S;
+  }
+
+  function normalizeDigitExpectation(params = {}) {
+    const promptHint = `${params.prompt || ''} ${params.prompt_hint || ''}`.toLowerCase();
+    const hasExplicitProfile = params.profile !== undefined
+      && params.profile !== null
+      && String(params.profile).trim() !== '';
+    const hasExplicitLength = typeof params.min_digits === 'number'
+      || typeof params.max_digits === 'number'
+      || typeof params.force_exact_length === 'number';
+    const allowProfileInference = params.allow_profile_inference === true;
+    let profile = normalizeProfileId(hasExplicitProfile ? params.profile : 'generic') || 'generic';
+    if (allowProfileInference && !hasExplicitProfile && !hasExplicitLength && profile === 'generic' && promptHint.match(/\b(code|otp|verification|verify|passcode|pin)\b/)) {
+      profile = 'verification';
+    }
+    const defaults = getDigitProfileDefaults(profile);
+    const minDigits = typeof params.min_digits === 'number'
+      ? params.min_digits
+      : (typeof defaults.min_digits === 'number' ? defaults.min_digits : 1);
+    const maxDigits = typeof params.max_digits === 'number'
+      ? params.max_digits
+      : (typeof defaults.max_digits === 'number' ? defaults.max_digits : minDigits);
+    const timeout = typeof params.timeout_s === 'number'
+      ? params.timeout_s
+      : (typeof defaults.timeout_s === 'number' ? defaults.timeout_s : 20);
+    const responseTimeout = typeof params.response_timeout_s === 'number'
+      ? params.response_timeout_s
+      : (typeof defaults.response_timeout_s === 'number' ? defaults.response_timeout_s : timeout);
+    const interDigitTimeout = typeof params.inter_digit_timeout_s === 'number'
+      ? params.inter_digit_timeout_s
+      : (typeof defaults.inter_digit_timeout_s === 'number' ? defaults.inter_digit_timeout_s : null);
+    const softTimeout = typeof params.soft_timeout_s === 'number'
+      ? params.soft_timeout_s
+      : (typeof defaults.soft_timeout_s === 'number' ? defaults.soft_timeout_s : null);
+    const maxRetries = typeof params.max_retries === 'number'
+      ? params.max_retries
+      : (typeof defaults.max_retries === 'number' ? defaults.max_retries : 2);
+    const minCollectDelayMs = typeof params.min_collect_delay_ms === 'number'
+      ? params.min_collect_delay_ms
+      : (typeof defaults.min_collect_delay_ms === 'number' ? defaults.min_collect_delay_ms : defaultCollectDelayMs);
+    const maskForGpt = typeof params.mask_for_gpt === 'boolean'
+      ? params.mask_for_gpt
+      : (typeof defaults.mask_for_gpt === 'boolean' ? defaults.mask_for_gpt : true);
+    const speakConfirmationProvided = typeof params.speak_confirmation === 'boolean';
+    const speakConfirmation = speakConfirmationProvided ? params.speak_confirmation : false;
+    const confirmationStyle = params.confirmation_style || defaults.confirmation_style || 'none';
+    const allowSmsFallback = typeof params.allow_sms_fallback === 'boolean'
+      ? params.allow_sms_fallback
+      : smsFallbackEnabled;
+    const channel = params.channel || 'dtmf';
+    const endCallOnSuccess = typeof params.end_call_on_success === 'boolean'
+      ? params.end_call_on_success
+      : (typeof defaults.end_call_on_success === 'boolean' ? defaults.end_call_on_success : true);
+    const rawPrompt = params.prompt && String(params.prompt).trim().length > 0
+      ? params.prompt
+      : '';
+    const reprompt_message = params.reprompt_message || defaults.reprompt_message || '';
+    const terminatorChar = params.terminator_char || defaults.terminator_char || '#';
+    const allowTerminator = params.allow_terminator === true || defaults.allow_terminator === true;
+    const terminatorSuffix = allowTerminator
+      ? ` You can end with ${terminatorChar} when finished.`
+      : '';
+    const prompt = rawPrompt ? `${rawPrompt}${terminatorSuffix}` : '';
+
+    let normalizedMin = minDigits;
+    let normalizedMax = maxDigits < minDigits ? minDigits : maxDigits;
+    const exactLength = Number(params.force_exact_length);
+    if (Number.isFinite(exactLength) && exactLength > 0) {
+      const boundedExact = Math.max(1, Math.trunc(exactLength));
+      normalizedMin = boundedExact;
+      normalizedMax = boundedExact;
+    }
+    if (allowTerminator && terminatorChar === '#') {
+      normalizedMax = Math.max(normalizedMax, normalizedMin);
+    }
+    if (profile === 'verification' || profile === 'otp') {
+      if (normalizedMin < 4) normalizedMin = 4;
+      if (normalizedMax < normalizedMin) normalizedMax = normalizedMin;
+      if (normalizedMax > 8) normalizedMax = 8;
+    }
+
+    const repromptDefaults = buildDefaultReprompts({
+      profile,
+      min_digits: normalizedMin,
+      max_digits: normalizedMax,
+      allow_terminator: allowTerminator,
+      terminator_char: terminatorChar
+    });
+
+    const reprompt_invalid = normalizeRepromptValue(
+      params.reprompt_invalid ?? defaults.reprompt_invalid ?? repromptDefaults.invalid
+    );
+    const reprompt_incomplete = normalizeRepromptValue(
+      params.reprompt_incomplete ?? defaults.reprompt_incomplete ?? repromptDefaults.invalid
+    );
+    const reprompt_timeout = normalizeRepromptValue(
+      params.reprompt_timeout ?? defaults.reprompt_timeout ?? repromptDefaults.timeout
+    );
+    const failure_message = normalizeTerminalMessageValue(
+      params.failure_message ?? defaults.failure_message ?? repromptDefaults.failure
+    );
+    const timeout_failure_message = normalizeTerminalMessageValue(
+      params.timeout_failure_message ?? defaults.timeout_failure_message ?? repromptDefaults.timeout_failure
+    );
+    const soft_timeout_prompt = normalizeRepromptValue(
+      params.soft_timeout_prompt ?? defaults.soft_timeout_prompt ?? ''
+    );
+
+    const estimatedPromptMs = estimateSpeechDurationMs(params.prompt || params.prompt_hint || '');
+    const adjustedDelayMs = Math.max(minCollectDelayMs, estimatedPromptMs, 3000);
+    const timeoutFloor = getProfileTimeoutFloor(profile);
+    const safeResponseTimeout = Math.min(
+      SAFE_TIMEOUT_MAX_S,
+      Math.max(SAFE_TIMEOUT_MIN_S, timeoutFloor, responseTimeout),
+    );
+    const safeInterDigitTimeout = Number.isFinite(Number(interDigitTimeout))
+      ? Math.max(
+        SAFE_TIMEOUT_MIN_S,
+        Math.min(
+          SAFE_TIMEOUT_MAX_S,
+          Number(interDigitTimeout),
+        ),
+      )
+      : Math.max(SAFE_TIMEOUT_MIN_S, Math.min(safeResponseTimeout, Math.round(safeResponseTimeout * 0.6)));
+    const timeoutGraceMs = Number.isFinite(Number(params.timeout_grace_ms))
+      ? Number(params.timeout_grace_ms)
+      : (Number.isFinite(Number(defaults.timeout_grace_ms))
+        ? Number(defaults.timeout_grace_ms)
+        : strictTimeoutGraceMs);
+    const safeTimeoutGraceMs = Math.max(250, Math.min(5000, timeoutGraceMs));
+    const safeSoftTimeout = Number.isFinite(softTimeout)
+      ? Math.max(1, Math.min(safeResponseTimeout - 1, softTimeout))
+      : Math.max(2, Math.round(safeResponseTimeout * 0.6));
+    const safeMaxRetries = Math.min(SAFE_RETRY_MAX, Math.max(0, maxRetries));
+    const safeCollectDelayMs = Math.max(800, adjustedDelayMs);
+
+    return {
+      prompt,
+      reprompt_message,
+      reprompt_invalid,
+      reprompt_incomplete,
+      reprompt_timeout,
+      failure_message,
+      timeout_failure_message,
+      profile,
+      min_digits: normalizedMin,
+      max_digits: normalizedMax,
+      timeout_s: safeResponseTimeout,
+      response_timeout_s: safeResponseTimeout,
+      inter_digit_timeout_s: safeInterDigitTimeout,
+      timeout_floor_s: timeoutFloor,
+      timeout_grace_ms: safeTimeoutGraceMs,
+      soft_timeout_s: safeSoftTimeout,
+      soft_timeout_prompt,
+      max_retries: safeMaxRetries,
+      min_collect_delay_ms: safeCollectDelayMs,
+      confirmation_style: confirmationStyle,
+      confirmation_locked: speakConfirmationProvided,
+      allow_spoken_fallback: params.allow_spoken_fallback === true || defaults.allow_spoken_fallback === true,
+      allow_sms_fallback: allowSmsFallback,
+      reset_on_interrupt: params.reset_on_interrupt === true || defaults.reset_on_interrupt === true,
+      mask_for_gpt: maskForGpt,
+      speak_confirmation: speakConfirmation,
+      end_call_on_success: endCallOnSuccess,
+      allow_terminator: allowTerminator,
+      terminator_char: terminatorChar,
+      channel
+    };
+  }
+
+  function buildDigitPrompt(expectation) {
+    const policy = resolveProfilePromptPolicy(expectation || {});
+    const prompt = renderPromptTemplate(policy.initial || 'Enter the {label} now.{terminatorSuffix}', expectation || {});
+    return prompt || 'Enter the code now.';
+  }
+
+  function buildConfirmationMessage(expectation = {}, collection = {}) {
+    const profile = String(expectation.profile || collection.profile || 'generic').toLowerCase();
+    const style = expectation.confirmation_style || 'none';
+    const speak = expectation.speak_confirmation === true || style !== 'none';
+    if (!speak) return '';
+
+    if (style === 'spoken_amount' && collection.digits) {
+      const amountCents = Number(collection.digits);
+      if (!Number.isNaN(amountCents)) {
+        const dollars = (amountCents / 100).toFixed(2);
+        return `Thanks, I noted ${dollars} dollars.`;
+      }
+    }
+
+    if ((style === 'last4' || style === 'last2') && collection.digits) {
+      const tailSize = style === 'last2' ? 2 : 4;
+      const tail = collection.digits.slice(-tailSize);
+      if (tail) {
+        return `Thanks, I have the number ending in ${tail}.`;
+      }
+    }
+
+    switch (profile) {
+      case 'verification':
+      case 'otp':
+        return 'Thanks, your code is received.';
+      case 'extension':
+        return 'Thanks, I have the extension.';
+      case 'zip':
+        return 'Thanks, I have the ZIP code.';
+      case 'account':
+        return 'Thanks, I have the account number.';
+      default:
+        return 'Thanks, I have that.';
+    }
+  }
+
+  function clearDigitTimeout(callSid) {
+    const timer = digitTimeouts.get(callSid);
+    if (timer) {
+      clearTimeout(timer);
+      digitTimeouts.delete(callSid);
+    }
+    const softTimer = digitTimeouts.get(`${callSid}:soft`);
+    if (softTimer) {
+      clearTimeout(softTimer);
+      digitTimeouts.delete(`${callSid}:soft`);
+    }
+  }
+
+  function clearDigitFallbackState(callSid) {
+    if (digitFallbackStates.has(callSid)) {
+      digitFallbackStates.delete(callSid);
+    }
+  }
+
+  function clearDigitPlan(callSid) {
+    if (digitCollectionPlans.has(callSid)) {
+      digitCollectionPlans.delete(callSid);
+    }
+  }
+
+  function buildGatherNonce() {
+    return crypto.randomBytes(8).toString('hex');
+  }
+
+  function markDigitPrompted(callSid, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
+    const expectation = digitCollectionManager.expectations.get(callSid);
+    if (!expectation) return false;
+    const channelChanged = normalizeCaptureChannel(expectation.channel || 'dtmf') !== normalizeCaptureChannel(source);
+    syncChannelSession(expectation, source, {
+      callSid,
+      forceRotate: options.reset_buffer === true || channelChanged
+    });
+    updateCaptureSessionChannel(callSid, source, { reason: 'prompted' });
+    const now = Date.now();
+    const promptText = options?.prompt_text || options?.prompt || '';
+    const fallbackPrompt = !promptText
+      ? (expectation.prompt || buildDigitPrompt(expectation))
+      : '';
+    const resolvedPromptText = promptText || fallbackPrompt || '';
+    const explicitDurationMs = options?.prompt_duration_ms;
+    const estimatedPromptMs = Number.isFinite(explicitDurationMs)
+      ? explicitDurationMs
+      : estimateSpeechDurationMs(resolvedPromptText);
+    const baseDelayMs = Number.isFinite(expectation.min_collect_delay_ms)
+      ? expectation.min_collect_delay_ms
+      : 0;
+    const promptDelayMs = Math.max(1000, baseDelayMs, estimatedPromptMs || 0);
+    const timeoutResolution = resolveEffectiveTimeoutSeconds(expectation, { hasPartialInput: false });
+    const timeoutFloor = timeoutResolution.floor_s;
+    const timeoutSeconds = timeoutResolution.timeout_s;
+    const effectiveTimeoutMs = Math.max(
+      5000,
+      Math.max(timeoutFloor, timeoutSeconds) * 1000,
+    );
+    const timeoutGraceMs = Number.isFinite(Number(expectation.timeout_grace_ms))
+      ? Number(expectation.timeout_grace_ms)
+      : strictTimeoutGraceMs;
+    const channelConditions = getChannelConditions(callSid, source);
+    expectation.prompted_at = now;
+    expectation.prompted_delay_ms = promptDelayMs;
+    expectation.timeout_deadline_at =
+      now + promptDelayMs + effectiveTimeoutMs + Math.max(250, timeoutGraceMs);
+    expectation.channel_conditions = {
+      poor: Boolean(channelConditions?.poor),
+      severe: Boolean(channelConditions?.severe),
+      qualityScore: Number.isFinite(channelConditions?.qualityScore)
+        ? channelConditions.qualityScore
+        : null,
+      jitterMs: Number.isFinite(channelConditions?.jitterMs)
+        ? channelConditions.jitterMs
+        : null,
+      rttMs: Number.isFinite(channelConditions?.rttMs)
+        ? channelConditions.rttMs
+        : null,
+      packetLossPct: Number.isFinite(channelConditions?.packetLossPct)
+        ? channelConditions.packetLossPct
+        : null,
+      updated_at: new Date(now).toISOString()
+    };
+    if (source === 'gather') {
+      expectation.gather_prompt_seq = Number(expectation.gather_prompt_seq || 0) + 1;
+      expectation.gather_nonce = buildGatherNonce();
+      expectation.gather_prompted_at = now;
+    }
+    if (options.reset_buffer === true && (source === 'dtmf' || source === 'gather')) {
+      expectation.buffer = '';
+      expectation.collected = [];
+      expectation.last_masked = null;
+      expectation.buffered_at = null;
+      expectation.attempt_id = (expectation.attempt_id || 0) + 1;
+      expectation.soft_timeout_fired = false;
+      expectation.soft_timeout_stage = 0;
+      pendingDigits.delete(callSid);
+      updateSessionState(callSid, { partialDigits: '' });
+      transitionCaptureState(callSid, CAPTURE_EVENTS.RESUME_COLLECT, { reason: 'reprompt' });
+    } else if (getCaptureState(callSid) === CAPTURE_STATES.IDLE) {
+      transitionCaptureState(callSid, CAPTURE_EVENTS.START_COLLECT, { reason: 'prompted' });
+    }
+    transitionCaptureState(callSid, CAPTURE_EVENTS.PROMPT_PLAYED, { reason: 'prompted' });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.WAIT_FOR_INPUT, { reason: 'awaiting_input' });
+    digitCollectionManager.expectations.set(callSid, expectation);
+    if (gptService) {
+      void flushBufferedDigits(callSid, gptService, interactionCount, source, options);
+    }
+    return true;
+  }
+
+  function updatePromptDelay(callSid, durationMs) {
+    const expectation = digitCollectionManager.expectations.get(callSid);
+    if (!expectation || !Number.isFinite(durationMs)) return false;
+    const baseDelayMs = Number.isFinite(expectation.min_collect_delay_ms)
+      ? expectation.min_collect_delay_ms
+      : 0;
+    const currentDelayMs = Number.isFinite(expectation.prompted_delay_ms)
+      ? expectation.prompted_delay_ms
+      : 0;
+    const nextDelayMs = Math.max(1000, baseDelayMs, currentDelayMs, durationMs);
+    expectation.prompted_delay_ms = nextDelayMs;
+    digitCollectionManager.expectations.set(callSid, expectation);
+    return true;
+  }
+
+  function bufferDigits(callSid, digits = '', meta = {}) {
+    if (!callSid || !digits) return;
+    const existing = pendingDigits.get(callSid) || [];
+    existing.push({ digits: String(digits), meta });
+    pendingDigits.set(callSid, existing);
+  }
+
+  async function flushBufferedDigits(callSid, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
+    const queue = pendingDigits.get(callSid);
+    if (!queue || queue.length === 0) return false;
+
+    let processed = false;
+    while (queue.length > 0) {
+      if (!digitCollectionManager.expectations.has(callSid)) {
+        logDigitMetric('flush_stopped_no_expectation', { callSid, remaining: queue.length });
+        break;
+      }
+      const item = queue.shift();
+      const exp = digitCollectionManager.expectations.get(callSid);
+      const meta = { ...(item.meta || {}) };
+      if (exp?.attempt_id && !meta.attempt_id) {
+        meta.attempt_id = exp.attempt_id;
+      }
+      const collection = digitCollectionManager.recordDigits(callSid, item.digits, meta);
+      processed = true;
+      try {
+        await handleCollectionResult(callSid, collection, gptService, interactionCount, source, options);
+      } catch (err) {
+        logDigitMetric('flush_error', { callSid, error: err.message, remaining: queue.length });
+        console.error(`[digits] handleCollectionResult failed for ${callSid}:`, err);
+        queue.unshift(item);  // Re-queue on failure
+        break;
+      }
+    }
+
+    if (queue.length === 0) {
+      pendingDigits.delete(callSid);
+    } else {
+      pendingDigits.set(callSid, queue);
+    }
+
+    return processed;
+  }
+
+  function isValidLuhn(value = '') {
+    const digits = String(value || '').replace(/\D/g, '');
+    if (!digits) return false;
+    let sum = 0;
+    let shouldDouble = false;
+    for (let i = digits.length - 1; i >= 0; i -= 1) {
+      let digit = Number(digits[i]);
+      if (Number.isNaN(digit)) return false;
+      if (shouldDouble) {
+        digit *= 2;
+        if (digit > 9) digit -= 9;
+      }
+      sum += digit;
+      shouldDouble = !shouldDouble;
+    }
+    return sum % 10 === 0;
+  }
+
+  function isValidRoutingNumber(value = '') {
+    const digits = String(value || '').replace(/\D/g, '');
+    if (digits.length !== 9) return false;
+    const weights = [3, 7, 1, 3, 7, 1, 3, 7, 1];
+    let sum = 0;
+    for (let i = 0; i < 9; i += 1) {
+      const n = Number(digits[i]);
+      if (Number.isNaN(n)) return false;
+      sum += n * weights[i];
+    }
+    return sum % 10 === 0;
+  }
+
+  function validateProfileDigits(profile = 'generic', digits = '') {
+    const value = String(digits || '');
+    if (!value) {
+      return { valid: false, reason: 'empty' };
+    }
+
+    switch (normalizeProfileId(profile) || String(profile || '').toLowerCase()) {
+      case 'verification':
+      case 'otp':
+        return { valid: true };
+      case 'ssn':
+        return value.length === 9 ? { valid: true } : { valid: false, reason: 'invalid_length' };
+      case 'dob': {
+        if (value.length !== 6 && value.length !== 8) {
+          return { valid: false, reason: 'invalid_length' };
+        }
+        const month = Number(value.slice(0, 2));
+        const day = Number(value.slice(2, 4));
+        if (!month || month < 1 || month > 12) {
+          return { valid: false, reason: 'invalid_month' };
+        }
+        if (!day || day < 1 || day > 31) {
+          return { valid: false, reason: 'invalid_day' };
+        }
+        return { valid: true };
+      }
+      case 'routing_number':
+        return isValidRoutingNumber(value)
+          ? { valid: true }
+          : { valid: false, reason: 'invalid_routing' };
+      case 'account_number':
+        return value.length >= 6 && value.length <= 17
+          ? { valid: true }
+          : { valid: false, reason: 'invalid_length' };
+      case 'phone':
+        return value.length === 10 ? { valid: true } : { valid: false, reason: 'invalid_phone' };
+      case 'tax_id':
+      case 'ein':
+        return value.length === 9 ? { valid: true } : { valid: false, reason: 'invalid_length' };
+      case 'cvv':
+        if (value.length === 3 || value.length === 4) {
+          return { valid: true };
+        }
+        return { valid: false, reason: 'invalid_cvv' };
+      case 'card_number':
+        if (value.length < 13 || value.length > 19) {
+          return { valid: false, reason: 'invalid_card_length' };
+        }
+        return isValidLuhn(value)
+          ? { valid: true }
+          : { valid: false, reason: 'invalid_card_number' };
+      case 'card_expiry': {
+        if (value.length !== 4 && value.length !== 6) {
+          return { valid: false, reason: 'invalid_expiry_length' };
+        }
+        const month = Number(value.slice(0, 2));
+        if (!month || month < 1 || month > 12) {
+          return { valid: false, reason: 'invalid_expiry_month' };
+        }
+        const year = value.length === 4
+          ? 2000 + Number(value.slice(2, 4))
+          : Number(value.slice(2, 6));
+        if (!Number.isFinite(year) || year < 2000 || year > 2199) {
+          return { valid: false, reason: 'invalid_expiry_year' };
+        }
+        const now = new Date();
+        const currentYear = now.getUTCFullYear();
+        const currentMonth = now.getUTCMonth() + 1;
+        if (year < currentYear || (year === currentYear && month < currentMonth)) {
+          return { valid: false, reason: 'invalid_expiry_past' };
+        }
+        return { valid: true };
+      }
+      default:
+        return { valid: true };
+    }
+  }
+
+  const digitCollectionManager = {
+    expectations: new Map(),
+    setExpectation(callSid, params = {}) {
+      const session = ensureCaptureSession(callSid, params, { channel: params.channel || 'dtmf' });
+      const normalized = applyCapturePolicy(
+        callSid,
+        applyHealthPolicy(callSid, applyRiskPolicy(callSid, normalizeDigitExpectation(params))),
+        params
+      );
+      const withMitigation = applySloMitigationPolicy(callSid, normalized);
+      const channelConditions = getChannelConditions(callSid, withMitigation.channel || 'dtmf');
+      const adjustedMitigation = applyChannelTimeoutAdjustments(withMitigation, channelConditions);
+      const expectation = {
+        ...adjustedMitigation,
+        plan_id: params.plan_id || null,
+        plan_step_index: Number.isFinite(params.plan_step_index) ? params.plan_step_index : null,
+        plan_total_steps: Number.isFinite(params.plan_total_steps) ? params.plan_total_steps : null,
+        prompted_at: params.prompted_at || null,
+        soft_timeout_fired: false,
+        soft_timeout_stage: 0,
+        timeout_streak: 0,
+        retries: 0,
+        attempt_count: 0,
+        attempt_id: 1,
+        buffered_at: null,
+        buffer: '',
+        collected: [],
+        last_masked: null
+      };
+      syncChannelSession(expectation, expectation.channel || params.channel || 'dtmf', {
+        callSid,
+        forceRotate: true
+      });
+      this.expectations.set(callSid, expectation);
+      transitionCaptureState(callSid, CAPTURE_EVENTS.START_COLLECT, { reason: 'expectation_set' });
+      if (session) {
+        session.last_profile = adjustedMitigation.profile;
+        session.plan_id = params.plan_id || session.plan_id || null;
+        session.plan_step_index = Number.isFinite(params.plan_step_index) ? params.plan_step_index : session.plan_step_index;
+        session.updated_at = Date.now();
+        captureSessions.set(callSid, session);
+      }
+      updateSessionState(callSid, { partialDigits: '' });
+      setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'expectation_set', confidence: 1 });
+      logDigitMetric('expectation_set', {
+        callSid,
+        profile: expectation.profile,
+        min_digits: expectation.min_digits,
+        max_digits: expectation.max_digits,
+        timeout_s: expectation.timeout_s,
+        response_timeout_s: expectation.response_timeout_s || null,
+        inter_digit_timeout_s: expectation.inter_digit_timeout_s || null,
+        max_retries: expectation.max_retries,
+        plan_id: expectation.plan_id || null,
+        plan_step_index: expectation.plan_step_index || null,
+        plan_total_steps: expectation.plan_total_steps || null,
+        capture_session_id: session?.id || null,
+        channel_session_id: expectation.channel_session_id || null
+      });
+      void emitAuditEvent(callSid, 'DigitCaptureStarted', {
+        profile: expectation.profile,
+        len: expectation.max_digits,
+        source: expectation.channel || 'dtmf',
+        reason: expectation.reason || null
+      });
+    },
+    recordDigits(callSid, digits = '', meta = {}) {
+      if (!digits) return { accepted: false, reason: 'empty' };
+      const exp = this.expectations.get(callSid);
+      if (!exp) return { accepted: false, reason: 'no_expectation' };
+      const source = String(meta.source || 'dtmf').toLowerCase();
+      const expectedChannelSessionId = exp.channel_session_id
+        || syncChannelSession(exp, source, { callSid, forceRotate: false });
+      const metaChannelSessionId = meta.channel_session_id
+        ? String(meta.channel_session_id).trim()
+        : null;
+      if (metaChannelSessionId && expectedChannelSessionId && metaChannelSessionId !== expectedChannelSessionId) {
+        return {
+          accepted: false,
+          reason: 'stale_channel_session',
+          rejection_code: 'STALE_CHANNEL_SESSION',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+      updateCaptureSessionChannel(callSid, source, { reason: 'input_received' });
+      updateCaptureSloCounters('input');
+      if (!canAcceptCaptureInput(callSid)) {
+        return {
+          accepted: false,
+          reason: 'invalid_state',
+          rejection_code: 'INVALID_CAPTURE_STATE',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source,
+          capture_state: getCaptureState(callSid)
+        };
+      }
+      const metaPlanId = meta.plan_id ? String(meta.plan_id) : null;
+      const metaStepIndex = Number.isFinite(Number(meta.plan_step_index))
+        ? Number(meta.plan_step_index)
+        : null;
+      const expPlanId = exp.plan_id ? String(exp.plan_id) : null;
+      const expStepIndex = Number.isFinite(Number(exp.plan_step_index))
+        ? Number(exp.plan_step_index)
+        : null;
+      if (metaPlanId && expPlanId && metaPlanId !== expPlanId) {
+        return {
+          accepted: false,
+          reason: 'stale_plan',
+          rejection_code: 'STALE_PLAN_EVENT',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+      if (Number.isFinite(metaStepIndex) && Number.isFinite(expStepIndex) && metaStepIndex !== expStepIndex) {
+        return {
+          accepted: false,
+          reason: 'stale_step',
+          rejection_code: 'STALE_PLAN_EVENT',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+      if (meta.attempt_id && exp.attempt_id && meta.attempt_id !== exp.attempt_id) {
+        return {
+          accepted: false,
+          reason: 'stale_attempt',
+          rejection_code: 'STALE_ATTEMPT',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+      const metaGatherNonce = meta.gather_nonce ? String(meta.gather_nonce) : null;
+      const expGatherNonce = exp.gather_nonce ? String(exp.gather_nonce) : null;
+      if (metaGatherNonce && expGatherNonce && metaGatherNonce !== expGatherNonce) {
+        return {
+          accepted: false,
+          reason: 'stale_nonce',
+          rejection_code: 'STALE_NONCE',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+      const metaPromptSeq = Number.isFinite(Number(meta.gather_prompt_seq))
+        ? Number(meta.gather_prompt_seq)
+        : null;
+      const expPromptSeq = Number.isFinite(Number(exp.gather_prompt_seq))
+        ? Number(exp.gather_prompt_seq)
+        : null;
+      if (Number.isFinite(metaPromptSeq) && Number.isFinite(expPromptSeq) && metaPromptSeq !== expPromptSeq) {
+        return {
+          accepted: false,
+          reason: 'stale_prompt_seq',
+          rejection_code: 'STALE_PROMPT_SEQ',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+
+      // Validate input size to prevent buffer overflow
+      const cleanDigitsTemp = String(digits || '').replace(/[^0-9]/g, '');
+      if (cleanDigitsTemp.length > MAX_DIGITS_BUFFER) {
+        logDigitMetric('digit_buffer_overflow', { callSid, length: cleanDigitsTemp.length, max: MAX_DIGITS_BUFFER });
+        return { accepted: false, reason: 'exceeds_max_buffer', profile: exp.profile, mask_for_gpt: exp.mask_for_gpt, source };
+      }
+
+      const isAtomicFullInputSource = source === 'gather'
+        || source === 'sms'
+        || source === 'link'
+        || source === 'secure_sms_link';
+      const isFullInput = meta.full_input === true
+        || isAtomicFullInputSource
+        || source === 'spoken';
+      const attemptId = Number.isFinite(Number(meta.attempt_id))
+        ? Number(meta.attempt_id)
+        : (Number.isFinite(Number(exp.attempt_id)) ? Number(exp.attempt_id) : 1);
+      let stepId = resolveCaptureStepId(exp, meta);
+      if (source === 'gather') {
+        const promptSeqScope = Number.isFinite(Number(meta.gather_prompt_seq))
+          ? Number(meta.gather_prompt_seq)
+          : (Number.isFinite(Number(exp.gather_prompt_seq)) ? Number(exp.gather_prompt_seq) : null);
+        if (Number.isFinite(promptSeqScope)) {
+          stepId = `${stepId}:p${promptSeqScope}`;
+        }
+        const nonceScope = meta.gather_nonce
+          ? String(meta.gather_nonce)
+          : (exp.gather_nonce ? String(exp.gather_nonce) : '');
+        if (nonceScope) {
+          stepId = `${stepId}:n${nonceScope.slice(0, 8)}`;
+        }
+      }
+      const inputHash = hashInput(cleanDigitsTemp || digits);
+      const idempotencyKey = buildGlobalIdempotencyKey({
+        scope: 'digit_capture',
+        callSid,
+        stepId,
+        attemptId,
+        inputHash
+      });
+
+      if (isFullInput && markIdempotentAction(idempotencyKey)) {
+        updateCaptureSloCounters('duplicate');
+        const session = captureSessions.get(callSid);
+        if (session) {
+          session.duplicate_hits = (session.duplicate_hits || 0) + 1;
+          session.updated_at = Date.now();
+          captureSessions.set(callSid, session);
+        }
+        return {
+          accepted: false,
+          reason: 'idempotent_duplicate',
+          rejection_code: 'DUPLICATE_INPUT',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source,
+          idempotency_key: idempotencyKey
+        };
+      }
+      if (isFullInput && exp.buffer) {
+        const preservePartial = exp.reset_on_interrupt !== true
+          && source === 'dtmf'
+          && String(exp.buffer || '').length < Math.max(1, Number(exp.max_digits) || 1);
+        if (!preservePartial) {
+          exp.buffer = '';
+        }
+      }
+      if (isFullInput && isDuplicateInput(callSid, exp, cleanDigitsTemp, source)) {
+        return {
+          accepted: false,
+          reason: 'duplicate',
+          rejection_code: 'DUPLICATE_INPUT',
+          ignore: true,
+          profile: exp.profile,
+          mask_for_gpt: exp.mask_for_gpt,
+          source
+        };
+      }
+
+      const result = {
+        profile: exp.profile,
+        mask_for_gpt: exp.mask_for_gpt,
+        source,
+        channel_session_id: expectedChannelSessionId || null,
+        step_id: stepId,
+        attempt_id: attemptId,
+        input_hash: inputHash,
+        idempotency_key: idempotencyKey
+      };
+      const hasTerminator = exp.allow_terminator && digits.includes(exp.terminator_char || '#');
+      const cleanDigits = cleanDigitsTemp;
+      const isRepeating = (val) => val.length >= 6 && /^([0-9])\1+$/.test(val);
+      const isAscending = (val) => val.length >= 6 && '0123456789'.includes(val);
+
+      if (meta.timestamp) {
+        const lastTs = lastDtmfTimestamps.get(callSid) || 0;
+        const gap = lastTs ? meta.timestamp - lastTs : null;
+        if (gap !== null) {
+          result.dtmf_gap_ms = gap;
+        }
+        if (gap !== null && gap < minDtmfGapMs && cleanDigits.length === 1) {
+          result.accepted = false;
+          result.reason = 'too_fast';
+          result.heuristic = 'inter_key_gap';
+          exp.buffer = '';
+          this.expectations.set(callSid, exp);
+          lastDtmfTimestamps.set(callSid, meta.timestamp);
+          result.attempt_count = exp.attempt_count || 0;
+          return result;
+        }
+        lastDtmfTimestamps.set(callSid, meta.timestamp);
+      }
+
+      exp.buffer = `${exp.buffer || ''}${String(cleanDigits)}`;
+      exp.buffered_at = meta.timestamp || Date.now();
+      const currentBuffer = exp.buffer;
+      const len = currentBuffer.length;
+      const inRange = len >= exp.min_digits && len <= exp.max_digits;
+      const tooLong = len > exp.max_digits;
+      const masked = len <= 4 ? currentBuffer : `${'*'.repeat(Math.max(0, len - 4))}${currentBuffer.slice(-4)}`;
+
+      let accepted = inRange && !tooLong;
+      let reason = null;
+
+      if (hasTerminator) {
+        if (len < exp.min_digits) {
+          accepted = false;
+          reason = 'too_short';
+        } else if (len > exp.max_digits) {
+          accepted = false;
+          reason = 'too_long';
+        } else {
+          accepted = true;
+        }
+      }
+
+      if (tooLong) {
+        accepted = false;
+        reason = 'too_long';
+        exp.buffer = '';
+      } else if (!inRange) {
+        accepted = false;
+        reason = 'incomplete';
+        if (isAtomicFullInputSource) {
+          exp.buffer = '';
+        }
+      } else {
+        const validation = validateProfileDigits(exp.profile, currentBuffer);
+        if (!validation.valid) {
+          accepted = false;
+          reason = validation.reason || 'invalid';
+          exp.buffer = '';
+        }
+      }
+
+      Object.assign(result, {
+        digits: currentBuffer,
+        len,
+        masked,
+        accepted,
+        reason
+      });
+      if (result.reason) {
+        result.rejection_code = resolveRejectionCode(result.reason, exp.profile, source);
+      }
+
+      exp.collected.push(result.digits);
+      exp.last_masked = masked;
+      exp.last_input_at = meta.timestamp || Date.now();
+      const session = captureSessions.get(callSid);
+      if (session) {
+        session.attempts = (session.attempts || 0) + 1;
+        session.updated_at = Date.now();
+        session.last_profile = exp.profile || session.last_profile;
+        captureSessions.set(callSid, session);
+      }
+
+      if (result.accepted) {
+        if (isRepeating(currentBuffer) || isAscending(currentBuffer)) {
+          result.accepted = false;
+          result.reason = 'spam_pattern';
+          result.heuristic = isRepeating(currentBuffer) ? 'repeat_pattern' : 'ascending_pattern';
+          exp.buffer = '';
+          exp.retries += 1;
+          result.retries = exp.retries;
+          exp.attempt_count = (exp.attempt_count || 0) + 1;
+          result.attempt_count = exp.attempt_count;
+          if (exp.retries > exp.max_retries) {
+            result.fallback = true;
+          }
+          exp.attempt_id = (exp.attempt_id || 1) + 1;
+          this.expectations.set(callSid, exp);
+          return result;
+        }
+        exp.buffer = '';
+        exp.attempt_id = (exp.attempt_id || 1) + 1;
+        if (hasTerminator) {
+          exp.terminated = true;
+        }
+      } else {
+        const shouldCountRetry = result.reason && (result.reason !== 'incomplete' || source !== 'dtmf');
+        if (shouldCountRetry) {
+          exp.retries += 1;
+          result.retries = exp.retries;
+          exp.attempt_count = (exp.attempt_count || 0) + 1;
+          result.attempt_count = exp.attempt_count;
+          exp.attempt_id = (exp.attempt_id || 1) + 1;
+          if (exp.retries > exp.max_retries) {
+            result.fallback = true;
+          }
+        } else if (Number.isFinite(exp.attempt_count)) {
+          result.attempt_count = exp.attempt_count;
+        }
+      }
+
+      if (result.reason === 'incomplete' && result.digits) {
+        updateSessionState(callSid, { partialDigits: result.digits });
+      } else if (result.accepted || result.reason) {
+        updateSessionState(callSid, { partialDigits: '' });
+      }
+
+      this.expectations.set(callSid, exp);
+      return result;
+    }
+  };
+
+  async function scheduleDigitTimeout(callSid, gptService = null, interactionCount = 0) {
+    const exp = digitCollectionManager.expectations.get(callSid);
+    if (!exp || !exp.timeout_s) return;
+
+    clearDigitTimeout(callSid);
+
+    if (!exp.prompted_at) {
+      const promptText = exp.prompt || buildDigitPrompt(exp);
+      const estimatedPromptMs = estimateSpeechDurationMs(promptText);
+      const baseDelayMs = Number.isFinite(exp.min_collect_delay_ms) ? exp.min_collect_delay_ms : 0;
+      exp.prompted_at = Date.now();
+      exp.prompted_delay_ms = Math.max(1000, baseDelayMs, estimatedPromptMs || 0);
+      digitCollectionManager.expectations.set(callSid, exp);
+    }
+
+    const channelConditions = getChannelConditions(callSid, exp.channel || 'dtmf');
+    const timeoutMultiplier = computeChannelTimeoutMultiplier(channelConditions);
+    const hasPartialInput = Boolean(String(exp.buffer || '').length);
+    const timeoutResolution = resolveEffectiveTimeoutSeconds(exp, { hasPartialInput });
+    const effectiveTimeoutS = timeoutResolution.timeout_s;
+    const timeoutMs = Math.max(5000, effectiveTimeoutS * 1000 * timeoutMultiplier);
+    const timeoutGraceMs = Number.isFinite(Number(exp.timeout_grace_ms))
+      ? Number(exp.timeout_grace_ms)
+      : strictTimeoutGraceMs;
+    const softPromptMs = Number.isFinite(exp.soft_timeout_s)
+      ? Math.max(1000, exp.soft_timeout_s * 1000)
+      : Math.round(timeoutMs * 0.6);
+    const promptAt = exp.prompted_at || Date.now();
+    const promptDelayMs = Number.isFinite(exp.prompted_delay_ms)
+      ? exp.prompted_delay_ms
+      : (exp.min_collect_delay_ms || 0);
+    const normalizedPromptDelayMs = hasPartialInput
+      ? 0
+      : Math.max(1000, promptDelayMs);
+    const elapsedSincePrompt = Date.now() - promptAt;
+    const remainingPromptDelayMs = Math.max(0, normalizedPromptDelayMs - elapsedSincePrompt);
+    const waitMs = remainingPromptDelayMs + timeoutMs + Math.max(250, timeoutGraceMs);
+    const softWaitMs = remainingPromptDelayMs + softPromptMs;
+
+    if (!exp.soft_timeout_fired && softWaitMs + 200 < waitMs) {
+      const softTimer = setTimeout(() => {
+        const current = digitCollectionManager.expectations.get(callSid);
+        if (!current) return;
+        if (current.soft_timeout_fired) return;
+        current.soft_timeout_fired = true;
+        digitCollectionManager.expectations.set(callSid, current);
+        transitionCaptureState(callSid, CAPTURE_EVENTS.SOFT_TIMEOUT, { reason: 'soft_timeout' });
+        const softPrompt = buildSoftTimeoutPrompt(current);
+        if (queuePendingDigitAction) {
+          queuePendingDigitAction(callSid, { type: 'reprompt', text: softPrompt, scheduleTimeout: false, soft: true });
+        }
+        webhookService.addLiveEvent(callSid, '🕒 Still waiting for digits', { force: false });
+      }, softWaitMs);
+      digitTimeouts.set(`${callSid}:soft`, softTimer);
+    }
+
+    exp.timeout_deadline_at = promptAt + normalizedPromptDelayMs + timeoutMs + Math.max(250, timeoutGraceMs);
+    digitCollectionManager.expectations.set(callSid, exp);
+
+    const timer = setTimeout(async () => {
+      const current = digitCollectionManager.expectations.get(callSid);
+      if (!current) return;
+
+      logDigitMetric('timeout_fired', {
+        callSid,
+        profile: current.profile || 'generic',
+        attempt: (current.retries || 0) + 1,
+        max_retries: current.max_retries
+      });
+      updateCaptureSloCounters('timeout');
+      const session = captureSessions.get(callSid);
+      if (session) {
+        session.timeout_count = (session.timeout_count || 0) + 1;
+        session.updated_at = Date.now();
+        captureSessions.set(callSid, session);
+      }
+
+      try {
+        await db.addCallDigitEvent({
+          call_sid: callSid,
+          source: 'timeout',
+          profile: current.profile || 'generic',
+          digits: null,
+          len: 0,
+          accepted: false,
+          reason: 'timeout',
+          metadata: {
+            rejection_code: 'TIMEOUT',
+            attempt: (current.retries || 0) + 1,
+            max_retries: current.max_retries,
+            attempt_count: Number(current.attempt_count) || (current.retries || 0) + 1,
+            plan_id: current.plan_id || null,
+            plan_step_index: current.plan_step_index || null,
+            plan_total_steps: current.plan_total_steps || null,
+            step_label: formatPlanStepLabel(current) || null,
+            prompted_at: current.prompted_at || null,
+            event_timestamp: new Date().toISOString()
+          }
+        });
+      } catch (err) {
+        const log = logger || console;
+        if (typeof log.error === 'function') {
+          log.error('Error logging digit timeout:', err);
+        } else if (typeof log.log === 'function') {
+          log.log('Error logging digit timeout:', err);
+        }
+      }
+
+      const plan = digitCollectionPlans.get(callSid);
+      const callConfig = callConfigurations.get(callSid) || {};
+      const isGroupedPlan = Boolean(
+        plan
+        && ['banking', 'card'].includes(plan.group_id)
+        && callConfig.call_mode === 'dtmf_capture'
+        && callConfig.digit_capture_active === true
+        && current.plan_id === plan.id
+      );
+
+      if (!isGroupedPlan && !digitFallbackStates.get(callSid)?.active && typeof triggerTwilioGatherFallback === 'function') {
+        try {
+          const fallbackPrompt = buildTimeoutPrompt(
+            current,
+            (Number(current?.retries) || 0) + 1
+          ) || buildDigitPrompt(current);
+          const usedFallback = await triggerTwilioGatherFallback(callSid, current, {
+            prompt: fallbackPrompt
+          });
+          if (usedFallback) {
+            transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'twilio_gather_fallback' });
+            return;
+          }
+        } catch (err) {
+          logger.error('Twilio gather fallback error:', err);
+        }
+      }
+
+      current.retries = (current.retries || 0) + 1;
+      current.attempt_id = (current.attempt_id || 1) + 1;
+      transitionCaptureState(callSid, CAPTURE_EVENTS.PROMPT_RETRY, { reason: 'timeout' });
+      if (resolveRetryStage(current, current.retries) === 'final') {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.FINAL_ATTEMPT_WARN, { reason: 'timeout_final_attempt' });
+      }
+      digitCollectionManager.expectations.set(callSid, current);
+
+      const qualityRetryBonus = channelConditions?.severe ? 1 : 0;
+      const maxRetries = current.max_retries + qualityRetryBonus;
+      if (current.retries > maxRetries) {
+        if (isGroupedPlan) {
+          updatePlanState(callSid, plan, PLAN_STATES.FAIL, {
+            step_index: current.plan_step_index,
+            reason: 'timeout'
+          });
+        }
+        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'max_retries_timeout' });
+        digitCollectionManager.expectations.delete(callSid);
+        clearDigitTimeout(callSid);
+        clearDigitFallbackState(callSid);
+        clearDigitPlan(callSid);
+        await completeCaptureSession(callSid, 'aborted', {
+          reason: 'timeout',
+          channel: current.channel || 'dtmf'
+        });
+        const finalTimeoutMessage = current.timeout_failure_message || callEndMessages.no_response;
+        await speakAndEndCall(callSid, finalTimeoutMessage, 'digit_collection_timeout');
+        return;
+      }
+
+      const affect = recordCallerAffect(callSid, 'timeout');
+        const policy = buildRetryPolicy({
+          reason: 'timeout',
+          attempt: current.retries || 1,
+          source: 'dtmf',
+          expectation: current,
+          affect,
+          session: getSessionState(callSid),
+          health: getSystemHealth(callSid),
+          qualityScore: channelConditions?.qualityScore ?? null,
+          conditions: channelConditions
+        });
+      const prompt = buildTimeoutPrompt(current, current.retries) || policy.prompt;
+
+      const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
+      const reply = {
+        partialResponseIndex: null,
+        partialResponse: prompt,
+        personalityInfo,
+        adaptationHistory: gptService?.personalityChanges?.slice(-3) || []
+      };
+
+        if (gptService) {
+          gptService.emit('gptreply', reply, interactionCount);
+          try {
+            gptService.updateUserContext('digit_timeout', 'system', `Digit timeout retry ${current.retries}/${current.max_retries}`);
+          } catch (_) {}
+          markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+            prompt_text: prompt,
+            reset_buffer: current.reset_on_interrupt === true
+          });
+        }
+
+      webhookService.addLiveEvent(callSid, `⏳ Awaiting digits retry ${current.retries}/${current.max_retries}`, { force: true });
+
+      scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+    }, waitMs);
+
+    digitTimeouts.set(callSid, timer);
+  }
+
+  function buildTwilioGatherTwiml(callSid, expectation, options = {}, hostname) {
+    if (!VoiceResponse) {
+      throw new Error('VoiceResponse not configured for Twilio gather');
+    }
+    const response = new VoiceResponse();
+    const min = expectation?.min_digits || 1;
+    const max = expectation?.max_digits || min;
+    const host = hostname || config?.server?.hostname;
+    const queryParams = new URLSearchParams({ callSid: String(callSid) });
+    if (expectation?.plan_id) {
+      queryParams.set('planId', String(expectation.plan_id));
+    }
+    if (Number.isFinite(expectation?.plan_step_index)) {
+      queryParams.set('stepIndex', String(expectation.plan_step_index));
+    }
+    if (expectation?.channel_session_id) {
+      queryParams.set('channelSessionId', String(expectation.channel_session_id));
+    }
+    if (Number.isFinite(Number(expectation?.attempt_id))) {
+      queryParams.set('attemptId', String(expectation.attempt_id));
+    }
+    if (expectation?.gather_nonce) {
+      queryParams.set('nonce', String(expectation.gather_nonce));
+    }
+    if (Number.isFinite(Number(expectation?.gather_prompt_seq))) {
+      queryParams.set('promptSeq', String(expectation.gather_prompt_seq));
+    }
+    const actionUrl = `https://${host}/webhook/twilio-gather?${queryParams.toString()}`;
+    const gatherOptions = {
+      input: 'dtmf',
+      numDigits: max,
+      timeout: Math.max(3, expectation?.timeout_s || 10),
+      action: actionUrl,
+      method: 'POST',
+      actionOnEmptyResult: true,
+      bargeIn: true
+    };
+    if (expectation?.allow_terminator) {
+      gatherOptions.finishOnKey = expectation?.terminator_char || '#';
+    }
+    const playWithNode = (node, url) => {
+      if (!url) return;
+      node.play(url);
+    };
+    const preambleUrl = options.preambleUrl || options.preamble_url;
+    const promptUrl = options.promptUrl || options.prompt_url;
+    const followupUrl = options.followupUrl || options.followup_url;
+
+    if (preambleUrl) {
+      playWithNode(response, preambleUrl);
+    }
+
+    const gather = response.gather(gatherOptions);
+    if (promptUrl) {
+      playWithNode(gather, promptUrl);
+    }
+    if (followupUrl) {
+      playWithNode(response, followupUrl);
+    }
+    return response.toString();
+  }
+
+  async function sendTwilioGather(callSid, expectation, options = {}, hostname) {
+    const provider = typeof getCurrentProvider === 'function' ? getCurrentProvider() : config?.platform?.provider;
+    if (provider && provider !== 'twilio') return false;
+    if (!config?.server?.hostname) return false;
+    if (!twilioClient || !config?.twilio?.accountSid || !config?.twilio?.authToken) return false;
+    try {
+      const callConfig = callConfigurations.get(callSid) || {};
+      const resolvedOptions = { ...options };
+      const promptText = [resolvedOptions?.preamble, resolvedOptions?.prompt].filter(Boolean).join(' ');
+      markDigitPrompted(callSid, null, 0, 'gather', { prompt_text: promptText });
+      const currentExpectation = digitCollectionManager.expectations.get(callSid) || expectation;
+      if (typeof getTwilioTtsAudioUrl === 'function') {
+        try {
+          if (!resolvedOptions.promptUrl && resolvedOptions.prompt) {
+            resolvedOptions.promptUrl = await getTwilioTtsAudioUrl(
+              resolvedOptions.prompt,
+              callConfig,
+              { forceGenerate: true }
+            );
+          }
+          if (!resolvedOptions.preambleUrl && resolvedOptions.preamble) {
+            resolvedOptions.preambleUrl = await getTwilioTtsAudioUrl(
+              resolvedOptions.preamble,
+              callConfig,
+              { forceGenerate: true }
+            );
+          }
+          if (!resolvedOptions.followupUrl && resolvedOptions.followup) {
+            resolvedOptions.followupUrl = await getTwilioTtsAudioUrl(
+              resolvedOptions.followup,
+              callConfig,
+              { forceGenerate: true }
+            );
+          }
+        } catch (ttsErr) {
+          logDigitMetric('twilio_gather_tts_fallback', { callSid, error: ttsErr?.message || 'tts_unavailable' });
+        }
+      }
+      const requiresPreambleAudio = Boolean(resolvedOptions.preamble && !resolvedOptions.preambleUrl);
+      const requiresPromptAudio = Boolean(resolvedOptions.prompt && !resolvedOptions.promptUrl);
+      const requiresFollowupAudio = Boolean(resolvedOptions.followup && !resolvedOptions.followupUrl);
+      if (requiresPreambleAudio || requiresPromptAudio || requiresFollowupAudio) {
+        logDigitMetric('twilio_gather_missing_tts_audio', {
+          callSid,
+          missing: {
+            preamble: requiresPreambleAudio,
+            prompt: requiresPromptAudio,
+            followup: requiresFollowupAudio
+          }
+        });
+        return false;
+      }
+      const client = twilioClient(config.twilio.accountSid, config.twilio.authToken);
+      const twiml = buildTwilioGatherTwiml(callSid, currentExpectation, resolvedOptions, hostname);
+      await client.calls(callSid).update({ twiml });
+      return true;
+    } catch (err) {
+      logDigitMetric('twilio_gather_failed', { callSid, error: err.message });
+      return false;
+    }
+  }
+
+  async function triggerTwilioGatherFallback(callSid, expectation, options = {}) {
+    const provider = typeof getCurrentProvider === 'function' ? getCurrentProvider() : config?.platform?.provider;
+    if (provider && provider !== 'twilio') return false;
+    if (!config?.twilio?.gatherFallback) return false;
+    if (!config?.server?.hostname) return false;
+
+    const state = digitFallbackStates.get(callSid);
+    if (state?.active) return false;
+
+    const accountSid = config.twilio.accountSid;
+    const authToken = config.twilio.authToken;
+    if (!accountSid || !authToken || !twilioClient) {
+      return false;
+    }
+
+    const callConfig = callConfigurations.get(callSid) || {};
+    const fallbackPrompt = (typeof options.prompt === 'string' && options.prompt.trim())
+      ? options.prompt.trim()
+      : (buildTimeoutPrompt(expectation, (Number(expectation?.retries) || 0) + 1) || buildDigitPrompt(expectation));
+    let promptUrl = options.promptUrl || null;
+    if (!promptUrl && typeof getTwilioTtsAudioUrl === 'function') {
+      try {
+        promptUrl = await getTwilioTtsAudioUrl(fallbackPrompt, callConfig, {
+          forceGenerate: true
+        });
+      } catch (ttsErr) {
+        logDigitMetric('twilio_gather_fallback_tts_error', { callSid, error: ttsErr?.message || 'tts_unavailable' });
+      }
+    }
+    if (!promptUrl) {
+      logDigitMetric('twilio_gather_fallback_missing_tts_audio', {
+        callSid,
+        reason: 'prompt_url_unavailable'
+      });
+      return false;
+    }
+    const client = twilioClient(accountSid, authToken);
+    markDigitPrompted(callSid, null, 0, 'gather', {
+      prompt_text: fallbackPrompt,
+      reset_buffer: true
+    });
+    const currentExpectation = digitCollectionManager.expectations.get(callSid) || expectation;
+    const twiml = buildTwilioGatherTwiml(callSid, currentExpectation, {
+      ...options,
+      prompt: fallbackPrompt,
+      promptUrl
+    });
+    await client.calls(callSid).update({ twiml });
+
+    digitFallbackStates.set(callSid, {
+      active: true,
+      attempts: (state?.attempts || 0) + 1,
+      lastAt: new Date().toISOString()
+    });
+    updateCaptureSessionChannel(callSid, 'dtmf', { reason: 'gather_fallback' });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'gather_fallback' });
+
+    webhookService.addLiveEvent(callSid, '📟 Capturing Mode', { force: true });
+    return true;
+  }
+
+  function getPaymentFeatureRuntimeConfig() {
+    if (typeof getPaymentFeatureConfig !== 'function') return null;
+    try {
+      const cfg = getPaymentFeatureConfig();
+      return cfg && typeof cfg === 'object' ? cfg : null;
+    } catch (error) {
+      logDigitMetric('payment_feature_config_error', {
+        error: String(error?.message || error || 'unknown_error')
+      });
+      return null;
+    }
+  }
+
+  function isPaymentFeatureEnabledForCall(callConfig = {}) {
+    const cfg = getPaymentFeatureRuntimeConfig();
+    if (!cfg) return { enabled: true, reason: null, config: null };
+    const provider = resolvePaymentProvider(callConfig);
+    const adapter = getPaymentProviderAdapter(provider);
+    const executionMode = resolvePaymentExecutionMode({
+      provider,
+      featureConfig: cfg,
+      hasNativeAdapter: Boolean(adapter),
+      smsFallbackEnabled:
+        config?.payment?.smsFallback?.enabled === true &&
+        cfg?.allow_sms_fallback !== false,
+      smsServiceReady: Boolean(smsService && typeof smsService.sendSMS === 'function'),
+    });
+    if (!executionMode.enabled) {
+      return {
+        enabled: false,
+        reason: executionMode.reason || 'unsupported_provider',
+        config: cfg,
+        mode: executionMode.mode,
+      };
+    }
+    if (cfg.require_script_opt_in === true) {
+      const hasScript = Boolean(
+        callConfig?.script_id
+        || callConfig?.script
+        || callConfig?.script_policy?.script_id
+      );
+      if (!hasScript) {
+        return { enabled: false, reason: 'script_required', config: cfg };
+      }
+    }
+    return {
+      enabled: true,
+      reason: null,
+      config: cfg,
+      mode: executionMode.mode,
+    };
+  }
+
+  function resolvePaymentProvider(callConfig = {}) {
+    return String(
+      callConfig.provider
+      || (typeof getCurrentProvider === 'function' ? getCurrentProvider() : config?.platform?.provider)
+      || ''
+    ).trim().toLowerCase();
+  }
+
+  function getPaymentProviderAdapter(provider = '') {
+    const normalized = String(provider || '').trim().toLowerCase();
+    return PAYMENT_PROVIDER_ADAPTERS[normalized] || null;
+  }
+
+  function getPaymentAdapterForCall(callConfig = {}) {
+    return getPaymentProviderAdapter(resolvePaymentProvider(callConfig));
+  }
+
+  function parsePaymentPolicy(callConfig = {}) {
+    const raw = callConfig?.payment_policy;
+    if (!raw) return {};
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      return { ...raw };
+    }
+    try {
+      const parsed = JSON.parse(String(raw));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      return parsed;
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function isPaymentAllowedAtHour(policy = {}, now = new Date()) {
+    const startHour = Number(policy.allowed_start_hour_utc);
+    const endHour = Number(policy.allowed_end_hour_utc);
+    if (
+      !Number.isFinite(startHour)
+      || !Number.isFinite(endHour)
+      || startHour < 0
+      || startHour > 23
+      || endHour < 0
+      || endHour > 23
+    ) {
+      return true;
+    }
+    if (startHour === endHour) return true;
+    const hour = now.getUTCHours();
+    if (startHour < endHour) {
+      return hour >= startHour && hour < endHour;
+    }
+    return hour >= startHour || hour < endHour;
+  }
+
+  function getPaymentRiskControls(callConfig = {}) {
+    const cfg = getPaymentFeatureRuntimeConfig();
+    const policy = parsePaymentPolicy(callConfig);
+    const maxAttempts = Number(cfg?.max_attempts_per_call);
+    const retryCooldownMs = Number(cfg?.retry_cooldown_ms);
+    const policyMaxAttempts = Number(policy?.max_attempts_per_call);
+    const policyRetryCooldownMs = Number(policy?.retry_cooldown_ms);
+    const policyMinInteractions = Number(policy?.min_interactions_before_payment);
+    return {
+      maxAttemptsPerCall:
+        Number.isFinite(policyMaxAttempts) && policyMaxAttempts > 0
+          ? Math.max(1, Math.floor(policyMaxAttempts))
+          : Number.isFinite(maxAttempts) && maxAttempts > 0
+            ? Math.max(1, Math.floor(maxAttempts))
+            : 3,
+      retryCooldownMs:
+        Number.isFinite(policyRetryCooldownMs) && policyRetryCooldownMs >= 0
+          ? Math.max(0, Math.floor(policyRetryCooldownMs))
+          : Number.isFinite(retryCooldownMs) && retryCooldownMs >= 0
+            ? Math.max(0, Math.floor(retryCooldownMs))
+            : 20000,
+      minInteractionsBeforePayment:
+        Number.isFinite(policyMinInteractions) && policyMinInteractions >= 0
+          ? Math.max(0, Math.floor(policyMinInteractions))
+          : 0,
+      allowedAtCurrentHour: isPaymentAllowedAtHour(policy),
+      policy
+    };
+  }
+
+  function getPaymentWebhookTtlMs() {
+    const cfg = getPaymentFeatureRuntimeConfig();
+    const parsed = Number(cfg?.webhook_idempotency_ttl_ms);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.max(1000, Math.round(parsed));
+    }
+    return 5 * 60 * 1000;
+  }
+
+  function stableSerializeForHash(value) {
+    if (value === null || value === undefined) return 'null';
+    if (typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => stableSerializeForHash(entry)).join(',')}]`;
+    }
+    const keys = Object.keys(value).sort();
+    const entries = keys.map((key) => `${JSON.stringify(key)}:${stableSerializeForHash(value[key])}`);
+    return `{${entries.join(',')}}`;
+  }
+
+  function hashWebhookPayload(payload = {}) {
+    try {
+      return crypto.createHash('sha1').update(stableSerializeForHash(payload)).digest('hex');
+    } catch (_) {
+      return crypto.createHash('sha1').update(String(Date.now())).digest('hex');
+    }
+  }
+
+  function normalizePaymentState(state, fallback = PAYMENT_STATES.READY) {
+    const key = String(state || '').trim().toLowerCase().replace(/\s+/g, '_');
+    return PAYMENT_STATE_ALIASES[key] || fallback;
+  }
+
+  function normalizePaymentResult(value = '') {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return 'unknown';
+    if (
+      normalized === 'success'
+      || normalized === 'successful'
+      || normalized === 'approved'
+    ) {
+      return 'success';
+    }
+    if (
+      normalized === 'failed'
+      || normalized === 'failure'
+      || normalized === 'declined'
+      || normalized === 'error'
+    ) {
+      return 'failed';
+    }
+    return normalized;
+  }
+
+  function getCurrentPaymentState(callConfig = {}) {
+    if (callConfig?.payment_state) {
+      return normalizePaymentState(callConfig.payment_state, PAYMENT_STATES.READY);
+    }
+    const hasExplicitEnabledFlag = Object.prototype.hasOwnProperty.call(callConfig || {}, 'payment_enabled');
+    if (hasExplicitEnabledFlag && callConfig?.payment_enabled !== true) {
+      return PAYMENT_STATES.DISABLED;
+    }
+    if (callConfig?.payment_in_progress === true) return PAYMENT_STATES.ACTIVE;
+    const lastResult = normalizePaymentResult(callConfig?.payment_last_result?.result || '');
+    if (lastResult === 'success') return PAYMENT_STATES.COMPLETED;
+    if (lastResult === 'failed') return PAYMENT_STATES.FAILED;
+    return PAYMENT_STATES.READY;
+  }
+
+  function buildPaymentStatePayload(callConfig = {}, extra = {}) {
+    return {
+      ...extra,
+      payment_state: callConfig?.payment_state || getCurrentPaymentState(callConfig),
+      payment_state_updated_at: callConfig?.payment_state_updated_at || new Date().toISOString(),
+      payment_attempt_count: Number.isFinite(Number(callConfig?.payment_attempt_count))
+        ? Math.max(0, Math.floor(Number(callConfig.payment_attempt_count)))
+        : 0,
+      payment_attempt_last_at: callConfig?.payment_attempt_last_at || null
+    };
+  }
+
+  function transitionPaymentState(callSid, nextState, meta = {}) {
+    if (!callSid) {
+      return { ok: false, reason: 'missing_call_sid' };
+    }
+    const callConfig = callConfigurations.get(callSid) || {};
+    const previousState = getCurrentPaymentState(callConfig);
+    const targetState = normalizePaymentState(nextState, previousState);
+    if (!targetState) {
+      return { ok: false, reason: 'invalid_state', previous_state: previousState };
+    }
+    const allowedTargets = PAYMENT_TRANSITIONS[previousState] || new Set();
+    if (previousState !== targetState && !allowedTargets.has(targetState)) {
+      logDigitMetric('payment_state_ignored', {
+        callSid,
+        state: previousState,
+        attempted: targetState,
+        reason: meta.reason || 'invalid_transition'
+      });
+      void emitAuditEvent(callSid, 'PaymentStateInvalidTransition', {
+        source: 'system',
+        reason: meta.reason || 'invalid_transition',
+        state_from: previousState,
+        state_to: targetState
+      });
+      return {
+        ok: false,
+        reason: 'invalid_transition',
+        previous_state: previousState,
+        target_state: targetState,
+        callConfig
+      };
+    }
+
+    const updatedAt = String(meta.updated_at || new Date().toISOString());
+    callConfig.payment_state = targetState;
+    callConfig.payment_state_updated_at = updatedAt;
+    if (meta.payment_in_progress !== undefined) {
+      callConfig.payment_in_progress = meta.payment_in_progress === true;
+    }
+    if (meta.payment_session !== undefined) {
+      callConfig.payment_session = meta.payment_session;
+    }
+    if (meta.payment_last_result !== undefined) {
+      callConfig.payment_last_result = meta.payment_last_result;
+    }
+    callConfigurations.set(callSid, callConfig);
+
+    if (previousState !== targetState) {
+      logDigitMetric('payment_state_transition', {
+        callSid,
+        from: previousState,
+        to: targetState,
+        reason: meta.reason || null
+      });
+      void emitAuditEvent(callSid, 'PaymentStateTransition', {
+        source: 'system',
+        reason: meta.reason || null,
+        state_from: previousState,
+        state_to: targetState
+      });
+    }
+    return {
+      ok: true,
+      previous_state: previousState,
+      state: targetState,
+      callConfig
+    };
+  }
+
+  async function reservePaymentWebhookIdempotency(callSid, payload = {}, options = {}) {
+    const source = String(options.source || 'twilio_pay_webhook').trim() || 'twilio_pay_webhook';
+    const paymentId = String(
+      options.paymentId || payload?.paymentId || payload?.PaymentSid || payload?.payment_id || ''
+    ).trim() || 'na';
+    const eventType = String(options.eventType || payload?.PaymentEvent || payload?.event || 'event').trim().toLowerCase() || 'event';
+    const payloadHash = hashWebhookPayload(payload);
+    const eventKey = `${source}:${callSid || 'unknown'}:${paymentId}:${eventType}:${payloadHash}`;
+    const ttlMs = getPaymentWebhookTtlMs();
+
+    if (markIdempotentAction(`payment_webhook:${eventKey}`, ttlMs)) {
+      return {
+        reserved: false,
+        duplicate: true,
+        source: 'memory',
+        event_key: eventKey,
+        payload_hash: payloadHash
+      };
+    }
+
+    if (db?.reserveProviderEventIdempotency) {
+      try {
+        const persisted = await db.reserveProviderEventIdempotency({
+          source,
+          payload_hash: payloadHash,
+          event_key: eventKey,
+          ttl_ms: ttlMs
+        });
+        if (persisted?.reserved !== true) {
+          return {
+            reserved: false,
+            duplicate: true,
+            source: 'db',
+            event_key: eventKey,
+            payload_hash: payloadHash
+          };
+        }
+      } catch (error) {
+        logDigitMetric('payment_webhook_idempotency_db_error', {
+          callSid,
+          source,
+          error: String(error?.message || error || 'unknown_error')
+        });
+      }
+    }
+
+    return {
+      reserved: true,
+      duplicate: false,
+      source: 'fresh',
+      event_key: eventKey,
+      payload_hash: payloadHash
+    };
+  }
+
+  function derivePaymentStateFromStatus(eventType = '', result = '') {
+    const event = String(eventType || '').trim().toLowerCase();
+    const normalizedResult = normalizePaymentResult(result);
+    if (normalizedResult === 'success') return PAYMENT_STATES.COMPLETED;
+    if (normalizedResult === 'failed') return PAYMENT_STATES.FAILED;
+    if (/(complete|captured|approved|authorize|success)/.test(event)) {
+      return PAYMENT_STATES.COMPLETED;
+    }
+    if (/(fail|declin|error|cancel)/.test(event)) {
+      return PAYMENT_STATES.FAILED;
+    }
+    if (/(start|initiat|process|collect|token)/.test(event)) {
+      return PAYMENT_STATES.ACTIVE;
+    }
+    return null;
+  }
+
+  function resolvePaymentVoiceMessages(callConfig = {}, args = {}) {
+    const normalize = (value, fallback = null) => {
+      const text = String(value || '').trim();
+      if (!text) return fallback;
+      return text.slice(0, 240);
+    };
+    return {
+      start_message: normalize(
+        args.start_message ?? args.startMessage ?? callConfig.payment_start_message,
+        null
+      ),
+      success_message: normalize(
+        args.success_message ?? args.successMessage ?? callConfig.payment_success_message,
+        'Payment processed successfully.'
+      ),
+      failure_message: normalize(
+        args.failure_message ?? args.failureMessage ?? callConfig.payment_failure_message,
+        'We were unable to process that payment. Let\'s continue.'
+      ),
+      retry_message: normalize(
+        args.retry_message ?? args.retryMessage ?? callConfig.payment_retry_message,
+        null
+      )
+    };
+  }
+
+  async function resolveHostedPaymentTtsUrl(text, callConfig = {}, options = {}) {
+    const normalizedText = String(text || '').trim().slice(0, 240);
+    if (!normalizedText) return null;
+    if (typeof getTwilioTtsAudioUrl !== 'function') return null;
+    const timeoutMs = Number(options.timeoutMs);
+    const safeTimeoutMs =
+      Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? timeoutMs
+        : Math.max(1200, Number(config?.twilio?.ttsMaxWaitMs) || 1200);
+    const retryTimeoutMs = Number(options.retryTimeoutMs);
+    const safeRetryTimeoutMs =
+      Number.isFinite(retryTimeoutMs) && retryTimeoutMs > 0
+        ? retryTimeoutMs
+        : Math.max(2500, safeTimeoutMs + 1000);
+    const baseTtsOptions =
+      options?.ttsOptions && typeof options.ttsOptions === 'object'
+        ? { ...options.ttsOptions }
+        : {};
+    if (options.forceGenerate === true) {
+      baseTtsOptions.forceGenerate = true;
+    }
+    const resolveWithTimeout = async (requestTimeoutMs, ttsOptions) => {
+      if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
+        return getTwilioTtsAudioUrl(normalizedText, callConfig, ttsOptions);
+      }
+      try {
+        return await Promise.race([
+          getTwilioTtsAudioUrl(normalizedText, callConfig, ttsOptions),
+          new Promise((resolve) => {
+            setTimeout(() => resolve(null), requestTimeoutMs);
+          })
+        ]);
+      } catch (error) {
+        logDigitMetric('payment_tts_error', {
+          callSid: options.callSid || null,
+          error: String(error?.message || error || 'unknown_error')
+        });
+        return null;
+      }
+    };
+
+    let url = await resolveWithTimeout(safeTimeoutMs, baseTtsOptions);
+    if (!url && options.retryOnMiss === true) {
+      url = await resolveWithTimeout(safeRetryTimeoutMs, {
+        ...baseTtsOptions,
+        forceGenerate: true
+      });
+    }
+    return typeof url === 'string' && url.trim() ? url : null;
+  }
+
+  async function appendHostedPaymentSpeech(node, text, callConfig = {}, options = {}) {
+    if (!node) return false;
+    const url = options.url || await resolveHostedPaymentTtsUrl(text, callConfig, options);
+    if (url) {
+      node.play(url);
+      return true;
+    }
+    const fallbackPauseSeconds = Math.max(
+      0,
+      Math.min(10, Math.round(Number(options.fallbackPauseSeconds) || 0))
+    );
+    if (fallbackPauseSeconds > 0 && typeof node.pause === 'function') {
+      node.pause({ length: fallbackPauseSeconds });
+    }
+    return false;
+  }
+
+  async function buildPaymentRedirectFallbackTwiml(message, host = '', callConfig = {}, options = {}) {
+    if (!VoiceResponse) return null;
+    const response = new VoiceResponse();
+    const timeoutMs = Math.max(1500, Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000);
+    const played = await appendHostedPaymentSpeech(response, message, callConfig, {
+      callSid: options.callSid || null,
+      forceGenerate: true,
+      retryOnMiss: true,
+      timeoutMs,
+      retryTimeoutMs: Math.max(2500, timeoutMs + 1500),
+      fallbackPauseSeconds: 1
+    });
+    if (!played) {
+      logDigitMetric('payment_tts_unavailable', {
+        callSid: options.callSid || null,
+        flow: options.flow || 'payment_fallback'
+      });
+    }
+    if (host) {
+      response.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+    } else {
+      response.hangup();
+    }
+    return response.toString();
+  }
+
+  async function buildPaymentCompletionTwiml(success, session = null, host = '', callConfig = {}, options = {}) {
+    if (!VoiceResponse) return null;
+    const response = new VoiceResponse();
+    const successMessage = String(session?.success_message || 'Payment processed successfully.').trim().slice(0, 240);
+    const failureMessage = String(session?.failure_message || 'We were unable to process that payment. Let\'s continue.').trim().slice(0, 240);
+    const timeoutMs = Math.max(1500, Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000);
+    await appendHostedPaymentSpeech(response, success ? successMessage : failureMessage, callConfig, {
+      callSid: options.callSid || null,
+      forceGenerate: true,
+      retryOnMiss: true,
+      timeoutMs,
+      retryTimeoutMs: Math.max(2500, timeoutMs + 1500),
+      fallbackPauseSeconds: 1
+    });
+    if (!success) {
+      const retryMessage = String(session?.retry_message || '').trim().slice(0, 240);
+      if (retryMessage) {
+        await appendHostedPaymentSpeech(response, retryMessage, callConfig, {
+          callSid: options.callSid || null,
+          forceGenerate: true,
+          retryOnMiss: true,
+          timeoutMs: Math.max(1200, Number(config?.twilio?.ttsMaxWaitMs) || 1200),
+          retryTimeoutMs: Math.max(2500, timeoutMs + 1000)
+        });
+      }
+    }
+    if (host) {
+      response.redirect({ method: 'POST' }, `https://${host}/incoming?resume=1`);
+    } else {
+      response.hangup();
+    }
+    return response.toString();
+  }
+
+  function shouldAttemptPaymentSmsFallback(callConfig = {}, reason = 'failed') {
+    if (!smsService || typeof smsService.sendSMS !== 'function') return false;
+    const fallbackConfig = config?.payment?.smsFallback || {};
+    if (fallbackConfig.enabled !== true) return false;
+    const policy = parsePaymentPolicy(callConfig);
+    const normalizedReason = String(reason || '').trim().toLowerCase();
+    if (
+      normalizedReason === 'failed'
+      && policy.sms_fallback_on_failure !== undefined
+      && policy.sms_fallback_on_failure !== true
+    ) {
+      return false;
+    }
+    if (
+      normalizedReason === 'timeout'
+      && policy.sms_fallback_on_timeout !== undefined
+      && policy.sms_fallback_on_timeout !== true
+    ) {
+      return false;
+    }
+    const maxPerCall = Number(fallbackConfig.maxPerCall);
+    const allowedMaxPerCall =
+      Number.isFinite(maxPerCall) && maxPerCall > 0
+        ? Math.max(1, Math.floor(maxPerCall))
+        : 1;
+    const sentCount = Number(callConfig?.payment_sms_fallback_sent_count || 0);
+    return !(Number.isFinite(sentCount) && sentCount >= allowedMaxPerCall);
+  }
+
+  async function sendPaymentSmsFallback(callSid, session = {}, callConfig = {}, reason = 'failed') {
+    if (!callSid) return { sent: false, reason: 'missing_call_sid' };
+    if (!shouldAttemptPaymentSmsFallback(callConfig, reason)) {
+      return { sent: false, reason: 'disabled_or_limited' };
+    }
+    if (typeof buildPaymentSmsFallbackLink !== 'function') {
+      return { sent: false, reason: 'link_builder_unavailable' };
+    }
+
+    let phoneNumber = String(callConfig?.customer_phone || callConfig?.phone_number || '').trim();
+    if (!phoneNumber && db?.getCall) {
+      const callRecord = await db.getCall(callSid).catch(() => null);
+      phoneNumber = String(callRecord?.phone_number || '').trim();
+    }
+    if (!phoneNumber) {
+      return { sent: false, reason: 'missing_phone_number' };
+    }
+
+    const linkPayload = buildPaymentSmsFallbackLink(callSid, session, callConfig, { reason });
+    if (!linkPayload?.url) {
+      return { sent: false, reason: 'fallback_url_not_available' };
+    }
+    const policy = parsePaymentPolicy(callConfig);
+    const policyMessage = String(policy?.sms_fallback_message || '').trim();
+    const defaultMessage = `Complete your payment securely here: ${linkPayload.url}`;
+    const renderedMessage = typeof buildPaymentSmsFallbackMessage === 'function'
+      ? buildPaymentSmsFallbackMessage({
+        payment_url: linkPayload.url,
+        amount: session?.amount || '',
+        currency: session?.currency || '',
+        payment_id: session?.payment_id || ''
+      })
+      : defaultMessage;
+    const message = (policyMessage || renderedMessage || defaultMessage).trim().slice(0, 240);
+    if (!message) {
+      return { sent: false, reason: 'empty_message' };
+    }
+
+    await smsService.sendSMS(phoneNumber, message, null, {
+      idempotencyKey: `${callSid}:payment:sms_fallback:${session?.payment_id || 'na'}:${reason}`,
+      userChatId: callConfig?.user_chat_id || null
+    });
+
+    const nextSentCount = Number(callConfig?.payment_sms_fallback_sent_count || 0) + 1;
+    callConfig.payment_sms_fallback_sent_count = nextSentCount;
+    callConfig.payment_sms_fallback_sent_at = new Date().toISOString();
+    callConfigurations.set(callSid, callConfig);
+
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_sms_fallback_sent', {
+        payment_id: session?.payment_id || null,
+        reason,
+        to: phoneNumber,
+        message: message,
+        payment_url: linkPayload.url,
+        expires_at: linkPayload.expires_at || null,
+        count: nextSentCount,
+        at: new Date().toISOString()
+      }).catch(() => {});
+    }
+
+    webhookService.addLiveEvent(
+      callSid,
+      '📩 Sent secure payment link via SMS',
+      { force: true }
+    );
+    return { sent: true, reason: null, to: phoneNumber, url: linkPayload.url };
+  }
+
+  async function resolvePaymentSession(callSid, paymentId = '') {
+    const callConfig = callConfigurations.get(callSid) || {};
+    let session = callConfig?.payment_session && typeof callConfig.payment_session === 'object'
+      ? { ...callConfig.payment_session }
+      : null;
+
+    if (
+      session
+      && paymentId
+      && session.payment_id
+      && String(session.payment_id) !== String(paymentId)
+    ) {
+      session = null;
+    }
+
+    if (!session && db?.getLatestCallState) {
+      const fallback = await db.getLatestCallState(callSid, 'payment_session_requested').catch(() => null);
+      if (fallback && typeof fallback === 'object') {
+        session = {
+          payment_id: fallback.payment_id || paymentId || null,
+          amount: fallback.amount || null,
+          currency: fallback.currency || 'USD',
+          provider: fallback.payment_provider || resolvePaymentProvider(callConfig),
+          execution_mode: fallback.execution_mode || null,
+          payment_connector: fallback.payment_connector || null,
+          description: fallback.description || null,
+          start_message: fallback.start_message || null,
+          success_message: fallback.success_message || 'Payment processed successfully.',
+          failure_message: fallback.failure_message || 'We were unable to process that payment. Let\'s continue.',
+          retry_message: fallback.retry_message || null,
+          requested_at: fallback.requested_at || null
+        };
+      }
+    }
+
+    return { callConfig, session };
+  }
+
+  async function requestPhonePayment(callSid, args = {}) {
+    const callConfig = callConfigurations.get(callSid) || {};
+    const flowState = String(callConfig.flow_state || '').trim().toLowerCase();
+    if (
+      callConfig.digit_capture_active === true
+      || flowState === 'capture_active'
+      || flowState === 'capture_pending'
+    ) {
+      return {
+        error: 'capture_active',
+        message: 'Cannot start payment while digit capture is active.'
+      };
+    }
+    if (callConfig.payment_in_progress === true || flowState === 'payment_active') {
+      return {
+        error: 'payment_in_progress',
+        message: 'A payment session is already in progress.'
+      };
+    }
+    const paymentFeature = isPaymentFeatureEnabledForCall(callConfig);
+    if (!paymentFeature.enabled) {
+      const reasonCode = String(paymentFeature.reason || '').trim().toLowerCase();
+      const reasonMessages = {
+        feature_disabled: 'Phone payment is currently disabled by system policy.',
+        kill_switch: 'Phone payment is temporarily unavailable right now.',
+        twilio_disabled: 'Twilio phone payments are currently disabled by system policy.',
+        native_adapter_unavailable: 'Native phone payment adapter is unavailable for this provider.',
+        sms_fallback_disabled: 'Secure SMS fallback is disabled for non-native payment providers.',
+        sms_service_unavailable: 'Secure SMS fallback is unavailable because SMS service is not ready.',
+        script_required: 'Phone payment requires a script-enabled call.'
+      };
+      return {
+        error: 'payment_feature_disabled',
+        reason: paymentFeature.reason || null,
+        message: reasonMessages[reasonCode] || 'Phone payment is currently unavailable.'
+      };
+    }
+    const provider = resolvePaymentProvider(callConfig);
+    const paymentAdapter = getPaymentAdapterForCall(callConfig);
+    const paymentMode = resolvePaymentExecutionMode({
+      provider,
+      featureConfig: paymentFeature?.config || {},
+      hasNativeAdapter: Boolean(paymentAdapter),
+      smsFallbackEnabled:
+        config?.payment?.smsFallback?.enabled === true &&
+        paymentFeature?.config?.allow_sms_fallback !== false,
+      smsServiceReady: Boolean(smsService && typeof smsService.sendSMS === 'function')
+    });
+    if (!paymentMode.enabled) {
+      return {
+        error: 'payment_mode_unavailable',
+        reason: paymentMode.reason || null,
+        message: 'Phone payment is unavailable for the active provider in current runtime mode.'
+      };
+    }
+    if (callConfig.payment_enabled !== true) {
+      return {
+        error: 'payment_not_enabled',
+        message: 'Payment is not enabled for this call. Set payment_enabled=true when creating the call.'
+      };
+    }
+    const amountNumber = Number(
+      args.amount ?? callConfig.payment_amount ?? callConfig?.payment_session?.amount
+    );
+    if (!Number.isFinite(amountNumber) || amountNumber <= 0) {
+      return {
+        error: 'invalid_amount',
+        message: 'A positive payment amount is required.'
+      };
+    }
+    const minAmount = Number(paymentFeature?.config?.min_amount);
+    const maxAmount = Number(paymentFeature?.config?.max_amount);
+    if (Number.isFinite(minAmount) && minAmount > 0 && amountNumber < minAmount) {
+      return {
+        error: 'invalid_amount',
+        message: `Payment amount must be at least ${minAmount.toFixed(2)}.`
+      };
+    }
+    if (Number.isFinite(maxAmount) && maxAmount > 0 && amountNumber > maxAmount) {
+      return {
+        error: 'invalid_amount',
+        message: `Payment amount must be at most ${maxAmount.toFixed(2)}.`
+      };
+    }
+    const riskControls = getPaymentRiskControls(callConfig);
+    if (riskControls.allowedAtCurrentHour !== true) {
+      return {
+        error: 'payment_time_window_restricted',
+        message: 'Payment is currently restricted by script policy schedule.'
+      };
+    }
+    const interactionCount = Number(
+      args.interaction_count
+      ?? args.interactionCount
+      ?? callConfig.interaction_count
+      ?? 0
+    );
+    const safeInteractionCount =
+      Number.isFinite(interactionCount) && interactionCount >= 0
+        ? Math.floor(interactionCount)
+        : 0;
+    if (
+      Number.isFinite(riskControls.minInteractionsBeforePayment)
+      && riskControls.minInteractionsBeforePayment > 0
+      && safeInteractionCount < riskControls.minInteractionsBeforePayment
+    ) {
+      return {
+        error: 'payment_not_ready',
+        message: `Payment can start after ${riskControls.minInteractionsBeforePayment} interactions.`,
+        required_interactions: riskControls.minInteractionsBeforePayment,
+        current_interactions: safeInteractionCount
+      };
+    }
+    const previousAttempts = Number(callConfig.payment_attempt_count);
+    const safeAttempts = Number.isFinite(previousAttempts) && previousAttempts >= 0
+      ? Math.floor(previousAttempts)
+      : 0;
+    if (
+      Number.isFinite(riskControls.maxAttemptsPerCall)
+      && riskControls.maxAttemptsPerCall > 0
+      && safeAttempts >= riskControls.maxAttemptsPerCall
+    ) {
+      return {
+        error: 'payment_attempt_limit',
+        message: `Payment retry limit reached for this call (${riskControls.maxAttemptsPerCall}).`
+      };
+    }
+    const lastAttemptAtMs = Date.parse(callConfig.payment_attempt_last_at || '');
+    if (
+      Number.isFinite(lastAttemptAtMs)
+      && riskControls.retryCooldownMs > 0
+      && Date.now() - lastAttemptAtMs < riskControls.retryCooldownMs
+    ) {
+      const retryAfterMs = Math.max(0, riskControls.retryCooldownMs - (Date.now() - lastAttemptAtMs));
+      return {
+        error: 'payment_retry_cooldown',
+        message: 'Please wait before retrying payment.',
+        retry_after_ms: retryAfterMs
+      };
+    }
+    const currency = String(
+      args.currency
+      || callConfig.payment_currency
+      || paymentFeature?.config?.default_currency
+      || 'USD'
+    ).trim().toUpperCase();
+    const paymentConnector = String(args.payment_connector || callConfig.payment_connector || '').trim();
+    if (paymentMode.mode === 'native' && !paymentConnector) {
+      return {
+        error: 'missing_payment_connector',
+        message: 'Missing payment connector. Set payment_connector in call payload or tool args.'
+      };
+    }
+
+    const messages = resolvePaymentVoiceMessages(callConfig, args);
+    const paymentId = `pay_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const session = {
+      payment_id: paymentId,
+      amount: amountNumber.toFixed(2),
+      currency: currency || 'USD',
+      provider,
+      execution_mode: paymentMode.mode,
+      payment_connector: paymentConnector,
+      description: String(args.description || callConfig.payment_description || '').trim().slice(0, 240),
+      start_message: messages.start_message || null,
+      success_message: messages.success_message,
+      failure_message: messages.failure_message,
+      retry_message: messages.retry_message || null,
+      requested_at: new Date().toISOString()
+    };
+
+    const requestedTransition = transitionPaymentState(callSid, PAYMENT_STATES.REQUESTED, {
+      reason: 'payment_session_requested',
+      payment_in_progress: paymentMode.mode === 'native',
+      payment_session: session,
+      payment_last_result: null
+    });
+    if (!requestedTransition.ok) {
+      return {
+        error: 'payment_state_invalid',
+        message: 'Payment state is not ready for a new session.'
+      };
+    }
+    const activeConfig = requestedTransition.callConfig || callConfig;
+    activeConfig.payment_attempt_count = safeAttempts + 1;
+    activeConfig.payment_attempt_last_at = new Date().toISOString();
+    callConfigurations.set(callSid, activeConfig);
+    if (typeof setCallFlowState === 'function' && paymentMode.mode === 'native') {
+      setCallFlowState(
+        callSid,
+        {
+          flow_state: 'payment_active',
+          flow_state_reason: 'payment_session_requested',
+          call_mode: 'payment_capture',
+          digit_capture_active: false
+        },
+        { callConfig: activeConfig, source: 'digit.requestPhonePayment' }
+      );
+    }
+
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_session_requested', buildPaymentStatePayload(activeConfig, {
+        payment_id: session.payment_id,
+        amount: session.amount,
+        currency: session.currency,
+        payment_connector: session.payment_connector,
+        description: session.description || null,
+        execution_mode: session.execution_mode || null,
+        start_message: session.start_message || null,
+        success_message: session.success_message || null,
+        failure_message: session.failure_message || null,
+        retry_message: session.retry_message || null,
+        payment_provider: provider,
+        payment_attempt_count: activeConfig.payment_attempt_count,
+        payment_attempt_last_at: activeConfig.payment_attempt_last_at,
+        requested_at: session.requested_at
+      })).catch(() => {});
+    }
+
+    if (paymentMode.mode === 'sms_fallback') {
+      let smsFallbackResult = null;
+      try {
+        smsFallbackResult = await sendPaymentSmsFallback(
+          callSid,
+          session,
+          activeConfig,
+          'manual'
+        );
+      } catch (error) {
+        logDigitMetric('payment_sms_fallback_error', {
+          callSid,
+          reason: 'manual',
+          error: String(error?.message || error || 'unknown_error')
+        });
+      }
+      if (!smsFallbackResult?.sent) {
+        const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+          reason: 'payment_sms_fallback_failed',
+          payment_in_progress: false,
+          payment_session: null
+        });
+        const failedConfig = failedTransition.callConfig || callConfig;
+        if (typeof setCallFlowState === 'function') {
+          setCallFlowState(
+            callSid,
+            {
+              flow_state: 'normal',
+              flow_state_reason: 'payment_sms_fallback_failed',
+              call_mode: 'normal',
+              digit_capture_active: false
+            },
+            { callConfig: failedConfig, source: 'digit.requestPhonePayment.sms_fallback_failed' }
+          );
+        }
+        if (db?.updateCallState) {
+          await db.updateCallState(callSid, 'payment_session_sms_fallback_failed', buildPaymentStatePayload(failedConfig, {
+            payment_id: session.payment_id,
+            execution_mode: session.execution_mode || 'sms_fallback',
+            reason: smsFallbackResult?.reason || 'sms_fallback_failed',
+            at: new Date().toISOString()
+          })).catch(() => {});
+        }
+        return {
+          error: 'payment_sms_fallback_failed',
+          message: 'Unable to send secure payment link right now.'
+        };
+      }
+
+      const activeTransition = transitionPaymentState(callSid, PAYMENT_STATES.ACTIVE, {
+        reason: 'payment_sms_fallback_sent',
+        payment_in_progress: false,
+        payment_session: session
+      });
+      const persistedConfig = activeTransition.callConfig || activeConfig;
+      callConfigurations.set(callSid, persistedConfig);
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            flow_state_reason: 'payment_sms_fallback_sent',
+            call_mode: 'normal',
+            digit_capture_active: false
+          },
+          { callConfig: persistedConfig, source: 'digit.requestPhonePayment.sms_fallback' }
+        );
+      }
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_sms_fallback_sent', buildPaymentStatePayload(persistedConfig, {
+          payment_id: session.payment_id,
+          payment_provider: provider,
+          execution_mode: session.execution_mode || 'sms_fallback',
+          amount: session.amount,
+          currency: session.currency,
+          payment_url: smsFallbackResult.url || null,
+          sent_to: smsFallbackResult.to || null,
+          at: new Date().toISOString()
+        })).catch(() => {});
+      }
+      webhookService.addLiveEvent(
+        callSid,
+        `💳 Payment link sent via SMS (${session.currency} ${session.amount})`,
+        { force: true }
+      );
+      return {
+        status: 'sms_fallback_sent',
+        payment_id: session.payment_id,
+        amount: session.amount,
+        currency: session.currency,
+        execution_mode: 'sms_fallback'
+      };
+    }
+
+    const host = config?.server?.hostname;
+    if (!host) {
+      return {
+        error: 'missing_server_hostname',
+        message: 'Server hostname is not configured.'
+      };
+    }
+    const accountSid = config?.twilio?.accountSid;
+    const authToken = config?.twilio?.authToken;
+    if (!accountSid || !authToken || !twilioClient) {
+      return {
+        error: 'twilio_credentials_missing',
+        message: 'Twilio credentials are not configured.'
+      };
+    }
+    const startUrl = paymentAdapter.buildStartUrl(host, callSid, session.payment_id);
+    const client = twilioClient(accountSid, authToken);
+    try {
+      await client.calls(callSid).update({ url: startUrl, method: 'POST' });
+    } catch (error) {
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_start_failed',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      const failedConfig = failedTransition.callConfig || callConfig;
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            flow_state_reason: 'payment_start_failed',
+            call_mode: 'normal',
+            digit_capture_active: false
+          },
+          { callConfig: failedConfig, source: 'digit.requestPhonePayment.error' }
+        );
+      }
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_start_failed', buildPaymentStatePayload(failedConfig, {
+          payment_id: session.payment_id,
+          error: String(error?.message || error || 'payment_start_failed'),
+          at: new Date().toISOString()
+        })).catch(() => {});
+      }
+      return {
+        error: 'payment_start_failed',
+        message: 'Unable to start payment session right now.'
+      };
+    }
+    webhookService.addLiveEvent(
+      callSid,
+      `💳 Payment started (${session.currency} ${session.amount})`,
+      { force: true }
+    );
+    return {
+      status: 'started',
+      payment_id: session.payment_id,
+      amount: session.amount,
+      currency: session.currency,
+      execution_mode: 'native'
+    };
+  }
+
+  async function buildTwilioPaymentTwiml(callSid, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    if (!VoiceResponse) {
+      return { ok: false, code: 'missing_voice_response', message: 'VoiceResponse not configured' };
+    }
+    const host = String(options.hostname || config?.server?.hostname || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    if (!host) {
+      return { ok: false, code: 'missing_server_hostname', message: 'Server hostname not configured' };
+    }
+
+    const { callConfig, session } = await resolvePaymentSession(callSid, options.paymentId || '');
+    const paymentFeature = isPaymentFeatureEnabledForCall(callConfig || {});
+    if (!paymentFeature.enabled) {
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'Phone payment is currently unavailable. Returning to the call flow.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_feature_disabled' }
+      );
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_feature_disabled',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_blocked', buildPaymentStatePayload(
+          failedTransition.callConfig || callConfig,
+          {
+            payment_id: options.paymentId || null,
+            reason: paymentFeature.reason || 'payment_feature_disabled',
+            at: new Date().toISOString()
+          }
+        )).catch(() => {});
+      }
+      return {
+        ok: false,
+        code: 'payment_feature_disabled',
+        message: 'Payment feature disabled',
+        twiml: fallbackTwiml
+      };
+    }
+    if (!session) {
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'A payment session is not available right now. Returning to the call.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_session_missing' }
+      );
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_session_missing',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_missing', buildPaymentStatePayload(
+          failedTransition.callConfig || callConfig,
+          {
+            payment_id: options.paymentId || null,
+            at: new Date().toISOString()
+          }
+        )).catch(() => {});
+      }
+      return {
+        ok: false,
+        code: 'payment_session_missing',
+        message: 'Payment session not found',
+        twiml: fallbackTwiml
+      };
+    }
+    if (String(session.execution_mode || 'native').toLowerCase() !== 'native') {
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'This payment flow is running via secure SMS. Returning to the call.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_mode_not_native' }
+      );
+      return {
+        ok: false,
+        code: 'payment_mode_not_native',
+        message: 'Payment session is not in native voice mode',
+        twiml: fallbackTwiml
+      };
+    }
+
+    const amountNumber = Number(session.amount);
+    const amount = Number.isFinite(amountNumber) && amountNumber > 0 ? amountNumber.toFixed(2) : null;
+    const paymentConnector = String(session.payment_connector || '').trim();
+    const paymentAdapter = getPaymentAdapterForCall(callConfig || {});
+    if (!paymentAdapter) {
+      return { ok: false, code: 'unsupported_provider', message: 'Unsupported payment provider' };
+    }
+    if (!amount || !paymentConnector) {
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'Payment setup is incomplete. Returning to the call flow.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_setup_incomplete' }
+      );
+      const failedTransition = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+        reason: 'payment_setup_incomplete',
+        payment_in_progress: false,
+        payment_session: null
+      });
+      if (db?.updateCallState) {
+        await db.updateCallState(callSid, 'payment_session_setup_incomplete', buildPaymentStatePayload(
+          failedTransition.callConfig || callConfig,
+          {
+            payment_id: options.paymentId || session?.payment_id || null,
+            at: new Date().toISOString()
+          }
+        )).catch(() => {});
+      }
+      return {
+        ok: false,
+        code: 'payment_setup_incomplete',
+        message: 'Payment amount or connector missing',
+        twiml: fallbackTwiml
+      };
+    }
+
+    const resolvedPaymentId = String(session.payment_id || options.paymentId || '').trim();
+    const actionUrl = paymentAdapter.buildCompleteUrl(host, callSid, resolvedPaymentId);
+    const statusUrl = paymentAdapter.buildStatusUrl(host, callSid, resolvedPaymentId);
+
+    const response = new VoiceResponse();
+    const startMessage = String(session.start_message || '').trim();
+    if (startMessage) {
+      await appendHostedPaymentSpeech(response, startMessage.slice(0, 240), callConfig || {}, {
+        callSid,
+        forceGenerate: true,
+        retryOnMiss: true,
+        timeoutMs: Math.max(1200, Number(config?.twilio?.ttsMaxWaitMs) || 1200),
+        retryTimeoutMs: Math.max(2500, Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000)
+      });
+    }
+    const payAttrs = {
+      paymentConnector,
+      chargeAmount: amount,
+      action: actionUrl,
+      method: 'POST',
+      statusCallback: statusUrl,
+      statusCallbackMethod: 'POST'
+    };
+    const normalizedCurrency = String(session.currency || 'USD').trim().toUpperCase();
+    if (/^[A-Z]{3}$/.test(normalizedCurrency)) {
+      payAttrs.currency = normalizedCurrency;
+    }
+    const description = String(session.description || '').trim().slice(0, 240);
+    if (description) {
+      payAttrs.description = description;
+    }
+    const paymentPromptDefinitions = [
+      { field: 'payment-card-number', text: 'Please enter your card number, then press pound.' },
+      { field: 'expiration-date', text: 'Enter your card expiration date.' },
+      { field: 'security-code', text: 'Enter the card security code.' },
+      { field: 'postal-code', text: 'Enter your billing ZIP code.' }
+    ];
+    const paymentPromptTimeoutMs = Math.max(
+      1500,
+      Number(config?.twilio?.finalPromptTtsTimeoutMs) || 6000
+    );
+    const paymentPromptEntries = await Promise.all(
+      paymentPromptDefinitions.map(async (entry) => ({
+        ...entry,
+        promptUrl: await resolveHostedPaymentTtsUrl(entry.text, callConfig || {}, {
+          callSid,
+          forceGenerate: true,
+          retryOnMiss: true,
+          timeoutMs: paymentPromptTimeoutMs,
+          retryTimeoutMs: Math.max(2500, paymentPromptTimeoutMs + 1000)
+        })
+      }))
+    );
+    const missingPromptFields = paymentPromptEntries
+      .filter((entry) => !entry.promptUrl)
+      .map((entry) => entry.field);
+    if (missingPromptFields.length) {
+      logDigitMetric('payment_tts_unavailable', {
+        callSid,
+        flow: 'payment_prompts',
+        missing_fields: missingPromptFields.join(',')
+      });
+      const fallbackTwiml = await buildPaymentRedirectFallbackTwiml(
+        'Payment voice prompts are temporarily unavailable. Returning to the call flow.',
+        host,
+        callConfig || {},
+        { callSid, flow: 'payment_prompt_tts_missing' }
+      );
+      return {
+        ok: false,
+        code: 'payment_tts_unavailable',
+        message: 'Payment TTS prompts unavailable',
+        twiml: fallbackTwiml
+      };
+    }
+    const pay = response.pay(payAttrs);
+    for (const entry of paymentPromptEntries) {
+      const prompt = pay.prompt({ for: entry.field });
+      prompt.play(entry.promptUrl);
+    }
+
+    let persistedConfig = callConfig;
+    if (callConfig && typeof callConfig === 'object') {
+      const transitioned = transitionPaymentState(callSid, PAYMENT_STATES.ACTIVE, {
+        reason: 'payment_session_started',
+        payment_in_progress: true,
+        payment_session: {
+          ...session,
+          payment_id: resolvedPaymentId || null,
+          amount
+        }
+      });
+      persistedConfig = transitioned.callConfig || callConfig;
+      persistedConfig.payment_session = {
+        ...session,
+        payment_id: resolvedPaymentId || null,
+        amount
+      };
+      callConfigurations.set(callSid, persistedConfig);
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'payment_active',
+            flow_state_reason: 'payment_session_started',
+            call_mode: 'payment_capture',
+            digit_capture_active: false
+          },
+          { callConfig: persistedConfig, source: 'digit.buildTwilioPaymentTwiml' }
+        );
+      }
+    }
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_session_started', buildPaymentStatePayload(persistedConfig, {
+        payment_id: resolvedPaymentId || null,
+        amount,
+        currency: normalizedCurrency,
+        payment_connector: paymentConnector,
+        payment_provider: paymentAdapter?.id || 'twilio',
+        start_message: session?.start_message || null,
+        success_message: session?.success_message || null,
+        failure_message: session?.failure_message || null,
+        retry_message: session?.retry_message || null,
+        started_at: new Date().toISOString()
+      })).catch(() => {});
+    }
+    webhookService.addLiveEvent(
+      callSid,
+      `💳 Payment capture started (${normalizedCurrency} ${amount})`,
+      { force: true }
+    );
+    return {
+      ok: true,
+      twiml: response.toString(),
+      session: {
+        ...session,
+        payment_id: resolvedPaymentId || null,
+        amount,
+        currency: normalizedCurrency
+      }
+    };
+  }
+
+  async function handleTwilioPaymentCompletion(callSid, payload = {}, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    const host = String(options.hostname || config?.server?.hostname || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    const { callConfig, session } = await resolvePaymentSession(callSid, options.paymentId || '');
+    const result = normalizePaymentResult(
+      payload?.Result || payload?.result || payload?.PaymentResult || ''
+    );
+    const success = result === 'success';
+    const normalizedPaymentId = String(options.paymentId || session?.payment_id || '').trim();
+    const idempotency = await reservePaymentWebhookIdempotency(callSid, payload, {
+      source: 'twilio_pay_complete',
+      paymentId: normalizedPaymentId || null,
+      eventType: result || 'unknown'
+    });
+    if (idempotency.duplicate) {
+      const existingSummary =
+        callConfig?.payment_last_result && typeof callConfig.payment_last_result === 'object'
+          ? { ...callConfig.payment_last_result }
+          : null;
+      const existingResult = normalizePaymentResult(existingSummary?.result || result);
+      const duplicateSuccess = existingResult === 'success';
+      return {
+        ok: true,
+        duplicate: true,
+        success: duplicateSuccess,
+        summary: existingSummary,
+        twiml: await buildPaymentCompletionTwiml(
+          duplicateSuccess,
+          session,
+          host,
+          callConfig || {},
+          { callSid }
+        )
+      };
+    }
+    const summary = {
+      payment_id: normalizedPaymentId || null,
+      result,
+      payment_provider: String(session?.provider || resolvePaymentProvider(callConfig || {})) || 'twilio',
+      amount: payload?.PaymentAmount || session?.amount || null,
+      currency: payload?.PaymentCurrency || session?.currency || null,
+      confirmation_code:
+        payload?.PaymentConfirmationCode
+        || payload?.payment_confirmation_code
+        || null,
+      payment_token:
+        payload?.PaymentToken
+        || payload?.payment_token
+        || null,
+      card_type:
+        payload?.PaymentCardType
+        || payload?.payment_card_type
+        || null,
+      error_code:
+        payload?.PaymentErrorCode
+        || payload?.payment_error_code
+        || null,
+      error_message:
+        payload?.PaymentError
+        || payload?.payment_error
+        || null,
+      completed_at: new Date().toISOString()
+    };
+
+    const transitioned = transitionPaymentState(
+      callSid,
+      success ? PAYMENT_STATES.COMPLETED : PAYMENT_STATES.FAILED,
+      {
+        reason: success ? 'payment_completed' : 'payment_failed',
+        payment_in_progress: false,
+        payment_last_result: summary,
+        payment_session: null
+      }
+    );
+    const persistedConfig = transitioned.callConfig || callConfig;
+
+    if (db?.updateCallState) {
+      await db.updateCallState(
+        callSid,
+        success ? 'payment_session_completed' : 'payment_session_failed',
+        buildPaymentStatePayload(persistedConfig, summary)
+      ).catch(() => {});
+    }
+    if (persistedConfig && typeof persistedConfig === 'object') {
+      callConfigurations.set(callSid, persistedConfig);
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            flow_state_reason: success ? 'payment_completed' : 'payment_failed',
+            call_mode: 'normal',
+            digit_capture_active: false
+          },
+          { callConfig: persistedConfig, source: 'digit.handleTwilioPaymentCompletion' }
+        );
+      }
+    }
+
+    let smsFallbackResult = null;
+    if (!success) {
+      try {
+        smsFallbackResult = await sendPaymentSmsFallback(
+          callSid,
+          session || {},
+          persistedConfig || callConfig || {},
+          'failed'
+        );
+      } catch (error) {
+        logDigitMetric('payment_sms_fallback_error', {
+          callSid,
+          reason: 'failed',
+          error: String(error?.message || error || 'unknown_error')
+        });
+      }
+    }
+
+    webhookService.addLiveEvent(
+      callSid,
+      success
+        ? '✅ Payment completed'
+        : `⚠️ Payment failed (${summary.error_code || 'unknown'})`,
+      { force: true }
+    );
+
+    return {
+      ok: true,
+      success,
+      summary: {
+        ...summary,
+        sms_fallback_sent: smsFallbackResult?.sent === true
+      },
+      twiml: await buildPaymentCompletionTwiml(
+        success,
+        session,
+        host,
+        persistedConfig || callConfig || {},
+        { callSid }
+      )
+    };
+  }
+
+  async function handleTwilioPaymentStatus(callSid, payload = {}, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    const eventType = String(
+      payload?.PaymentEvent
+      || payload?.payment_event
+      || payload?.EventType
+      || payload?.event
+      || 'unknown'
+    ).trim();
+    const result = normalizePaymentResult(payload?.Result || payload?.result || '');
+    const paymentId = options.paymentId || payload?.paymentId || payload?.PaymentSid || null;
+    const idempotency = await reservePaymentWebhookIdempotency(callSid, payload, {
+      source: 'twilio_pay_status',
+      paymentId,
+      eventType
+    });
+    if (idempotency.duplicate) {
+      return { ok: true, event: eventType, result, duplicate: true };
+    }
+
+    const derivedState = derivePaymentStateFromStatus(eventType, result);
+    let persistedConfig = callConfigurations.get(callSid) || {};
+    if (derivedState) {
+      const transitionMeta = {
+        reason: 'payment_status_event'
+      };
+      if (derivedState === PAYMENT_STATES.COMPLETED || derivedState === PAYMENT_STATES.FAILED) {
+        transitionMeta.payment_in_progress = false;
+        transitionMeta.payment_session = null;
+        transitionMeta.payment_last_result = {
+          payment_id: paymentId || null,
+          result,
+          payment_provider: resolvePaymentProvider(persistedConfig || {}),
+          event: eventType,
+          completed_at: new Date().toISOString()
+        };
+      }
+      const transitioned = transitionPaymentState(callSid, derivedState, transitionMeta);
+      persistedConfig = transitioned.callConfig || persistedConfig;
+    }
+
+    if (db?.updateCallState) {
+      await db.updateCallState(callSid, 'payment_status_event', buildPaymentStatePayload(persistedConfig, {
+        payment_id: paymentId,
+        event: eventType,
+        result,
+        at: new Date().toISOString()
+      })).catch(() => {});
+    }
+    return { ok: true, event: eventType, result };
+  }
+
+  async function reconcilePaymentSession(callSid, options = {}) {
+    if (!callSid) {
+      return { ok: false, code: 'missing_call_sid', message: 'Missing CallSid' };
+    }
+    const reason = String(options.reason || 'payment_reconcile_timeout').trim() || 'payment_reconcile_timeout';
+    const { callConfig, session } = await resolvePaymentSession(callSid, options.paymentId || '');
+    const state = getCurrentPaymentState(callConfig || {});
+    const flowState = String(callConfig?.flow_state || '').trim().toLowerCase();
+    const activeLike = (
+      callConfig?.payment_in_progress === true
+      || state === PAYMENT_STATES.REQUESTED
+      || state === PAYMENT_STATES.ACTIVE
+      || flowState === 'payment_active'
+    );
+    if (!activeLike && PAYMENT_TERMINAL_STATES.has(state)) {
+      return { ok: true, reconciled: false, state, reason: 'already_terminal' };
+    }
+    if (!activeLike && !session) {
+      return { ok: true, reconciled: false, state, reason: 'no_active_payment_session' };
+    }
+
+    const summary = {
+      payment_id: session?.payment_id || null,
+      result: 'failed',
+      amount: session?.amount || null,
+      currency: session?.currency || null,
+      error_code: 'reconcile_timeout',
+      error_message: String(options.message || 'Payment session timed out before completion webhook was confirmed.').slice(0, 240),
+      completed_at: new Date().toISOString(),
+      source: options.source || 'payment_reconcile_worker'
+    };
+
+    const transitioned = transitionPaymentState(callSid, PAYMENT_STATES.FAILED, {
+      reason,
+      payment_in_progress: false,
+      payment_session: null,
+      payment_last_result: summary
+    });
+    const persistedConfig = transitioned.callConfig || callConfig || {};
+    persistedConfig.payment_attempt_reconciled_at = new Date().toISOString();
+    callConfigurations.set(callSid, persistedConfig);
+
+    if (typeof setCallFlowState === 'function') {
+      setCallFlowState(
+        callSid,
+        {
+          flow_state: 'normal',
+          flow_state_reason: 'payment_reconciled',
+          call_mode: 'normal',
+          digit_capture_active: false
+        },
+        { callConfig: persistedConfig, source: 'digit.reconcilePaymentSession' }
+      );
+    }
+
+    if (db?.updateCallState) {
+      await db.updateCallState(
+        callSid,
+        'payment_session_reconciled',
+        buildPaymentStatePayload(persistedConfig, {
+          ...summary,
+          reconcile_reason: reason,
+          stale_since: options.staleSince || null,
+          reconciled_at: new Date().toISOString()
+        })
+      ).catch(() => {});
+    }
+
+    webhookService.addLiveEvent(
+      callSid,
+      '⚠️ Payment timed out. Returning to normal call flow.',
+      { force: true }
+    );
+    let smsFallbackResult = null;
+    try {
+      smsFallbackResult = await sendPaymentSmsFallback(
+        callSid,
+        session || {},
+        persistedConfig || callConfig || {},
+        'timeout'
+      );
+    } catch (error) {
+      logDigitMetric('payment_sms_fallback_error', {
+        callSid,
+        reason: 'timeout',
+        error: String(error?.message || error || 'unknown_error')
+      });
+    }
+    return {
+      ok: true,
+      reconciled: true,
+      state: PAYMENT_STATES.FAILED,
+      summary: {
+        ...summary,
+        sms_fallback_sent: smsFallbackResult?.sent === true
+      }
+    };
+  }
+
+  function formatOtpForDisplay(digits, mode = otpDisplayMode, expectedLength = null) {
+    const safeDigits = String(digits || '').replace(/\D/g, '');
+    if (mode === 'raw') {
+      return safeDigits ? `OTP received: ${safeDigits}` : 'OTP received';
+    }
+    const targetLen = Number.isFinite(expectedLength) && expectedLength > 0 ? expectedLength : otpLength;
+    if (mode === 'length') {
+      return `OTP received (${safeDigits.length} digits)`;
+    }
+    if (mode === 'progress') {
+      return `OTP entry: ${safeDigits.length}/${targetLen} digits received`;
+    }
+    if (!safeDigits) return 'OTP received';
+    const maskLen = Math.max(0, safeDigits.length - 2);
+    const masked = `${'*'.repeat(maskLen)}${safeDigits.slice(-2)}`;
+    return `OTP received: ${masked}`;
+  }
+
+  function formatDigitsGeneral(digits, masked = null, mode = 'live') {
+    const raw = String(digits || '');
+    if (mode === 'live' && showRawDigitsLive) return raw;
+    if (mode === 'notify' && sendRawDigitsToUser) return raw;
+    if (masked) return masked;
+    const safe = raw.replace(/\d{0,}/g, (m) => (m.length <= 4 ? m : `${'*'.repeat(Math.max(0, m.length - 2))}${m.slice(-2)}`));
+    return safe;
+  }
+
+  function hasDigitEntryContext(text = '') {
+    // Check if text contains nearby keywords indicating digit entry context
+    const keywords = /\b(enter|press|key|digit|code|number|input|type|dial|read|say|provide)\b/;
+    return keywords.test(String(text || '').toLowerCase());
+  }
+
+  function extractSpokenDigitSequences(text = '', callSid = null) {
+    if (!text) return [];
+    const lower = String(text || '').toLowerCase();
+    const tokens = lower
+      .replace(/[^a-z0-9\s-]/g, ' ')  // Allow hyphens for sequences like "one-two-three"
+      .split(/[\s-]+/)
+      .filter(Boolean);
+
+    const sequences = [];
+    let buffer = '';
+    let repeat = 1;
+
+    for (const token of tokens) {
+      if (token === 'double') {
+        repeat = 2;
+        continue;
+      }
+      if (token === 'triple') {
+        repeat = 3;
+        continue;
+      }
+
+      const digit = DIGIT_WORD_MAP[token];
+      if (digit) {
+        buffer += digit.repeat(repeat);
+        repeat = 1;
+        continue;
+      }
+
+      if (/^\d+$/.test(token)) {
+        if (buffer) {
+          sequences.push(buffer);
+          buffer = '';
+        }
+        sequences.push(token);
+        repeat = 1;
+        continue;
+      }
+
+      if (buffer) {
+        sequences.push(buffer);
+        buffer = '';
+      }
+      repeat = 1;
+    }
+
+    if (buffer) {
+      sequences.push(buffer);
+    }
+
+    // Filter out sequences that don't have digit entry context if we have an active expectation
+    if (callSid && digitCollectionManager.expectations.has(callSid) && !hasDigitEntryContext(text)) {
+      const filtered = sequences.filter((seq) => {
+        // Keep sequences that are part of larger numeric context
+        return /\d/.test(seq) && seq.length >= 4;
+      });
+      return filtered.length > 0 ? filtered : [];
+    }
+
+    return sequences;
+  }
+
+  function getOtpContext(text = '', callSid = null) {
+    if (!text) {
+      return {
+        raw: text,
+        maskedForGpt: text,
+        maskedForLogs: text,
+        otpDetected: false,
+        codes: []
+      };
+    }
+    const expectation = callSid ? digitCollectionManager.expectations.get(callSid) : null;
+    const maskForGpt = expectation ? expectation.mask_for_gpt !== false : true;
+    const minExpected = typeof expectation?.min_digits === 'number' ? expectation.min_digits : 4;
+    const maxExpected = typeof expectation?.max_digits === 'number' ? expectation.max_digits : 8;
+    const dynamicRegex = expectation
+      ? new RegExp(`\\b\\d{${minExpected},${maxExpected}}\\b`, 'g')
+      : OTP_REGEX;
+    const numericCodes = [...text.matchAll(dynamicRegex)].map((m) => m[0]);
+    // Pass callSid to extractSpokenDigitSequences for context-aware filtering
+    const spokenCodes = extractSpokenDigitSequences(text, callSid).filter((code) => code.length >= minExpected && code.length <= maxExpected);
+    const codes = [...numericCodes, ...spokenCodes];
+    const otpDetected = codes.length > 0;
+    const masked = text.replace(dynamicRegex, '******').replace(SPOKEN_DIGIT_PATTERN, '******');
+    return {
+      raw: text,
+      maskedForGpt: maskForGpt ? masked : text,
+      maskedForLogs: masked,
+      otpDetected,
+      codes
+    };
+  }
+
+  function maskOtpForExternal(text = '') {
+    if (!text) return text;
+    return text.replace(OTP_REGEX, '******').replace(SPOKEN_DIGIT_PATTERN, '******');
+  }
+
+  function buildExpectationFromConfig(callConfig = {}) {
+    const rawProfile = String(
+      callConfig.collection_profile
+        || callConfig.digit_profile_id
+        || callConfig.digitProfileId
+        || callConfig.digit_profile
+        || ''
+    ).trim().toLowerCase();
+    if (!rawProfile) return null;
+    if (REMOVED_DIGIT_PROFILES.has(rawProfile)) return null;
+    if (normalizeGroupId(rawProfile)) {
+      return null;
+    }
+    const profile = normalizeProfileId(rawProfile);
+    if (!profile) return null;
+    if (!isSupportedProfile(profile)) {
+      logDigitMetric('profile_unsupported', { profile });
+      return null;
+    }
+    const defaults = getDigitProfileDefaults(profile);
+    const expectedLength = Number(callConfig.collection_expected_length);
+    const explicitLength = Number.isFinite(expectedLength) ? expectedLength : null;
+    const minDigits = explicitLength || defaults.min_digits || 1;
+    const maxDigits = explicitLength || defaults.max_digits || minDigits;
+    const timeout = Number(callConfig.collection_timeout_s);
+    const timeout_s = Number.isFinite(timeout) ? timeout : defaults.timeout_s;
+    const responseTimeout = Number(callConfig.collection_response_timeout_s);
+    const response_timeout_s = Number.isFinite(responseTimeout)
+      ? responseTimeout
+      : (Number.isFinite(defaults.response_timeout_s) ? defaults.response_timeout_s : timeout_s);
+    const interDigitTimeout = Number(callConfig.collection_inter_digit_timeout_s);
+    const inter_digit_timeout_s = Number.isFinite(interDigitTimeout)
+      ? interDigitTimeout
+      : (Number.isFinite(defaults.inter_digit_timeout_s) ? defaults.inter_digit_timeout_s : null);
+    const retries = Number(callConfig.collection_max_retries);
+    const max_retries = Number.isFinite(retries) ? retries : defaults.max_retries;
+    const mask_for_gpt = typeof callConfig.collection_mask_for_gpt === 'boolean'
+      ? callConfig.collection_mask_for_gpt
+      : (typeof defaults.mask_for_gpt === 'boolean' ? defaults.mask_for_gpt : true);
+    const speak_confirmation = typeof callConfig.collection_speak_confirmation === 'boolean'
+      ? callConfig.collection_speak_confirmation
+      : false;
+    const prompt = ''; // initial prompt now comes from bot payload, not profile
+    const endCallOverride = typeof callConfig.collection_end_call_on_success === 'boolean'
+      ? callConfig.collection_end_call_on_success
+      : null;
+    const end_call_on_success = endCallOverride !== null
+      ? endCallOverride
+      : true;
+    return {
+      profile,
+      min_digits: minDigits,
+      max_digits: maxDigits,
+      timeout_s,
+      response_timeout_s,
+      inter_digit_timeout_s,
+      max_retries,
+      mask_for_gpt,
+      speak_confirmation,
+      prompt,
+      end_call_on_success
+    };
+  }
+
+  function resolveLockedExpectation(callConfig = {}) {
+    if (!callConfig) return null;
+    const fromConfig = buildExpectationFromConfig(callConfig);
+    if (fromConfig?.profile) {
+      return normalizeDigitExpectation({ ...fromConfig, prompt: '' });
+    }
+    const fromIntent = callConfig?.digit_intent?.expectation;
+    if (fromIntent?.profile) {
+      return normalizeDigitExpectation({ ...fromIntent, prompt: fromIntent.prompt || '' });
+    }
+    const tpl = callConfig.script_policy || {};
+    if (tpl.requires_otp) {
+      const len = tpl.expected_length || otpLength;
+      return normalizeDigitExpectation({
+        profile: tpl.default_profile || 'verification',
+        min_digits: len,
+        max_digits: len,
+        force_exact_length: len,
+        prompt: ''
+      });
+    }
+    return null;
+  }
+
+  function resolveLockedGroup(callConfig = {}) {
+    if (!callConfig) return null;
+    const locked = normalizeGroupId(callConfig.capture_group || callConfig.captureGroup);
+    if (callConfig.group_locked && locked) return locked;
+    const explicitStrict = normalizeGroupId(callConfig.capture_group || callConfig.captureGroup);
+    if (explicitStrict) return explicitStrict;
+    const explicitPlan = normalizeGroupId(callConfig.digit_plan_id || callConfig.digitPlanId);
+    if (explicitPlan) return explicitPlan;
+    const rawProfile = String(
+      callConfig.collection_profile
+        || callConfig.digit_profile_id
+        || callConfig.digitProfileId
+        || callConfig.digit_profile
+        || ''
+    ).trim().toLowerCase();
+    if (!rawProfile) return null;
+    return normalizeGroupId(rawProfile);
+  }
+
+  function normalizeIntentSignal(value = '') {
+    const normalized = String(value || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[\s-]+/g, '_');
+    if (!normalized) return null;
+    return normalized.replace(/[^a-z0-9_]/g, '');
+  }
+
+  function collectFlowSignals(callConfig = {}) {
+    const signals = new Set();
+    const push = (value) => {
+      const normalized = normalizeIntentSignal(value);
+      if (!normalized) return;
+      signals.add(normalized);
+      normalized.split(/[_/]+/).forEach((token) => {
+        if (token) signals.add(token);
+      });
+    };
+
+    push(callConfig.conversation_profile);
+    push(callConfig.call_profile);
+    push(callConfig.purpose);
+    push(callConfig.flow_type);
+    push(callConfig.flowType);
+    push(callConfig.script);
+    push(callConfig.business_context?.purpose);
+    push(callConfig.business_context?.flow_type);
+
+    const tpl = callConfig.script_policy || {};
+    push(tpl.flow_type);
+    push(tpl.objective_tag);
+    if (Array.isArray(tpl.flow_types)) {
+      tpl.flow_types.forEach((entry) => push(entry));
+    }
+
+    return Array.from(signals);
+  }
+
+  function hasExplicitDigitCaptureConfig(callConfig = {}) {
+    const explicitSources = [
+      callConfig.capture_group,
+      callConfig.captureGroup,
+      callConfig.capture_plan,
+      callConfig.capturePlan,
+      callConfig.digit_plan_id,
+      callConfig.digitPlanId,
+      callConfig.collection_profile,
+      callConfig.digit_profile_id,
+      callConfig.digitProfileId,
+      callConfig.digit_profile
+    ];
+    if (explicitSources.some((value) => value !== null && value !== undefined && String(value).trim() !== '')) {
+      return true;
+    }
+
+    const tpl = callConfig.script_policy || {};
+    if (tpl.requires_otp === true) return true;
+    const scriptDefaultProfile = normalizeProfileId(tpl.default_profile || '');
+    if (scriptDefaultProfile && scriptDefaultProfile !== 'generic' && isSupportedProfile(scriptDefaultProfile)) {
+      return true;
+    }
+    const scriptCollectionProfile = normalizeProfileId(tpl.collection_profile || '');
+    if (scriptCollectionProfile && scriptCollectionProfile !== 'generic' && isSupportedProfile(scriptCollectionProfile)) {
+      return true;
+    }
+
+    const intentProfile = normalizeProfileId(
+      callConfig?.digit_intent?.expectation?.profile
+        || callConfig?.digit_intent?.profile
+        || ''
+    );
+    if (intentProfile && intentProfile !== 'generic' && isSupportedProfile(intentProfile)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function resolveImplicitDigitInferenceGuard(callConfig = {}) {
+    if (!callConfig || typeof callConfig !== 'object') {
+      return { blocked: false, reason: null, matched_profiles: [] };
+    }
+    if (hasExplicitDigitCaptureConfig(callConfig)) {
+      return { blocked: false, reason: null, matched_profiles: [] };
+    }
+    const flowSignals = collectFlowSignals(callConfig);
+    const matchedProfiles = flowSignals.filter((signal) => RELATIONSHIP_PROFILE_HINTS.has(signal));
+    if (!matchedProfiles.length) {
+      return { blocked: false, reason: null, matched_profiles: [] };
+    }
+    return {
+      blocked: true,
+      reason: 'relationship_profile_without_explicit_digit_policy',
+      matched_profiles: Array.from(new Set(matchedProfiles)).slice(0, 8)
+    };
+  }
+
+  const MIN_INFER_CONFIDENCE = 0.65;
+
+  function inferDigitExpectationFromText(text = '', callConfig = {}) {
+    const lower = String(text || '').toLowerCase();
+    const tpl = callConfig.script_policy || {};
+    const contains = (re) => re.test(lower);
+    const explicitProfile = normalizeProfileId(
+      callConfig.collection_profile
+        || callConfig.digit_profile_id
+        || callConfig.digitProfileId
+        || callConfig.digit_profile
+        || ''
+    );
+    const numberHint = (re) => {
+      const m = lower.match(re);
+      return m ? parseInt(m[1], 10) : null;
+    };
+    const hasPress = contains(/\bpress\b/);
+    const hasEnter = contains(/\b(enter|input|key in|dial)\b/) || contains(/\btype\s+(?:in|the|your|[0-9])/);
+    const explicitDigitCount = numberHint(/\b(\d{1,2})\s*[- ]?digit\b/);
+    const explicitCodeCount = numberHint(/\b(\d{1,2})\s*[- ]?code\b/);
+    const explicitLen = explicitDigitCount || explicitCodeCount;
+    const explicitCommand = hasPress || hasEnter;
+    const hasStrongOtpSignals = contains(/\b(otp|one[-\s]?time|passcode|password)\b/);
+    const hasOtpDeliveryPhrase = contains(/\b(text message code|sms code|texted code)\b/);
+    const hasCodeSignals = contains(/\b(code|security code|auth(?:entication)? code)\b/);
+    const hasOtpDelivery = contains(/\b(text message|sms|texted)\b/);
+    const hasDigitWord = contains(/\bdigit(s)?\b/);
+    const hasOtpDeliveryDigits = hasOtpDelivery && (hasDigitWord || explicitLen);
+    const hasActionOrCount = explicitCommand || explicitLen;
+
+    if (explicitProfile) {
+      return null;
+    }
+
+    if (tpl.requires_otp) {
+      const len = tpl.expected_length || otpLength;
+      return {
+        profile: tpl.default_profile || 'verification',
+        min_digits: len,
+        max_digits: len,
+        force_exact_length: len,
+        prompt: '',
+        end_call_on_success: true,
+        max_retries: otpMaxRetries,
+        confidence: 0.95,
+        reason: 'script_requires_otp',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    if (tpl.default_profile && tpl.default_profile !== 'generic') {
+      const len = tpl.expected_length || otpLength;
+      return {
+        profile: tpl.default_profile,
+        min_digits: len,
+        max_digits: len,
+        force_exact_length: len,
+        prompt: '',
+        end_call_on_success: true,
+        max_retries: otpMaxRetries,
+        confidence: 0.8,
+        reason: 'script_default_profile',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    const buildProfileExpectation = (profile, overrides = {}, reason = 'keyword', confidence = 0.7) => {
+      const defaults = getDigitProfileDefaults(profile);
+      return {
+        profile,
+        min_digits: overrides.min_digits || defaults.min_digits || 1,
+        max_digits: overrides.max_digits || defaults.max_digits || overrides.min_digits || defaults.min_digits || 1,
+        force_exact_length: overrides.force_exact_length || false,
+        prompt: '',
+        end_call_on_success: typeof overrides.end_call_on_success === 'boolean'
+          ? overrides.end_call_on_success
+          : true,
+        max_retries: overrides.max_retries || defaults.max_retries || 2,
+        confidence,
+        reason,
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    };
+
+    const exactKeywordProfiles = [
+      { profile: 'verification', regex: /\b(otp|one[-\s]?time|one[-\s]?time password|verification code|passcode)\b/, reason: 'otp_exact_keyword', confidence: 0.9 },
+      { profile: 'pin', regex: /\bpin\b/, min: 4, max: 8, reason: 'pin_keyword', confidence: 0.85 },
+      { profile: 'routing_number', regex: /\brouting number\b/, min: 9, max: 9, exact: 9, reason: 'routing_keyword', confidence: 0.8 },
+      { profile: 'account_number', regex: /\b(bank account|bank acct)\b/, min: 6, max: 17, reason: 'account_number_keyword', confidence: 0.75 },
+      { profile: 'ssn', regex: /\b(ssn|social security)\b/, min: 9, max: 9, exact: 9, reason: 'ssn_keyword', confidence: 0.85 },
+      { profile: 'dob', regex: /\b(date of birth|dob|birth date)\b/, min: 6, max: 8, reason: 'dob_keyword', confidence: 0.75 },
+      { profile: 'phone', regex: /\b(phone number|callback number|call back number)\b/, min: 10, max: 10, exact: 10, reason: 'phone_keyword', confidence: 0.7 },
+      { profile: 'tax_id', regex: /\b(tax id|tax identification|tin)\b/, min: 9, max: 9, exact: 9, reason: 'tax_id_keyword', confidence: 0.7 },
+      { profile: 'ein', regex: /\b(ein|employer identification)\b/, min: 9, max: 9, exact: 9, reason: 'ein_keyword', confidence: 0.7 },
+      { profile: 'claim_number', regex: /\b(claim number|claim)\b/, min: 4, max: 12, reason: 'claim_keyword', confidence: 0.7 },
+      { profile: 'reservation_number', regex: /\b(reservation number|reservation)\b/, min: 4, max: 12, reason: 'reservation_keyword', confidence: 0.7 },
+      { profile: 'ticket_number', regex: /\b(ticket number|ticket id|ticket)\b/, min: 4, max: 12, reason: 'ticket_keyword', confidence: 0.7 },
+      { profile: 'case_number', regex: /\b(case number|case id|case)\b/, min: 4, max: 12, reason: 'case_keyword', confidence: 0.7 },
+      { profile: 'extension', regex: /\b(extension|ext\.?)\b/, min: 2, max: 6, reason: 'extension_keyword', confidence: 0.7 }
+    ];
+
+    for (const entry of exactKeywordProfiles) {
+      if (!contains(entry.regex)) continue;
+      if (!hasActionOrCount) return null;
+      const useLen = entry.profile === 'verification' ? (explicitLen || otpLength) : null;
+      return buildProfileExpectation(entry.profile, {
+        min_digits: useLen || entry.min,
+        max_digits: useLen || entry.max,
+        force_exact_length: useLen || entry.exact || false,
+        end_call_on_success: true
+      }, entry.reason, entry.confidence);
+    }
+
+    // OTP / verification keyword fallback (requires action verb or explicit length)
+    const hasOtpSignals = (hasStrongOtpSignals || hasOtpDeliveryPhrase || hasCodeSignals || hasOtpDeliveryDigits)
+      && hasActionOrCount;
+
+    if (hasOtpSignals) {
+      const len = explicitLen || otpLength;
+      return {
+        profile: 'verification',
+        min_digits: len,
+        max_digits: len,
+        force_exact_length: len,
+        prompt: '',
+        end_call_on_success: true,
+        max_retries: otpMaxRetries,
+        confidence: 0.8,
+        reason: 'otp_keyword',
+        allow_terminator: tpl.allow_terminator === true,
+        terminator_char: tpl.terminator_char || '#'
+      };
+    }
+
+    const weightedProfiles = [
+      { profile: 'account_number', keywords: [/account\b/, /\bnumber\b/], weight: 0.45, min: 6, max: 17, reason: 'account_weighted' },
+      { profile: 'claim_number', keywords: [/claim\b/, /\bnumber\b/], weight: 0.4, min: 4, max: 12, reason: 'claim_weighted' },
+      { profile: 'reservation_number', keywords: [/reservation\b/, /\bnumber\b/], weight: 0.4, min: 4, max: 12, reason: 'reservation_weighted' },
+      { profile: 'ticket_number', keywords: [/ticket\b/, /\bnumber\b/], weight: 0.4, min: 4, max: 12, reason: 'ticket_weighted' },
+      { profile: 'case_number', keywords: [/case\b/, /\bnumber\b/], weight: 0.4, min: 4, max: 12, reason: 'case_weighted' }
+    ];
+
+    let best = null;
+    let second = null;
+    for (const entry of weightedProfiles) {
+      let score = 0;
+      entry.keywords.forEach((kw) => {
+        if (kw.test(lower)) score += entry.weight;
+      });
+      if (!score) continue;
+      const candidate = { ...entry, score };
+      if (!best || candidate.score > best.score) {
+        second = best;
+        best = candidate;
+      } else if (!second || candidate.score > second.score) {
+        second = candidate;
+      }
+    }
+
+    if (best && hasActionOrCount) {
+      const minScore = 0.75;
+      const gap = best.score - (second?.score || 0);
+      if (best.score >= minScore && gap >= 0.2) {
+        return buildProfileExpectation(best.profile, {
+          min_digits: best.min,
+          max_digits: best.max,
+          end_call_on_success: true
+        }, best.reason, Math.min(0.85, best.score));
+      }
+    }
+
+    return null;
+  }
+
+  function determineDigitIntent(callSid, callConfig = {}) {
+    const explicitGroup = resolveLockedGroup(callConfig);
+    if (explicitGroup) {
+      lockGroupForCall(callSid, callConfig, explicitGroup, 'locked');
+      const intent = buildGroupIntent(explicitGroup, 'explicit_group', callConfig);
+      if (intent) {
+        return intent;
+      }
+    }
+    const explicitSelection = resolveExplicitGroup(callConfig);
+    if (explicitSelection.provided) {
+      if (!explicitSelection.groupId) {
+        logDigitMetric('group_invalid_explicit', { callSid, source: explicitSelection.source });
+        return { mode: 'normal', reason: 'invalid_group', confidence: 0 };
+      }
+      lockGroupForCall(callSid, callConfig, explicitSelection.groupId, explicitSelection.reason);
+      const intent = buildGroupIntent(explicitSelection.groupId, 'explicit_group', callConfig);
+      if (intent) {
+        logDigitMetric('group_selected', {
+          callSid,
+          group: explicitSelection.groupId,
+          reason: explicitSelection.reason,
+          confidence: 1,
+          matched_keywords: []
+        });
+        return intent;
+      }
+    }
+    const explicitProfileRaw = callConfig.collection_profile
+      || callConfig.digit_profile_id
+      || callConfig.digitProfileId
+      || callConfig.digit_profile;
+    if (explicitProfileRaw) {
+      const normalizedProfile = normalizeProfileId(explicitProfileRaw);
+      if (!isSupportedProfile(normalizedProfile)) {
+        logDigitMetric('profile_invalid_config', { profile: explicitProfileRaw });
+        return { mode: 'normal', reason: 'invalid_profile', confidence: 0 };
+      }
+    }
+    const explicit = buildExpectationFromConfig(callConfig);
+    if (explicit) {
+      return {
+        mode: 'dtmf',
+        reason: 'explicit_config',
+        confidence: 0.95,
+        expectation: explicit
+      };
+    }
+
+    const implicitGuard = resolveImplicitDigitInferenceGuard(callConfig);
+    if (implicitGuard.blocked) {
+      logDigitMetric('intent_inference_blocked', {
+        callSid,
+        reason: implicitGuard.reason,
+        matched_profiles: implicitGuard.matched_profiles
+      });
+      if (webhookService?.addLiveEvent) {
+        webhookService.addLiveEvent(
+          callSid,
+          `🛡️ Digit inference blocked (${implicitGuard.matched_profiles.join(', ') || 'relationship'} flow requires explicit digit policy)`,
+          { force: false }
+        );
+      }
+      if (db?.updateCallState) {
+        Promise.resolve(
+          db.updateCallState(callSid, 'digit_intent_inference_blocked', {
+            reason: implicitGuard.reason,
+            matched_profiles: implicitGuard.matched_profiles,
+            prompt_preview: String(callConfig.prompt || callConfig.first_message || '').slice(0, 140) || null
+          })
+        ).catch((error) => {
+          logDigitMetric('intent_inference_blocked_state_update_failed', {
+            callSid,
+            error: error?.message || 'unknown_error'
+          });
+        });
+      }
+      return { mode: 'normal', reason: implicitGuard.reason, confidence: 0 };
+    }
+
+    let candidates = [];
+    if (typeof intentPredictor === 'function') {
+      try {
+        const predicted = intentPredictor({ callSid, callConfig });
+        if (Array.isArray(predicted)) {
+          candidates = predicted;
+        }
+      } catch (err) {
+        logDigitMetric('intent_predictor_error', { callSid, error: err.message });
+      }
+    } else {
+      candidates = estimateIntentCandidates(callSid, callConfig);
+    }
+    if (candidates.length) {
+      logDigitMetric('intent_candidates', {
+        callSid,
+        candidates: candidates.map((entry) => ({
+          profile: entry.profile,
+          score: Number(entry.score || 0).toFixed(2),
+          sources: entry.sources || []
+        }))
+      });
+      const top = candidates[0];
+      if (top?.profile && (top.score || 0) >= INTENT_PREDICT_MIN_SCORE) {
+        const predicted = buildProfileExpectation(top.profile, {}, 'predictive_intent', top.score);
+        if (predicted) {
+          return {
+            mode: 'dtmf',
+            reason: predicted.reason || 'predictive_intent',
+            confidence: predicted.confidence || top.score,
+            expectation: predicted
+          };
+        }
+      }
+    }
+
+    const text = `${callConfig.prompt || ''} ${callConfig.first_message || ''}`.trim();
+    if (!text) {
+      return { mode: 'normal', reason: 'no_prompt', confidence: 0 };
+    }
+
+    const groupResolution = resolveGroupFromPrompt(text);
+    if (groupResolution.groupId) {
+      lockGroupForCall(callSid, callConfig, groupResolution.groupId, groupResolution.reason, {
+        confidence: groupResolution.confidence,
+        matched_keywords: groupResolution.matches
+      });
+      logDigitMetric('group_selected', {
+        callSid,
+        group: groupResolution.groupId,
+        reason: groupResolution.reason,
+        confidence: groupResolution.confidence,
+        matched_keywords: groupResolution.matches
+      });
+      const intent = buildGroupIntent(groupResolution.groupId, 'prompt_group', callConfig);
+      if (intent) return intent;
+    } else {
+      logDigitMetric('group_not_selected', {
+        callSid,
+        reason: groupResolution.reason,
+        confidence: groupResolution.confidence,
+        matched_keywords: groupResolution.matches
+      });
+      if (groupResolution.reason === 'ambiguous' || groupResolution.reason === 'low_confidence') {
+        return { mode: 'normal', reason: 'group_ambiguous', confidence: 0 };
+      }
+    }
+
+    const inferred = inferDigitExpectationFromText(text, callConfig);
+    if (inferred && (inferred.confidence || 0) >= MIN_INFER_CONFIDENCE) {
+      return {
+        mode: 'dtmf',
+        reason: inferred.reason || 'prompt_signal',
+        confidence: inferred.confidence || 0.6,
+        expectation: inferred
+      };
+    }
+
+    return { mode: 'normal', reason: 'no_signal', confidence: 0 };
+  }
+
+  function prepareInitialExpectation(callSid, callConfig = {}) {
+    const intent = determineDigitIntent(callSid, callConfig);
+    logDigitMetric('intent_resolved', {
+      callSid,
+      mode: intent?.mode,
+      profile: intent?.expectation?.profile || intent?.group_id || null,
+      reason: intent?.reason || null,
+      confidence: intent?.confidence || 0
+    });
+    if (intent.mode !== 'dtmf' || !intent.expectation) {
+      return { intent, expectation: null, plan_steps: intent?.plan_steps || null };
+    }
+    const payload = normalizeDigitExpectation({
+      ...intent.expectation,
+      prompt: '',
+      prompt_hint: `${callConfig.first_message || ''} ${callConfig.prompt || ''}`
+    });
+    payload.reason = intent.reason || 'initial_intent';
+    digitCollectionManager.setExpectation(callSid, payload);
+    return { intent, expectation: payload };
+  }
+
+  function buildPlanStepPrompt(expectation = {}) {
+    const basePrompt = expectation.prompt || buildDigitPrompt(expectation);
+    return expectation.plan_total_steps
+      ? `Step ${expectation.plan_step_index} of ${expectation.plan_total_steps}. ${basePrompt}`
+      : basePrompt;
+  }
+
+  async function startNextDigitPlanStep(callSid, plan, gptService = null, interactionCount = 0) {
+    if (!plan || !Array.isArray(plan.steps) || plan.index >= plan.steps.length) return;
+    if (plan.state === PLAN_STATES.INIT) {
+      updatePlanState(callSid, plan, PLAN_STATES.PLAY_FIRST_MESSAGE, { step_index: plan.index + 1 });
+    }
+    const step = plan.steps[plan.index];
+    const callConfig = callConfigurations.get(callSid);
+    const promptHint = [callConfig?.first_message, callConfig?.prompt]
+      .filter(Boolean)
+      .join(' ');
+    const payload = normalizeDigitExpectation({ ...step, prompt_hint: promptHint });
+    payload.plan_id = plan.id;
+    payload.plan_step_index = plan.index + 1;
+    payload.plan_total_steps = plan.steps.length;
+    if (plan?.capture_mode === 'ivr_gather' && ['banking', 'card'].includes(plan.group_id)) {
+      const baseRetries = Number.isFinite(payload.max_retries) ? payload.max_retries : 0;
+      payload.max_retries = Math.max(baseRetries, 3);
+    }
+
+    if (isCircuitOpen()) {
+      await handleCircuitFallback(callSid, payload, true, false, 'system');
+      return;
+    }
+
+    digitCollectionManager.setExpectation(callSid, payload);
+    updatePlanState(callSid, plan, PLAN_STATES.COLLECT_STEP, { step_index: payload.plan_step_index });
+    setCaptureActive(callSid, true, { group_id: plan.group_id });
+    if (typeof clearSilenceTimer === 'function') {
+      clearSilenceTimer(callSid);
+    }
+
+    try {
+      await db.updateCallState(callSid, 'digit_collection_requested', payload);
+    } catch (err) {
+      logger.error('digit plan step updateCallState error:', err);
+    }
+
+    const stepLabel = payload.profile || 'digits';
+    const stepTitle = formatPlanStepLabel(payload);
+    if (stepTitle) {
+      webhookService.addLiveEvent(callSid, `🧭 ${stepTitle} — awaiting input`, { force: true });
+    } else {
+      webhookService.addLiveEvent(callSid, `🔢 Collect digits (${stepLabel}) step ${payload.plan_step_index}/${payload.plan_total_steps}`, { force: true });
+    }
+
+    await flushBufferedDigits(callSid, gptService, interactionCount, 'dtmf', { allowCallEnd: true });
+    const currentExpectation = digitCollectionManager.expectations.get(callSid);
+    if (!currentExpectation) {
+      return;
+    }
+    if (currentExpectation.plan_id && currentExpectation.plan_id !== payload.plan_id) {
+      return;
+    }
+    if (currentExpectation.plan_step_index && currentExpectation.plan_step_index !== payload.plan_step_index) {
+      return;
+    }
+
+    const instruction = buildPlanStepPrompt(payload);
+    const channel = payload.channel || plan.channel || 'dtmf';
+    const captureMode = plan.capture_mode || payload.capture_mode || null;
+
+    if (channel === 'sms' && smsService) {
+      const smsPrompt = buildSmsStepPrompt(payload);
+      try {
+        const session = smsSessions.get(callSid) || await createSmsSession(callSid, payload, 'plan_step');
+        if (session) {
+          await smsService.sendSMS(session.phone, smsPrompt, null, { idempotencyKey: `${callSid}:${payload.plan_step_index}:sms-step` });
+          logDigitMetric('sms_step_prompt_sent', {
+            callSid,
+            step: payload.plan_step_index,
+            profile: payload.profile
+          });
+        }
+      } catch (err) {
+        logDigitMetric('sms_step_prompt_failed', { callSid, error: err.message });
+      }
+    }
+
+    if (gptService && channel !== 'sms') {
+      gptService.emit('gptreply', {
+        partialResponseIndex: null,
+        partialResponse: instruction,
+        personalityInfo: gptService.personalityEngine.getCurrentPersonality(),
+        adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+      }, interactionCount);
+      try {
+        gptService.updateUserContext('digit_collection_plan', 'system', `Digit plan step ${payload.plan_step_index}/${payload.plan_total_steps} (${payload.profile})`);
+      } catch (_) {}
+    }
+
+    if (channel !== 'sms' && captureMode !== 'ivr_gather') {
+      markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+        allowCallEnd: true,
+        prompt_text: instruction
+      });
+      scheduleDigitTimeout(callSid, gptService, interactionCount);
+    }
+  }
+
+  async function requestDigitCollection(callSid, args = {}, gptService = null) {
+    const initialConfig = callConfigurations.get(callSid) || {};
+    const initialFlowState = String(initialConfig.flow_state || '').trim().toLowerCase();
+    if (initialConfig.payment_in_progress === true || initialFlowState === 'payment_active') {
+      return {
+        error: 'payment_in_progress',
+        message: 'Digit capture is unavailable while payment is in progress.'
+      };
+    }
+    if (digitCollectionPlans.has(callSid)) {
+      clearDigitPlan(callSid);
+    }
+    if (isCircuitOpen()) {
+      const payload = normalizeDigitExpectation({ ...args });
+      await handleCircuitFallback(callSid, payload, true, false, 'system');
+      return { error: 'circuit_open' };
+    }
+    setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'tool_request', confidence: 1 });
+    if (typeof args.end_call_on_success !== 'boolean') {
+      args.end_call_on_success = true;
+    }
+    if (args.profile) {
+      const groupFromArg = normalizeGroupId(args.profile);
+      if (groupFromArg) {
+        const steps = buildGroupPlanSteps(groupFromArg, callConfigurations.get(callSid) || {});
+        return requestDigitCollectionPlan(callSid, {
+          steps,
+          end_call_on_success: true,
+          group_id: groupFromArg,
+          capture_mode: 'ivr_gather'
+        }, gptService);
+      }
+      const normalizedProfile = normalizeProfileId(args.profile);
+      if (!isSupportedProfile(normalizedProfile)) {
+        logDigitMetric('profile_invalid_request', { profile: args.profile });
+        args.profile = 'generic';
+      } else {
+        args.profile = normalizedProfile;
+      }
+    }
+    const callConfig = callConfigurations.get(callSid);
+    const requestedGroup = resolveGroupFromProfile(args.profile);
+    if (requestedGroup) {
+      const steps = buildGroupPlanSteps(requestedGroup, callConfig || {});
+      return requestDigitCollectionPlan(callSid, {
+        steps,
+        end_call_on_success: true,
+        group_id: requestedGroup,
+        capture_mode: 'ivr_gather'
+      }, gptService);
+    }
+    const lockedGroup = resolveLockedGroup(callConfig || {});
+    if (lockedGroup) {
+      const steps = buildGroupPlanSteps(lockedGroup, callConfig || {});
+      return requestDigitCollectionPlan(callSid, {
+        steps,
+        end_call_on_success: true,
+        group_id: lockedGroup,
+        capture_mode: 'ivr_gather'
+      }, gptService);
+    }
+    const lockedExpectation = resolveLockedExpectation(callConfig);
+    if (lockedExpectation?.profile) {
+      const requestedProfile = args.profile ? String(args.profile).toLowerCase() : null;
+      if (requestedProfile && requestedProfile !== lockedExpectation.profile) {
+        logger.warn(`Digit profile override: ${requestedProfile} -> ${lockedExpectation.profile}`);
+        webhookService.addLiveEvent(callSid, `🔒 Digit profile locked to ${lockedExpectation.profile}`, { force: true });
+      }
+      args = {
+        ...args,
+        profile: lockedExpectation.profile
+      };
+      if (typeof args.min_digits !== 'number' && typeof lockedExpectation.min_digits === 'number') {
+        args.min_digits = lockedExpectation.min_digits;
+      }
+      if (typeof args.max_digits !== 'number' && typeof lockedExpectation.max_digits === 'number') {
+        args.max_digits = lockedExpectation.max_digits;
+      }
+      if (lockedExpectation.force_exact_length) {
+        args.min_digits = lockedExpectation.force_exact_length;
+        args.max_digits = lockedExpectation.force_exact_length;
+      }
+      if (typeof args.end_call_on_success !== 'boolean' && typeof lockedExpectation.end_call_on_success === 'boolean') {
+        args.end_call_on_success = lockedExpectation.end_call_on_success;
+      }
+      if (typeof args.allow_terminator !== 'boolean' && typeof lockedExpectation.allow_terminator === 'boolean') {
+        args.allow_terminator = lockedExpectation.allow_terminator;
+      }
+      if (!args.terminator_char && lockedExpectation.terminator_char) {
+        args.terminator_char = lockedExpectation.terminator_char;
+      }
+    }
+    const promptHint = [callConfig?.first_message, callConfig?.prompt]
+      .filter(Boolean)
+      .join(' ');
+    const payload = normalizeDigitExpectation({ ...args, prompt_hint: promptHint });
+    try {
+      logDigitMetric('single_collection_requested', {
+        callSid,
+        profile: payload.profile,
+        min_digits: payload.min_digits,
+        max_digits: payload.max_digits,
+        timeout_s: payload.timeout_s,
+        max_retries: payload.max_retries
+      });
+      await db.updateCallState(callSid, 'digit_collection_requested', payload);
+      webhookService.addLiveEvent(callSid, `🔢 Collect digits (${payload.profile}): ${payload.min_digits}-${payload.max_digits}`, { force: true });
+      digitCollectionManager.setExpectation(callSid, payload);
+      if (typeof clearSilenceTimer === 'function') {
+        clearSilenceTimer(callSid);
+      }
+      await flushBufferedDigits(callSid, gptService, 0, 'dtmf', { allowCallEnd: true });
+      if (!digitCollectionManager.expectations.has(callSid)) {
+        return payload;
+      }
+      const instruction = payload.prompt || buildDigitPrompt(payload);
+      if (gptService) {
+        const reply = {
+          partialResponseIndex: null,
+          partialResponse: instruction,
+          personalityInfo: gptService.personalityEngine.getCurrentPersonality(),
+          adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+        };
+        gptService.emit('gptreply', reply, 0);
+        gptService.updateUserContext('digit_collection', 'system', `Collect digits requested (${payload.profile}): expecting ${payload.min_digits}-${payload.max_digits} digits.`);
+      }
+      markDigitPrompted(callSid, gptService, 0, 'dtmf', { allowCallEnd: true, prompt_text: instruction });
+      scheduleDigitTimeout(callSid, gptService, 0);
+    } catch (err) {
+      logger.error('collect_digits handler error:', err);
+    }
+    return payload;
+  }
+
+  async function requestDigitCollectionPlan(callSid, args = {}, gptService = null) {
+    const initialConfig = callConfigurations.get(callSid) || {};
+    const initialFlowState = String(initialConfig.flow_state || '').trim().toLowerCase();
+    if (initialConfig.payment_in_progress === true || initialFlowState === 'payment_active') {
+      return {
+        error: 'payment_in_progress',
+        message: 'Digit capture is unavailable while payment is in progress.'
+      };
+    }
+    let steps = Array.isArray(args.steps) ? args.steps : [];
+    const groupFromArgs = normalizeGroupId(args.group_id);
+    if (!steps.length && groupFromArgs) {
+      steps = buildGroupPlanSteps(groupFromArgs, callConfigurations.get(callSid) || {});
+    }
+    if (!steps.length) {
+      return { error: 'No steps provided' };
+    }
+
+    if (digitCollectionPlans.has(callSid)) {
+      clearDigitPlan(callSid);
+    }
+    if (isCircuitOpen()) {
+      const payload = normalizeDigitExpectation({ ...steps[0] });
+      await handleCircuitFallback(callSid, payload, true, false, 'system');
+      return { error: 'circuit_open' };
+    }
+    const callConfig = callConfigurations.get(callSid) || {};
+    let groupId = groupFromArgs;
+    if (groupId) {
+      const groupSteps = buildGroupPlanSteps(groupId, callConfig);
+      if (groupSteps.length) {
+        steps = groupSteps;
+      }
+    }
+    const lockedGroup = resolveLockedGroup(callConfig);
+    if (lockedGroup) {
+      const groupSteps = buildGroupPlanSteps(lockedGroup, callConfig);
+      if (groupSteps.length) {
+        steps = groupSteps;
+        groupId = lockedGroup;
+      }
+    }
+    setCallDigitIntent(callSid, { mode: 'dtmf', reason: 'tool_plan', confidence: 1 });
+    digitCollectionManager.expectations.delete(callSid);
+    clearDigitTimeout(callSid);
+    clearDigitFallbackState(callSid);
+
+    const normalizedSteps = steps.map((step) => {
+      const normalized = { ...step };
+      if (normalized.profile) {
+        const normalizedProfile = normalizeProfileId(normalized.profile);
+        if (!isSupportedProfile(normalizedProfile)) {
+          logDigitMetric('plan_step_invalid_profile', { profile: normalized.profile });
+          normalized.profile = 'generic';
+        } else {
+          normalized.profile = normalizedProfile;
+        }
+      }
+      if (!normalized.profile) {
+        const hint = [step.prompt, step.label, step.name].filter(Boolean).join(' ');
+        if (hint) {
+          const inferred = inferDigitExpectationFromText(hint, callConfig);
+          if (inferred && (inferred.confidence || 0) >= MIN_INFER_CONFIDENCE) {
+            normalized.profile = inferred.profile;
+            if (typeof normalized.min_digits !== 'number' && typeof inferred.min_digits === 'number') {
+              normalized.min_digits = inferred.min_digits;
+            }
+            if (typeof normalized.max_digits !== 'number' && typeof inferred.max_digits === 'number') {
+              normalized.max_digits = inferred.max_digits;
+            }
+            if (typeof normalized.force_exact_length !== 'number' && typeof inferred.force_exact_length === 'number') {
+              normalized.force_exact_length = inferred.force_exact_length;
+            }
+          }
+        }
+      }
+      return normalized;
+    });
+    const stepsToUse = normalizedSteps;
+    const lockedExpectation = resolveLockedExpectation(callConfig);
+    if (lockedExpectation?.profile) {
+      const mismatched = stepsToUse.some((step) => step.profile && String(step.profile).toLowerCase() !== lockedExpectation.profile);
+      if (mismatched || stepsToUse.length > 1) {
+        webhookService.addLiveEvent(callSid, `🔒 Digit profile locked to ${lockedExpectation.profile} (plan rejected)`, { force: true });
+        return { error: 'profile_locked', expected: lockedExpectation.profile };
+      }
+      if (stepsToUse.length === 1 && !stepsToUse[0].profile) {
+        stepsToUse[0].profile = lockedExpectation.profile;
+      }
+    }
+
+    const planEndOnSuccess = typeof args.end_call_on_success === 'boolean'
+      ? args.end_call_on_success
+      : true;
+    const captureMode = args.capture_mode || (groupId ? 'ivr_gather' : null);
+    const plan = {
+      id: `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      steps: stepsToUse,
+      index: 0,
+      active: true,
+      group_id: groupId,
+      capture_mode: captureMode,
+      end_call_on_success: planEndOnSuccess,
+      completion_message: typeof args.completion_message === 'string' ? args.completion_message.trim() : '',
+      created_at: new Date().toISOString(),
+      last_completed_step: null,
+      last_completed_fingerprint: null,
+      last_completed_at: null,
+      step_attempts: {},
+      state: PLAN_STATES.INIT,
+      state_updated_at: new Date().toISOString()
+    };
+
+    digitCollectionPlans.set(callSid, plan);
+    setCaptureActive(callSid, true, { group_id: groupId });
+    logDigitMetric('plan_started', {
+      callSid,
+      steps: stepsToUse.length,
+      profiles: stepsToUse.map((step) => step.profile || 'generic')
+    });
+    await db.updateCallState(callSid, 'digit_collection_plan_started', {
+      steps: stepsToUse.map((step) => step.profile || 'generic'),
+      total_steps: stepsToUse.length
+    }).catch(() => {});
+
+    const promptService = captureMode === 'ivr_gather' ? null : gptService;
+    await startNextDigitPlanStep(callSid, plan, promptService, 0);
+    if (plan.capture_mode === 'ivr_gather' && args.defer_twiml !== true) {
+      const currentExpectation = digitCollectionManager.expectations.get(callSid);
+      if (currentExpectation) {
+        const prompt = buildPlanStepPrompt(currentExpectation);
+        await sendTwilioGather(callSid, currentExpectation, { prompt });
+      }
+    }
+    return { status: 'started', steps: stepsToUse.length };
+  }
+
+  async function handleCollectionResult(callSid, collection, gptService = null, interactionCount = 0, source = 'dtmf', options = {}) {
+    recordCircuitAttempt();
+    try {
+      if (isCircuitOpen()) {
+        const expectation = digitCollectionManager.expectations.get(callSid);
+        await handleCircuitFallback(callSid, expectation, options?.allowCallEnd === true, options?.deferCallEnd === true, source);
+        return;
+      }
+      if (!collection) return;
+      if (collection.ignore) {
+        logDigitMetric('collection_ignored', {
+          callSid,
+          profile: collection.profile,
+          source: collection.source || source || 'dtmf',
+          reason: collection.reason || 'ignored'
+        });
+        return;
+      }
+      const allowCallEnd = options.allowCallEnd === true;
+      const deferCallEnd = options.deferCallEnd === true;
+      const expectation = digitCollectionManager.expectations.get(callSid);
+      const storageClass = expectation?.storage_class || 'standard';
+      const persistRawDigits = expectation?.persist_raw_digits !== false;
+      const allowSensitiveRawPersistence = expectation?.allow_sensitive_raw_persistence === true && persistRawDigits;
+      const sensitive = isSensitiveProfile(collection?.profile || expectation?.profile);
+      const shouldEndCall = allowCallEnd && expectation?.end_call_on_success !== false;
+      const expectedLabel = expectation ? buildExpectedLabel(expectation) : 'the code';
+      const stepTitle = formatPlanStepLabel(expectation);
+      const stepPrefix = stepTitle ? `${stepTitle} — ` : '';
+      const resolvedSource = collection.source || source || 'dtmf';
+      updateCaptureSessionChannel(callSid, resolvedSource, { reason: 'collection_result' });
+      const secretToken = sensitive && !allowSensitiveRawPersistence
+        ? storeSensitiveToken(callSid, collection?.profile || expectation?.profile || 'generic', collection?.digits || '', {
+          reason: collection?.accepted ? 'capture_accepted' : 'capture_attempt',
+          channel: resolvedSource
+        })
+        : null;
+      const payload = {
+        profile: collection.profile,
+        raw_digits: secretToken?.ref || (persistRawDigits ? collection.digits : null),
+        masked: collection.masked,
+        len: collection.len,
+        route: collection.route || null,
+        accepted: !!collection.accepted,
+        retries: collection.retries || 0,
+        fallback: !!collection.fallback,
+        reason: collection.reason || null,
+        heuristic: collection.heuristic || null,
+        storage_class: storageClass,
+        secret_token_ref: secretToken?.ref || null,
+        rejection_code: null
+      };
+      if (!collection.accepted && collection.reason && collection.reason !== 'incomplete' && collection.reason !== 'timeout') {
+        updateCaptureSloCounters('error');
+      }
+      const attemptCount = Math.max(
+        1,
+        Number.isFinite(collection.attempt_count)
+          ? collection.attempt_count
+          : (Number.isFinite(expectation?.attempt_count) ? expectation.attempt_count : (collection.retries || 1))
+      );
+      const planId = expectation?.plan_id;
+      if (planId && expectation?.plan_step_index && digitCollectionPlans.has(callSid)) {
+        const plan = digitCollectionPlans.get(callSid);
+        if (plan?.id === planId) {
+          if (!plan.step_attempts || typeof plan.step_attempts !== 'object') {
+            plan.step_attempts = {};
+          }
+          const stepKey = expectation.plan_step_index;
+          const currentAttempt = Number(plan.step_attempts[stepKey] || 0);
+          if (attemptCount > currentAttempt) {
+            plan.step_attempts[stepKey] = attemptCount;
+            digitCollectionPlans.set(callSid, plan);
+          }
+        }
+      }
+      const candidate = buildDigitCandidate(collection, expectation, resolvedSource);
+      collection.confidence = candidate.confidence;
+      collection.confidence_signals = candidate.signals;
+      collection.confidence_reason_codes = candidate.reasonCodes;
+      updateSessionState(callSid, { lastCandidate: candidate });
+      void emitAuditEvent(callSid, 'DigitCandidateProduced', {
+        profile: collection.profile,
+        len: collection.len,
+        source: resolvedSource,
+        confidence: collection.confidence,
+        signals: collection.confidence_signals,
+        reason: collection.reason || null,
+        masked: collection.masked
+      });
+
+    const riskCheck = evaluateCaptureRisk({
+      callSid,
+      collection,
+      expectation,
+      source: resolvedSource,
+      candidate
+    });
+    const confidenceSensitiveSources = new Set(['spoken']);
+    const lowConfidenceReject = collection.accepted
+      && candidate.confidence < 0.45
+      && confidenceSensitiveSources.has(resolvedSource);
+    const shouldRiskReject = collection.accepted && riskCheck.reject;
+    if (lowConfidenceReject || shouldRiskReject) {
+      collection.accepted = false;
+      collection.reason = lowConfidenceReject ? 'low_confidence' : 'risk_rejected';
+      collection.rejection_code = lowConfidenceReject
+        ? 'MULTI_SIGNAL_LOW_CONFIDENCE'
+        : (riskCheck.code || 'RISK_SIGNAL_REJECTED');
+      if (Array.isArray(riskCheck.reasons) && riskCheck.reasons.length) {
+        collection.confidence_reason_codes = [
+          ...(collection.confidence_reason_codes || []),
+          ...riskCheck.reasons
+        ];
+      }
+      const exp = digitCollectionManager.expectations.get(callSid);
+      if (exp) {
+        exp.retries = (exp.retries || 0) + 1;
+        collection.retries = exp.retries;
+        if (exp.retries > exp.max_retries) {
+          collection.fallback = true;
+        }
+        digitCollectionManager.expectations.set(callSid, exp);
+      }
+      logDigitMetric('capture_rejected_multi_signal', {
+        callSid,
+        profile: collection.profile,
+        source: resolvedSource,
+        rejection_code: collection.rejection_code,
+        reasons: riskCheck.reasons || []
+      });
+    }
+
+    if (collection.accepted) {
+      const fingerprint = buildCollectionFingerprint(collection, expectation);
+      const lastAccepted = recentAccepted.get(callSid);
+      if (lastAccepted && lastAccepted.fingerprint === fingerprint && Date.now() - lastAccepted.at < 2500) {
+        logDigitMetric('duplicate_accept_ignored', {
+          callSid,
+          profile: collection.profile,
+          len: collection.len,
+          source: resolvedSource
+        });
+        return;
+      }
+      recentAccepted.set(callSid, { fingerprint, at: Date.now() });
+    }
+    if (!collection.accepted) {
+      collection.rejection_code = collection.rejection_code
+        || resolveRejectionCode(collection.reason, collection.profile || expectation?.profile, resolvedSource);
+    }
+    payload.accepted = !!collection.accepted;
+    payload.reason = collection.reason || null;
+    payload.retries = collection.retries || 0;
+    payload.fallback = !!collection.fallback;
+    payload.rejection_code = collection.rejection_code || null;
+
+    try {
+      await db.updateCallState(callSid, 'digits_collected', {
+        ...payload,
+        masked_last4: collection.masked
+      });
+      await db.addCallDigitEvent({
+        call_sid: callSid,
+        source: resolvedSource,
+        profile: collection.profile,
+        digits: secretToken?.ref || (persistRawDigits ? collection.digits : null),
+        len: collection.len,
+        accepted: collection.accepted,
+        reason: collection.reason,
+        metadata: {
+          masked: collection.masked,
+          retries: collection.retries || 0,
+          attempt_count: attemptCount || collection.retries || 1,
+          route: collection.route || null,
+          heuristic: collection.heuristic || null,
+          confidence: collection.confidence,
+          confidence_signals: collection.confidence_signals,
+          confidence_reasons: collection.confidence_reason_codes,
+          rejection_code: collection.rejection_code || null,
+          channel_session_id: collection.channel_session_id || expectation?.channel_session_id || null,
+          plan_id: expectation?.plan_id || null,
+          plan_step_index: expectation?.plan_step_index || null,
+          plan_total_steps: expectation?.plan_total_steps || null,
+          storage_class: storageClass,
+          secret_token_ref: secretToken?.ref || null,
+          idempotency_key: collection.idempotency_key || null,
+          input_hash: collection.input_hash || null,
+          step_label: formatPlanStepLabel(expectation) || null,
+          prompted_at: expectation?.prompted_at || null,
+          event_timestamp: new Date().toISOString()
+        }
+      });
+    } catch (err) {
+      logger.error('Error logging digits_collected:', err);
+    }
+
+    logDigitMetric('collection_result', {
+      callSid,
+      profile: collection.profile,
+      len: collection.len,
+      accepted: collection.accepted,
+      reason: collection.reason || null,
+      rejection_code: collection.rejection_code || null,
+      retries: collection.retries || 0,
+      source: resolvedSource,
+      confidence: collection.confidence
+    });
+
+    const liveMasked = maskDigitsForPreview(collection.digits || collection.masked || '', collection.profile || expectation?.profile || 'generic');
+    const liveLabel = labelForProfile(collection.profile);
+    if (collection.reason === 'incomplete') {
+      const progressMax = expectation?.max_digits || '';
+      const progress = progressMax ? ` (${collection.len}/${progressMax})` : '';
+      webhookService.addLiveEvent(callSid, `🔢 ${stepPrefix}${liveLabel} progress: ${liveMasked}${progress}`, { force: true });
+    } else if (collection.accepted) {
+      webhookService.addLiveEvent(callSid, `✅ ${stepPrefix}${liveLabel} captured: ${liveMasked}`, { force: true });
+    } else {
+      const hint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
+      webhookService.addLiveEvent(callSid, `⚠️ ${stepPrefix}${liveLabel} invalid${hint}: ${liveMasked}`, { force: true });
+    }
+
+    if (expectation?.plan_id && expectation?.plan_step_index) {
+      const plan = digitCollectionPlans.get(callSid);
+      if (plan?.id === expectation.plan_id) {
+        if (!plan.step_stats) plan.step_stats = {};
+        const stepKey = String(expectation.plan_step_index);
+        const stepStats = plan.step_stats[stepKey] || {
+          attempts: 0,
+          failures: 0,
+          last_reason: null,
+          first_at: null,
+          last_at: null
+        };
+        stepStats.attempts += 1;
+        if (!collection.accepted) {
+          stepStats.failures += 1;
+          stepStats.last_reason = collection.reason || 'invalid';
+        } else {
+          stepStats.last_reason = 'accepted';
+        }
+        if (!stepStats.first_at) stepStats.first_at = new Date().toISOString();
+        stepStats.last_at = new Date().toISOString();
+        plan.step_stats[stepKey] = stepStats;
+        digitCollectionPlans.set(callSid, plan);
+      }
+    }
+
+    if (!collection.accepted && collection.reason === 'incomplete' && resolvedSource === 'dtmf') {
+      void emitAuditEvent(callSid, 'DigitCaptureFailed', {
+        profile: collection.profile,
+        len: collection.len,
+        source: resolvedSource,
+        reason: collection.reason,
+        confidence: collection.confidence,
+        signals: collection.confidence_signals,
+        masked: collection.masked
+      });
+      if (collection.profile === 'verification' || collection.profile === 'otp') {
+        const progress = formatOtpForDisplay(collection.digits, 'progress', expectation?.max_digits);
+        webhookService.addLiveEvent(callSid, `🔢 ${progress}`, { force: true });
+      }
+      recordCallerAffect(callSid, 'partial_input');
+      scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+      return;
+    }
+
+    const personalityInfo = gptService?.personalityEngine?.getCurrentPersonality();
+    const emitReply = (text) => {
+      if (!gptService || !text) return;
+      const reply = {
+        partialResponseIndex: null,
+        partialResponse: text,
+        personalityInfo,
+        adaptationHistory: gptService.personalityChanges?.slice(-3) || []
+      };
+      gptService.emit('gptreply', reply, interactionCount);
+      try {
+        gptService.updateUserContext('system', 'system', `Digit handling note: ${text}`);
+      } catch (_) {}
+    };
+
+    if (collection.accepted) {
+      void emitAuditEvent(callSid, 'DigitCaptureSucceeded', {
+        profile: collection.profile,
+        len: collection.len,
+        source: resolvedSource,
+        masked: collection.masked,
+        confidence: collection.confidence
+      });
+      recordIntentHistory(callSid, collection.profile);
+      const riskAction = expectation?.risk_action === 'route_to_agent';
+      transitionCaptureState(callSid, CAPTURE_EVENTS.COMPLETE, { reason: 'digits_accepted' });
+      clearDigitTimeout(callSid);
+      clearDigitFallbackState(callSid);
+      digitCollectionManager.expectations.delete(callSid);
+      if (stepTitle) {
+        webhookService.addLiveEvent(callSid, `✅ ${stepTitle} validated`, { force: true });
+      }
+      const profile = String(collection.profile || '').toLowerCase();
+      switch (profile) {
+        case 'extension':
+          break;
+        case 'verification':
+        case 'otp':
+          webhookService.addLiveEvent(callSid, `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'raw' : 'masked')}`, { force: true });
+          await db.updateCallState(callSid, 'identity_confirmed', {
+            method: 'digits',
+            note: `${collection.profile} digits confirmed (masked)`,
+            masked: collection.masked
+          }).catch(() => {});
+          await db.updateCallStatus(callSid, 'in-progress', {
+            last_otp: secretToken?.ref || (persistRawDigits ? collection.digits : null),
+            last_otp_masked: collection.masked,
+            last_otp_token: secretToken?.ref || null
+          }).catch(() => {});
+          await db.updateCallState(callSid, 'otp_captured', {
+            masked: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'account':
+          webhookService.addLiveEvent(callSid, `🏷️ Account number captured (ending ${collection.masked.slice(-4)})`, { force: true });
+          await db.updateCallState(callSid, 'account_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'zip':
+          webhookService.addLiveEvent(callSid, `📮 ZIP captured`, { force: true });
+          await db.updateCallState(callSid, 'zip_captured', {
+            masked: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'amount': {
+          const amountCents = Number(collection.digits);
+          const dollars = (amountCents / 100).toFixed(2);
+          webhookService.addLiveEvent(callSid, `💵 Amount entered: $${dollars}`, { force: true });
+          await db.updateCallState(callSid, 'amount_captured', {
+            amount_cents: amountCents,
+            amount_display: `$${dollars}`
+          }).catch(() => {});
+          break;
+        }
+        case 'account_number':
+          webhookService.addLiveEvent(callSid, '🏦 Account number captured', { force: true });
+          await db.updateCallState(callSid, 'account_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'callback_confirm':
+          webhookService.addLiveEvent(callSid, `📞 Callback number confirmed (ending ${collection.masked.slice(-4)})`, { force: true });
+          await db.updateCallState(callSid, 'callback_confirmed', {
+            masked_last4: collection.masked,
+            raw_digits: secretToken?.ref || collection.digits,
+            secret_token_ref: secretToken?.ref || null
+          }).catch(() => {});
+          break;
+        case 'card_number':
+          webhookService.addLiveEvent(callSid, `💳 Card number captured (${collection.len})`, { force: true });
+          await db.updateCallState(callSid, 'card_number_captured', {
+            card_number: secretToken?.ref || null,
+            card_number_token: secretToken?.ref || null,
+            last4: collection.digits ? collection.digits.slice(-4) : null
+          }).catch(() => {});
+          break;
+        case 'cvv':
+          webhookService.addLiveEvent(callSid, `🔐 CVV captured (${collection.len})`, { force: true });
+          await db.updateCallState(callSid, 'cvv_captured', {
+            cvv: secretToken?.ref || null,
+            cvv_token: secretToken?.ref || null
+          }).catch(() => {});
+          break;
+        case 'card_expiry':
+          webhookService.addLiveEvent(callSid, `📅 Expiry captured (${collection.masked || 'masked'})`, { force: true });
+          await db.updateCallState(callSid, 'card_expiry_captured', {
+            expiry: secretToken?.ref || null,
+            expiry_token: secretToken?.ref || null
+          }).catch(() => {});
+          break;
+        case 'ssn':
+          webhookService.addLiveEvent(callSid, '🪪 SSN captured', { force: true });
+          await db.updateCallState(callSid, 'ssn_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'dob':
+          webhookService.addLiveEvent(callSid, '🎂 DOB captured', { force: true });
+          await db.updateCallState(callSid, 'dob_captured', {
+            masked: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'routing_number':
+          webhookService.addLiveEvent(callSid, '🏦 Routing number captured', { force: true });
+          await db.updateCallState(callSid, 'routing_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'phone':
+          webhookService.addLiveEvent(callSid, '📱 Phone number captured', { force: true });
+          await db.updateCallState(callSid, 'phone_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'tax_id':
+          webhookService.addLiveEvent(callSid, '🧾 Tax ID captured', { force: true });
+          await db.updateCallState(callSid, 'tax_id_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'ein':
+          webhookService.addLiveEvent(callSid, '🏢 EIN captured', { force: true });
+          await db.updateCallState(callSid, 'ein_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'claim_number':
+          webhookService.addLiveEvent(callSid, '🧾 Claim number captured', { force: true });
+          await db.updateCallState(callSid, 'claim_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'reservation_number':
+          webhookService.addLiveEvent(callSid, '🧾 Reservation number captured', { force: true });
+          await db.updateCallState(callSid, 'reservation_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'ticket_number':
+          webhookService.addLiveEvent(callSid, '🧾 Ticket number captured', { force: true });
+          await db.updateCallState(callSid, 'ticket_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        case 'case_number':
+          webhookService.addLiveEvent(callSid, '🧾 Case number captured', { force: true });
+          await db.updateCallState(callSid, 'case_number_captured', {
+            masked_last4: collection.masked,
+            len: collection.len
+          }).catch(() => {});
+          break;
+        default:
+          webhookService.addLiveEvent(callSid, `🔢 Digits captured (${collection.len})`, { force: true });
+      }
+      const planId = expectation?.plan_id;
+      if (planId && digitCollectionPlans.has(callSid)) {
+        const plan = digitCollectionPlans.get(callSid);
+        if (plan?.id === planId && plan.active) {
+          updatePlanState(callSid, plan, PLAN_STATES.ADVANCE, { step_index: expectation.plan_step_index });
+          const fingerprint = buildCollectionFingerprint(collection, expectation);
+          if (
+            plan.last_completed_step === expectation.plan_step_index
+            && plan.last_completed_fingerprint === fingerprint
+            && plan.last_completed_at
+            && Date.now() - plan.last_completed_at < 3000
+          ) {
+            logDigitMetric('duplicate_step_ignored', {
+              callSid,
+              profile: collection.profile,
+              step: expectation.plan_step_index,
+              plan_id: planId
+            });
+            return;
+          }
+          plan.last_completed_step = expectation.plan_step_index;
+          plan.last_completed_fingerprint = fingerprint;
+          plan.last_completed_at = Date.now();
+          plan.index += 1;
+          if (plan.index < plan.steps.length) {
+            await startNextDigitPlanStep(callSid, plan, gptService, interactionCount + 1);
+            return;
+          }
+          plan.active = false;
+          updatePlanState(callSid, plan, PLAN_STATES.COMPLETE, { step_index: expectation.plan_step_index });
+          if (plan.step_stats) {
+            try {
+              await db.updateCallState(callSid, 'digit_plan_step_stats', {
+                plan_id: plan.id,
+                group_id: plan.group_id || null,
+                step_stats: plan.step_stats
+              });
+            } catch (_) {}
+          }
+          digitCollectionPlans.delete(callSid);
+          setCaptureActive(callSid, false);
+          await completeCaptureSession(callSid, 'completed', {
+            reason: 'plan_completed',
+            channel: resolvedSource
+          });
+          webhookService.addLiveEvent(callSid, '✅ Digit collection plan completed', { force: true });
+          await db.updateCallState(callSid, 'digit_collection_plan_completed', {
+            steps: plan.steps.length,
+            completed_at: new Date().toISOString()
+          }).catch(() => {});
+          if (riskAction) {
+            await routeToAgentOnRisk(callSid, expectation, collection, allowCallEnd, deferCallEnd);
+            return;
+          }
+          const planShouldEnd = allowCallEnd && plan.end_call_on_success !== false;
+          if (planShouldEnd) {
+            const completionMessage = plan.completion_message
+              || buildClosingMessage(collection.profile || expectation?.profile)
+              || closingMessage;
+            if (deferCallEnd) {
+              return;
+            }
+            await speakAndEndCall(callSid, completionMessage, 'digits_collected_plan');
+            return;
+          }
+          clearDigitIntent(callSid, 'digit_plan_completed');
+          if (gptService) {
+            const completionMessage = plan.completion_message || 'Thanks, I have all the digits I need.';
+            emitReply(completionMessage);
+          }
+          return;
+        }
+      }
+
+      if (riskAction) {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'risk_escalation' });
+        await completeCaptureSession(callSid, 'aborted', {
+          reason: 'risk_escalation',
+          channel: 'human_agent_handoff'
+        });
+        await routeToAgentOnRisk(callSid, expectation, collection, allowCallEnd, deferCallEnd);
+        return;
+      }
+      if (shouldEndCall) {
+        await completeCaptureSession(callSid, 'completed', {
+          reason: 'end_call_on_success',
+          channel: resolvedSource
+        });
+        if (deferCallEnd) {
+          return;
+        }
+        const completionMessage = buildClosingMessage(collection.profile || expectation?.profile) || closingMessage;
+        await speakAndEndCall(
+          callSid,
+          completionMessage,
+          (collection.profile === 'verification' || collection.profile === 'otp') ? 'otp_verified' : 'digits_collected'
+        );
+        return;
+      }
+      clearDigitIntent(callSid);
+      await completeCaptureSession(callSid, 'completed', {
+        reason: 'capture_confirmed',
+        channel: resolvedSource
+      });
+      const confirmation = buildConfirmationMessage(expectation || {}, collection);
+      if (confirmation) {
+        emitReply(confirmation);
+        void emitAuditEvent(callSid, 'DigitCaptureConfirmed', {
+          profile: collection.profile,
+          len: collection.len,
+          source: resolvedSource
+        });
+      }
+      return;
+    } else {
+      void emitAuditEvent(callSid, 'DigitCaptureFailed', {
+        profile: collection.profile,
+        len: collection.len,
+        source: resolvedSource,
+        reason: collection.reason,
+        confidence: collection.confidence,
+        signals: collection.confidence_signals,
+        masked: collection.masked
+      });
+      const reasonHint = collection.reason ? ` (${collection.reason.replace(/_/g, ' ')})` : '';
+      webhookService.addLiveEvent(callSid, `⚠️ Invalid digits (${collection.len})${reasonHint}; retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`, { force: true });
+      if (collection.fallback) {
+        const session = captureSessions.get(callSid);
+        if (session) {
+          session.fallback_count = (session.fallback_count || 0) + 1;
+          session.updated_at = Date.now();
+          captureSessions.set(callSid, session);
+        }
+        if (expectation?.allow_sms_fallback && shouldUseSmsFallback(expectation, collection)) {
+          const smsSession = await createSmsSession(callSid, expectation, collection.reason || 'fallback');
+          if (smsSession) {
+            transitionCaptureState(callSid, CAPTURE_EVENTS.FALLBACK, { reason: 'sms_fallback' });
+            expectation.sms_fallback_used = true;
+            expectation.channel = 'sms';
+            digitCollectionManager.expectations.set(callSid, expectation);
+            webhookService.addLiveEvent(callSid, '📩 SMS fallback sent for digit capture', { force: true });
+            void emitAuditEvent(callSid, 'DigitCaptureAborted', {
+              profile: expectation.profile,
+              source: resolvedSource,
+              reason: 'sms_fallback'
+            });
+            if (allowCallEnd) {
+              if (!deferCallEnd) {
+                await speakAndEndCall(callSid, smsFallbackMessage, 'digits_sms_fallback');
+              }
+              return;
+            }
+            emitReply(smsFallbackMessage);
+            return;
+          }
+        }
+        if (expectation?.escalation_policy === 'route_to_agent') {
+          await completeCaptureSession(callSid, 'aborted', {
+            reason: 'high_risk_policy',
+            channel: 'human_agent_handoff'
+          });
+          await routeToAgentOnRisk(
+            callSid,
+            { ...expectation, risk_reason: 'high_risk_policy' },
+            collection,
+            allowCallEnd,
+            deferCallEnd
+          );
+          return;
+        }
+        const failureMessage = expectation?.failure_message || callEndMessages.failure || 'I could not verify the digits. Thank you for your time.';
+        const allowSpokenFallback = expectation?.allow_spoken_fallback !== false;
+        const shouldFallbackToVoice = fallbackToVoiceOnFailure && allowSpokenFallback;
+        const fallbackMsg = shouldFallbackToVoice
+          ? 'I could not verify the digits. I will continue the call without keypad entry.'
+          : failureMessage;
+        webhookService.addLiveEvent(callSid, `⏳ No valid digits; ${shouldFallbackToVoice ? 'switching to voice' : 'ending call'}`, { force: true });
+        transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, {
+          reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries'
+        });
+        digitCollectionManager.expectations.delete(callSid);
+        clearDigitTimeout(callSid);
+        clearDigitFallbackState(callSid);
+        clearDigitPlan(callSid);
+        await completeCaptureSession(callSid, 'aborted', {
+          reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries',
+          channel: shouldFallbackToVoice ? 'spoken' : resolvedSource
+        });
+        await db.updateCallState(callSid, 'digit_collection_fallback', {
+          profile: expectation?.profile || collection?.profile || null,
+          source: resolvedSource,
+          reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries',
+          fallback_reason_code: buildFallbackReasonCode(
+            shouldFallbackToVoice ? 'voice' : resolvedSource,
+            shouldFallbackToVoice ? 'voice_fallback' : 'max_retries'
+          )
+        }).catch(() => {});
+        void emitAuditEvent(callSid, 'DigitCaptureAborted', {
+          profile: expectation?.profile || collection.profile,
+          source: resolvedSource,
+          reason: shouldFallbackToVoice ? 'voice_fallback' : 'max_retries'
+        });
+        if (shouldFallbackToVoice) {
+          clearDigitIntent(callSid, 'digit_collection_failed');
+          emitReply(fallbackMsg);
+          return;
+        }
+        if (allowCallEnd) {
+          if (deferCallEnd) {
+            return;
+          }
+          await speakAndEndCall(callSid, failureMessage, 'digit_collection_failed');
+          return;
+        }
+        emitReply(fallbackMsg);
+      } else {
+        transitionCaptureState(callSid, CAPTURE_EVENTS.PROMPT_RETRY, {
+          reason: collection.reason || 'invalid'
+        });
+        const retryStage = resolveRetryStage(expectation || {}, attemptCount || collection.retries || 1);
+        if (retryStage === 'final') {
+          transitionCaptureState(callSid, CAPTURE_EVENTS.FINAL_ATTEMPT_WARN, {
+            reason: 'invalid_final_attempt'
+          });
+        }
+        const affect = recordCallerAffect(callSid, collection.reason || 'invalid');
+        const channelConditions = getChannelConditions(callSid, resolvedSource);
+        const qualityScore = channelConditions?.qualityScore ?? null;
+        const policy = buildRetryPolicy({
+          reason: collection.reason || 'invalid',
+          attempt: attemptCount || collection.retries || 1,
+          source: resolvedSource,
+          expectation,
+          affect,
+          session: getSessionState(callSid),
+          health: getSystemHealth(callSid),
+          qualityScore,
+          conditions: channelConditions
+        });
+        const pacingDelay = attemptCount >= 2 ? 250 : 0;
+        if (pacingDelay > 0) {
+          policy.delayMs = Math.max(policy.delayMs || 0, pacingDelay);
+        }
+        if (affect?.patience === 'low') {
+          policy.delayMs = Math.max(policy.delayMs || 0, 350);
+        }
+        if (channelConditions?.poor) {
+          policy.delayMs = Math.max(policy.delayMs || 0, 400);
+          if (policy.prompt && !/connection/i.test(policy.prompt)) {
+            policy.prompt = `I may be losing you. ${policy.prompt}`;
+          }
+        }
+        const adaptiveReason = isAdaptiveRepromptReason(collection.reason);
+        let prompt = adaptiveReason
+          ? buildAdaptiveReprompt(expectation || {}, collection.reason, attemptCount || collection.retries || 1)
+          : policy.prompt;
+        if (!prompt) {
+          prompt = policy.prompt;
+        }
+        if (!prompt) {
+          const repromptAttempt = attemptCount || collection.retries || 1;
+          if (collection.reason === 'too_short' || collection.reason === 'incomplete') {
+            prompt = chooseReprompt(expectation || {}, 'incomplete', repromptAttempt)
+              || `Please enter the ${expectedLabel} now.`;
+          } else {
+            prompt = chooseReprompt(expectation || {}, 'invalid', repromptAttempt)
+              || `Please enter the ${expectedLabel} now.`;
+          }
+        }
+        if (policy.forceDtmfOnly && expectation) {
+          expectation.allow_spoken_fallback = false;
+          digitCollectionManager.expectations.set(callSid, expectation);
+        }
+        if (policy.delayMs && gptService) {
+          await sleep(policy.delayMs);
+        }
+        emitReply(prompt);
+        if (gptService) {
+          const resetBufferOnReprompt = expectation?.reset_on_interrupt === true
+            || ['spam_pattern', 'too_long'].includes(String(collection.reason || '').toLowerCase());
+          markDigitPrompted(callSid, gptService, interactionCount, 'dtmf', {
+            prompt_text: prompt,
+            reset_buffer: resetBufferOnReprompt
+          });
+          scheduleDigitTimeout(callSid, gptService, interactionCount + 1);
+        }
+      }
+    }
+
+    const summary = collection.accepted
+      ? collection.route
+        ? `✅ Digits accepted • routed: ${collection.route}`
+        : (collection.profile === 'verification' || collection.profile === 'otp')
+          ? `✅ ${formatOtpForDisplay(collection.digits, showRawDigitsLive ? 'raw' : 'masked')}`
+          : `✅ Digits accepted: ${formatDigitsGeneral(collection.digits, collection.masked, 'live')}`
+      : collection.fallback
+        ? '⚠️ Digits failed after retries'
+        : `⚠️ Invalid digits (${collection.len}); retry ${collection.retries}/${digitCollectionManager.expectations.get(callSid)?.max_retries || 0}`;
+    webhookService.addLiveEvent(callSid, summary, { force: true });
+    } catch (err) {
+      recordCircuitError();
+      logDigitMetric('digit_service_error', { callSid, error: err.message });
+      throw err;
+    }
+  }
+
+  function clearCallState(callSid) {
+    void completeCaptureSession(callSid, 'aborted', { reason: 'call_state_cleared' });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.RESET, { reason: 'call_clear' });
+    captureLifecycle.delete(callSid);
+    digitCollectionManager.expectations.delete(callSid);
+    clearDigitPlan(callSid);
+    clearDigitTimeout(callSid);
+    clearDigitFallbackState(callSid);
+    lastDtmfTimestamps.delete(callSid);
+    pendingDigits.delete(callSid);
+    recentAccepted.delete(callSid);  // Add missing cleanup to prevent memory leak
+    for (const key of recentInputEvents.keys()) {
+      if (key.startsWith(`${callSid}:`)) {
+        recentInputEvents.delete(key);
+      }
+    }
+    for (const key of recentCrossChannelInputs.keys()) {
+      if (key.startsWith(`${callSid}:`)) {
+        recentCrossChannelInputs.delete(key);
+      }
+    }
+    clearIdempotencyForCall(callSid);
+    // Keep vault entries until TTL expiry so operator-facing post-call messages
+    // can still resolve short-lived token refs to display digits in Telegram.
+    captureSessions.delete(callSid);
+    sessionState.delete(callSid);
+    intentHistory.delete(callSid);
+    riskSignals.delete(callSid);
+    clearSmsSession(callSid);
+    const callConfig = callConfigurations.get(callSid);
+    if (callConfig) {
+      if (callConfig.digit_intent?.mode === 'dtmf') {
+        callConfig.digit_intent = { mode: 'normal', reason: 'call_end', confidence: 1 };
+      }
+      if (typeof setCallFlowState === 'function') {
+        setCallFlowState(
+          callSid,
+          {
+            flow_state: 'normal',
+            reason: 'call_end',
+            call_mode: callConfig.call_mode === 'dtmf_capture' ? 'normal' : callConfig.call_mode,
+            digit_capture_active: false,
+            flow_state_updated_at: new Date().toISOString()
+          },
+          { callConfig, source: 'digit.clearCallState' }
+        );
+      } else {
+        callConfig.digit_capture_active = false;
+        if (callConfig.call_mode === 'dtmf_capture') {
+          callConfig.call_mode = 'normal';
+        }
+        callConfig.flow_state = 'normal';
+        callConfig.flow_state_reason = 'call_end';
+        callConfig.flow_state_updated_at = new Date().toISOString();
+      }
+      callConfigurations.set(callSid, callConfig);
+    }
+    logDigitMetric('call_state_cleared', { callSid, timestamp: Date.now() });
+  }
+
+  async function handleIncomingSms(from, body) {
+    const session = getSmsSessionByPhone(from);
+    if (!session || !session.active) {
+      return { handled: false };
+    }
+    updateCaptureSessionChannel(session.callSid, 'secure_sms_link', { reason: 'sms_reply' });
+    const digits = parseDigitsFromText(body);
+    if (!digits) {
+      if (smsService) {
+        await smsService.sendSMS(session.phone, 'Please reply with digits only.', null, {
+          idempotencyKey: `${session.callSid}:sms-nodigits:${Date.now()}`
+        });
+      }
+      return { handled: true, reason: 'no_digits' };
+    }
+    const callSid = session.callSid;
+    if (!digitCollectionManager.expectations.has(callSid)) {
+      digitCollectionManager.setExpectation(callSid, { ...session.expectation, channel: 'sms' });
+    }
+    const attemptId = digitCollectionManager.expectations.get(callSid)?.attempt_id
+      || session.expectation?.attempt_id
+      || null;
+    const collection = digitCollectionManager.recordDigits(callSid, digits, {
+      source: 'sms',
+      timestamp: Date.now(),
+      full_input: true,
+      attempt_id: attemptId,
+      plan_id: session.expectation?.plan_id || null,
+      plan_step_index: session.expectation?.plan_step_index || null,
+      channel_session_id: digitCollectionManager.expectations.get(callSid)?.channel_session_id || null
+    });
+    await handleCollectionResult(callSid, collection, null, 0, 'sms', { allowCallEnd: false, deferCallEnd: true });
+    session.attempts += 1;
+    smsSessions.set(callSid, session);
+    const reply = buildSmsReplyForResult(collection);
+    if (smsService && reply) {
+      await smsService.sendSMS(session.phone, reply, null, {
+        idempotencyKey: `${callSid}:sms-reply:${session.attempts}`
+      });
+    }
+    if (collection.accepted) {
+      const plan = digitCollectionPlans.get(callSid);
+      if (!plan || !plan.active) {
+        clearSmsSession(callSid);
+      }
+    } else if (collection.fallback) {
+      clearSmsSession(callSid);
+      digitCollectionManager.expectations.delete(callSid);
+    }
+    return { handled: true, collection };
+  }
+
+  async function handleSecureCaptureInput({ callSid, tokenRef, digits, source = 'link' } = {}) {
+    const validation = validateSecureCaptureToken(callSid, tokenRef);
+    if (!validation.ok) {
+      return {
+        ok: false,
+        status: validation.reason === 'token_expired' ? 410 : 401,
+        code: validation.reason
+      };
+    }
+    const resolvedCallSid = validation.callSid;
+    const cleanedDigits = parseDigitsFromText(digits);
+    if (!cleanedDigits) {
+      return {
+        ok: false,
+        status: 400,
+        code: 'invalid_digits'
+      };
+    }
+
+    let expectation = digitCollectionManager.expectations.get(resolvedCallSid);
+    if (!expectation) {
+      const smsSession = smsSessions.get(resolvedCallSid);
+      if (smsSession?.active && smsSession.expectation) {
+        digitCollectionManager.setExpectation(resolvedCallSid, {
+          ...smsSession.expectation,
+          channel: 'link'
+        });
+        expectation = digitCollectionManager.expectations.get(resolvedCallSid);
+      }
+    }
+
+    if (!expectation) {
+      return {
+        ok: false,
+        status: 410,
+        code: 'session_expired'
+      };
+    }
+
+    if (!canAcceptCaptureInput(resolvedCallSid)) {
+      transitionCaptureState(resolvedCallSid, CAPTURE_EVENTS.START_COLLECT, {
+        reason: 'secure_link_resume'
+      });
+    }
+    updateCaptureSessionChannel(resolvedCallSid, 'secure_sms_link', {
+      reason: 'secure_link_submit'
+    });
+    const collection = digitCollectionManager.recordDigits(resolvedCallSid, cleanedDigits, {
+      source,
+      timestamp: Date.now(),
+      full_input: true,
+      attempt_id: expectation?.attempt_id || null,
+      plan_id: expectation?.plan_id || null,
+      plan_step_index: expectation?.plan_step_index || null,
+      channel_session_id: expectation?.channel_session_id || null
+    });
+    if (collection?.ignore) {
+      return {
+        ok: true,
+        duplicate: collection.reason === 'idempotent_duplicate',
+        state: getCaptureState(resolvedCallSid),
+        accepted: false,
+        code: collection.reason || 'ignored'
+      };
+    }
+    await handleCollectionResult(
+      resolvedCallSid,
+      collection,
+      null,
+      0,
+      source,
+      { allowCallEnd: false, deferCallEnd: true }
+    );
+    if (collection.accepted) {
+      const plan = digitCollectionPlans.get(resolvedCallSid);
+      if (!plan || !plan.active) {
+        clearSmsSession(resolvedCallSid);
+      }
+    }
+    if (collection.fallback) {
+      clearSmsSession(resolvedCallSid);
+    }
+    return {
+      ok: true,
+      accepted: collection.accepted === true,
+      fallback: collection.fallback === true,
+      retries: collection.retries || 0,
+      reason: collection.reason || null,
+      state: getCaptureState(resolvedCallSid)
+    };
+  }
+
+  return {
+    expectations: digitCollectionManager.expectations,
+    buildAdaptiveReprompt,
+    buildDigitPrompt,
+    buildTimeoutPrompt,
+    buildSoftTimeoutPrompt,
+    buildTwilioGatherTwiml,
+    buildPlanStepPrompt,
+    sendTwilioGather,
+    clearCallState,
+    clearDigitFallbackState,
+    clearDigitPlan,
+    clearDigitTimeout,
+    determineDigitIntent,
+    handleIncomingSms,
+    formatDigitsGeneral,
+    formatOtpForDisplay,
+    getExpectation: (callSid) => digitCollectionManager.expectations.get(callSid),
+    getCaptureSession: (callSid) => captureSessions.get(callSid) || null,
+    getCaptureSloSnapshot: () => computeCaptureSloSnapshot(),
+    validateSecureCaptureToken,
+    resolveSensitiveTokenRef,
+    handleSecureCaptureInput,
+    getOtpContext,
+    handleCollectionResult,
+    requestPhonePayment,
+    buildTwilioPaymentTwiml,
+    handleTwilioPaymentCompletion,
+    handleTwilioPaymentStatus,
+    reconcilePaymentSession,
+    hasExpectation: (callSid) => digitCollectionManager.expectations.has(callSid),
+    getCaptureState,
+    inferDigitExpectationFromText,
+    markDigitPrompted,
+    updatePromptDelay,
+    maskOtpForExternal,
+    normalizeDigitExpectation,
+    bufferDigits,
+    flushBufferedDigits,
+    prepareInitialExpectation,
+    recordDigits: (callSid, digits, meta) => digitCollectionManager.recordDigits(callSid, digits, meta),
+    requestDigitCollection,
+    requestDigitCollectionPlan,
+    setCaptureActive,
+    getPlan: (callSid) => digitCollectionPlans.get(callSid),
+    getLockedGroup: resolveLockedGroup,
+    updatePlanState,
+    __test: {
+      buildAdaptiveReprompt,
+      buildRepromptDetail,
+      buildTimeoutPrompt,
+      isAdaptiveRepromptReason,
+      normalizeCaptureText,
+      resolveGroupFromPrompt,
+      resolveExplicitGroup,
+      resolveLockedGroup,
+      scoreGroupMatch
+    },
+    scheduleDigitTimeout,
+    setExpectation: (callSid, params) => digitCollectionManager.setExpectation(callSid, params),
+    isFallbackActive: (callSid) => digitFallbackStates.get(callSid)?.active === true,
+    hasPlan: (callSid) => digitCollectionPlans.has(callSid),
+    buildClosingMessage
+  };
+}
+
+module.exports = {
+  createDigitCollectionService
+};

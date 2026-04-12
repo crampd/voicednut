@@ -1,107 +1,223 @@
-require('dotenv').config();
 const { Buffer } = require('node:buffer');
 const EventEmitter = require('events');
 const fetch = require('node-fetch');
+const config = require('../config');
+const { sanitizeVoiceOutputText } = require('../utils/voiceOutputGuard');
+
+const TTS_CACHE_TTL_MS = 15 * 60 * 1000;
+const TTS_CACHE_MAX_ITEMS = 200;
+const ttsCache = new Map(); // key -> { audio, at }
+const ttsInflight = new Map(); // key -> Promise
+
+function buildTtsCacheKey(text, voiceModel, audioSpec = {}) {
+  const cleanText = String(text || '').trim();
+  const encoding = String(audioSpec.encoding || 'mulaw').toLowerCase();
+  const sampleRate = Number(audioSpec.sampleRate) || 8000;
+  const container = String(audioSpec.container || 'none').toLowerCase();
+  return `${voiceModel || 'default'}::${encoding}:${sampleRate}:${container}::${cleanText}`;
+}
+
+function pruneTtsCache() {
+  if (ttsCache.size <= TTS_CACHE_MAX_ITEMS) return;
+  const entries = [...ttsCache.entries()].sort((a, b) => a[1].at - b[1].at);
+  const overflow = entries.length - TTS_CACHE_MAX_ITEMS;
+  for (let i = 0; i < overflow; i += 1) {
+    ttsCache.delete(entries[i][0]);
+  }
+}
 
 class TextToSpeechService extends EventEmitter {
-  constructor() {
+  constructor(options = {}) {
     super();
-    this.nextExpectedIndex = 0;
-    this.speechBuffer = {};
-    this.defaultVoiceModel = process.env.VOICE_MODEL || 'aura-asteria-en';
-    this.activeVoiceModel = this.defaultVoiceModel;
+    this.voiceModel = options.voiceModel || null;
+    this.encoding = String(options.encoding || 'mulaw')
+      .toLowerCase()
+      .trim();
+    this.sampleRate = Number.isFinite(Number(options.sampleRate))
+      ? Number(options.sampleRate)
+      : 8000;
+    this.container = String(options.container || 'none')
+      .toLowerCase()
+      .trim();
     
     // Validate required environment variables
-    if (!process.env.DEEPGRAM_API_KEY) {
+    if (!config.deepgram.apiKey) {
       console.error('❌ DEEPGRAM_API_KEY is not set');
     }
-    if (!process.env.VOICE_MODEL) {
+    if (!config.deepgram.voiceModel) {
       console.warn('⚠️ VOICE_MODEL not set, using default');
     }
     
-    console.log(`🎵 TTS Service initialized with voice model: ${this.defaultVoiceModel}`);
+    const activeVoice = this.voiceModel || config.deepgram.voiceModel || 'default';
+    console.log(`🎵 TTS Service initialized with voice model: ${activeVoice}`);
   }
 
-  setVoiceModel(voiceModel) {
-    if (voiceModel && typeof voiceModel === 'string' && voiceModel.trim().length > 0) {
-      this.activeVoiceModel = voiceModel.trim();
-      console.log(`🎙️ TTS voice model set to: ${this.activeVoiceModel}`.cyan);
+  async fetchSpeechAudio(text, voiceModel, audioSpec = {}) {
+    const encoding = String(audioSpec.encoding || this.encoding || 'mulaw')
+      .toLowerCase()
+      .trim();
+    const sampleRate = Number.isFinite(Number(audioSpec.sampleRate))
+      ? Number(audioSpec.sampleRate)
+      : this.sampleRate;
+    const container = String(audioSpec.container || this.container || 'none')
+      .toLowerCase()
+      .trim();
+    const query = new URLSearchParams({
+      model: voiceModel,
+      encoding,
+      sample_rate: String(sampleRate),
+      container,
+    });
+    const url = `https://api.deepgram.com/v1/speak?${query.toString()}`;
+    console.log(`🌐 Making TTS request to: ${url}`.gray);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Token ${config.deepgram.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+      timeout: 10000
+    });
+
+    console.log(`📡 TTS Response status: ${response.status}`.blue);
+    if (response.status !== 200) {
+      const errorText = await response.text();
+      console.error('❌ Deepgram TTS error:');
+      console.error('Status:', response.status);
+      console.error('Status Text:', response.statusText);
+      console.error('Error Response:', errorText);
+      throw new Error(`TTS API error: ${response.status} - ${response.statusText}`);
     }
+
+    const audioBuffer = await response.buffer();
+    return Buffer.from(audioBuffer).toString('base64');
   }
 
-  resetVoiceModel() {
-    this.activeVoiceModel = this.defaultVoiceModel;
-  }
+  async generate(gptReply, interactionCount, options = {}) {
+    const { partialResponseIndex, partialResponse } = gptReply || {};
+    const silent = !!options.silent;
 
-  async generate(gptReply, interactionCount) {
-    const { partialResponseIndex, partialResponse } = gptReply;
-
-    if (!partialResponse) { 
+    if (!partialResponse) {
       console.warn('⚠️ TTS: No partialResponse provided');
-      return; 
+      return { ok: false, reason: 'missing_partial_response' };
     }
 
-    console.log(`🎵 TTS generating for: "${partialResponse.substring(0, 50)}..."`.cyan);
+    const sanitized = sanitizeVoiceOutputText(partialResponse, {
+      maxChars: Number(options.maxChars || config.openRouter?.voiceOutputMaxChars || 260),
+      fallbackText: 'Let me help you with that.'
+    });
+    const speechText = String(sanitized.text || '').trim();
+    if (!speechText) {
+      console.warn('⚠️ TTS: Sanitized response is empty');
+      return { ok: false, reason: 'empty_speech_text' };
+    }
+
+    console.log(`🎵 TTS generating for: "${speechText.substring(0, 50)}..."`.cyan);
 
     try {
-      const voiceModel = this.activeVoiceModel || this.defaultVoiceModel;
-      const url = `https://api.deepgram.com/v1/speak?model=${voiceModel}&encoding=mulaw&sample_rate=8000&container=none`;
-      
-      console.log(`🌐 Making TTS request to: ${url}`.gray);
-      
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          text: partialResponse,
-        }),
-        timeout: 10000 // 10 second timeout
-      });
-
-      console.log(`📡 TTS Response status: ${response.status}`.blue);
-
-      if (response.status === 200) {
-        try {
-          const blob = await response.blob();
-          const audioArrayBuffer = await blob.arrayBuffer();
-          const base64String = Buffer.from(audioArrayBuffer).toString('base64');
-          
-          console.log(`✅ TTS audio generated, size: ${base64String.length} chars`.green);
-          
-          this.emit('speech', partialResponseIndex, base64String, partialResponse, interactionCount);
-        } catch (processingError) {
-          console.error('❌ Error processing TTS audio response:', processingError);
-          throw processingError;
+      const voiceModel = options.voiceModel || this.voiceModel || config.deepgram.voiceModel || 'aura-2-andromeda-en';
+      const audioSpec = {
+        encoding: options.encoding || this.encoding,
+        sampleRate: options.sampleRate || this.sampleRate,
+        container: options.container || this.container,
+      };
+      const key = buildTtsCacheKey(speechText, voiceModel, audioSpec);
+      const cached = ttsCache.get(key);
+      const now = Date.now();
+      if (cached && now - cached.at < TTS_CACHE_TTL_MS) {
+        if (!silent) {
+          this.emit('speech', partialResponseIndex, cached.audio, speechText, interactionCount);
         }
-      } else {
-        const errorText = await response.text();
-        console.error('❌ Deepgram TTS error:');
-        console.error('Status:', response.status);
-        console.error('Status Text:', response.statusText);
-        console.error('Error Response:', errorText);
-        
-        // Try to parse error details
-        try {
-          const errorData = JSON.parse(errorText);
-          console.error('Error Details:', errorData);
-        } catch (parseError) {
-          console.error('Could not parse error response as JSON');
-        }
-        
-        throw new Error(`TTS API error: ${response.status} - ${response.statusText}`);
+        return {
+          ok: true,
+          cached: true,
+          voiceModel,
+          text: speechText
+        };
       }
+      if (cached) {
+        ttsCache.delete(key);
+      }
+
+      if (ttsInflight.has(key)) {
+        const sharedAudio = await ttsInflight.get(key);
+        if (sharedAudio && !silent) {
+          this.emit('speech', partialResponseIndex, sharedAudio, speechText, interactionCount);
+        }
+        return {
+          ok: Boolean(sharedAudio),
+          shared: true,
+          voiceModel,
+          text: speechText
+        };
+      }
+
+      const requestPromise = (async () => {
+        try {
+          const base64String = await this.fetchSpeechAudio(
+            speechText,
+            voiceModel,
+            audioSpec,
+          );
+          ttsCache.set(key, { audio: base64String, at: Date.now() });
+          pruneTtsCache();
+          return base64String;
+        } catch (primaryError) {
+          const fallbackVoice = config.deepgram.voiceModel || 'aura-2-andromeda-en';
+          if (fallbackVoice && fallbackVoice !== voiceModel) {
+            try {
+              const base64String = await this.fetchSpeechAudio(
+                speechText,
+                fallbackVoice,
+                audioSpec,
+              );
+              const fallbackKey = buildTtsCacheKey(
+                speechText,
+                fallbackVoice,
+                audioSpec,
+              );
+              ttsCache.set(fallbackKey, { audio: base64String, at: Date.now() });
+              pruneTtsCache();
+              return base64String;
+            } catch (fallbackError) {
+              throw fallbackError;
+            }
+          }
+          throw primaryError;
+        }
+      })();
+
+      ttsInflight.set(key, requestPromise);
+      const base64String = await requestPromise.finally(() => {
+        ttsInflight.delete(key);
+      });
+      if (base64String && !silent) {
+        console.log(`✅ TTS audio generated, size: ${base64String.length} chars`.green);
+        this.emit('speech', partialResponseIndex, base64String, speechText, interactionCount);
+      }
+      return {
+        ok: Boolean(base64String),
+        voiceModel,
+        text: speechText
+      };
     } catch (err) {
       console.error('❌ Error occurred in TextToSpeech service:', err.message);
       console.error('Error stack:', err.stack);
-      
-      // Emit an error event so the caller can handle it
-      this.emit('error', err);
-      
-      // Don't throw the error to prevent crashing the call
-      // Instead, try to continue without this audio
+
+      // Keep runtime behavior deterministic:
+      // - Throw only when caller explicitly asks for strict failure semantics.
+      // - Emit error only when a listener exists to avoid unhandled EventEmitter errors.
+      if (options.throwOnError === true) {
+        throw err;
+      }
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', err);
+      }
+      return {
+        ok: false,
+        error: err
+      };
     }
   }
 }

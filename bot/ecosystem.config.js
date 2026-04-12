@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'BOT',
       script: './bot.js',
-      cwd: '/home/ubuntu/voicednut/bot',
+      cwd: '/home/ubuntu/voxly/bot',
       instances: 1, // ✅ Single instance
       exec_mode: 'fork',
 
@@ -15,9 +15,9 @@ module.exports = {
       max_restarts: 5,
       min_uptime: '10s',
 
-      log_file: '/home/ubuntu/voicednut/logs/bot/combined.log',
-      out_file: '/home/ubuntu/voicednut/logs/bot/out.log',
-      error_file: '/home/ubuntu/voicednut/logs/bot/error.log',
+      log_file: '/home/ubuntu/voxly/logs/bot/combined.log',
+      out_file: '/home/ubuntu/voxly/logs/bot/out.log',
+      error_file: '/home/ubuntu/voxly/logs/bot/error.log',
       log_type: 'json',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
 
@@ -35,17 +35,6 @@ module.exports = {
       merge_logs: true,
       time: true,
       autorestart: true,
-
-      env_production: {
-        NODE_ENV: 'production',
-        PORT: 1337,
-      },
-
-      env_development: {
-        NODE_ENV: 'development',
-        watch: true
-      },
-
       crash_restart_delay: 1000
     }
   ]

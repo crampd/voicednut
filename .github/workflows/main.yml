@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -20,30 +21,64 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
           script: |
-            # Ensure PM2 is in PATH
-            export PATH=$PATH:/home/ubuntu/.npm-global/bin
+            set -euo pipefail
 
-            # Navigate to project root
-            cd /home/ubuntu/voicednut
+            # Ensure PM2 is available in non-interactive SSH shell
+            export PATH=$PATH:/home/ubuntu/.nvm/versions/node/v20.20.0/bin
 
-            # Pull latest changes
-            git pull origin main
+            DEPLOY_ROOT=/home/ubuntu/voxly
+            RELEASES_ROOT=/home/ubuntu/voxly-releases
+            RELEASE_DIR="$RELEASES_ROOT/${{ github.sha }}"
+            REPO_URL=https://github.com/voxsprint/voicednut.git
 
-            # Kill PM2 daemon and delete all processes
-            pm2 kill
-            pm2 delete all
+            mkdir -p "$RELEASES_ROOT" "$DEPLOY_ROOT/api" "$DEPLOY_ROOT/bot"
+            rm -rf "$RELEASE_DIR"
+
+            # Build a clean sparse checkout for this exact revision so deploys do not depend
+            # on any drift or local edits inside the long-lived EC2 checkout.
+            git clone --filter=blob:none --no-checkout "$REPO_URL" "$RELEASE_DIR"
+            cd "$RELEASE_DIR"
+            git sparse-checkout init --cone
+            git sparse-checkout set api bot
+            git checkout --force "${{ github.sha }}"
+
+            # Sync only the deployable server code into the live path while preserving
+            # server-managed env files, logs, and installed dependencies until reinstall.
+            rsync -a --delete \
+              --exclude='.env' \
+              --exclude='.env.*' \
+              --exclude='node_modules' \
+              --exclude='logs' \
+              "$RELEASE_DIR/api/" "$DEPLOY_ROOT/api/"
+            rsync -a --delete \
+              --exclude='.env' \
+              --exclude='.env.*' \
+              --exclude='node_modules' \
+              --exclude='logs' \
+              "$RELEASE_DIR/bot/" "$DEPLOY_ROOT/bot/"
+
+            # Remove any stale Mini App files left over from older full-repo deployments.
+            rm -rf "$DEPLOY_ROOT/miniapp"
+
+            # Reset PM2 to a known-empty state without failing when nothing is running.
+            pm2 delete all || true
+            pm2 kill || true
 
             # Deploy API
-            cd api
+            cd "$DEPLOY_ROOT/api"
             npm install
-            npm run db:migrate
+            npm run parity:providers
             pm2 startOrRestart ecosystem.config.js --env production
 
             # Deploy Bot
-            cd ../bot
+            cd "$DEPLOY_ROOT/bot"
             npm install
             pm2 startOrRestart ecosystem.config.js --env production
 
             # Save PM2 process list
             pm2 save
+
+            # Keep only the most recent release snapshots.
+            ls -1dt "$RELEASES_ROOT"/* 2>/dev/null | tail -n +4 | xargs -r rm -rf

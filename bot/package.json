@@ -1,12 +1,13 @@
 {
   "name": "bot",
   "version": "2.0.0",
-  "description": "AI-powered voice calling bot with Mini App interface",
+  "description": "AI-powered voice calling bot",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js",
-    "setup": "node setup-env.js"
+    "start": "node .",
+    "dev": "nodemon .",
+    "setup": "node setup-env.js",
+    "test": "echo \"No tests configured\""
   },
   "dependencies": {
     "@grammyjs/conversations": "^1.2.0",
@@ -28,7 +29,6 @@
     "telegram-bot",
     "voice-calls",
     "ai",
-    "miniapp",
     "sms"
   ],
   "author": "Tunde Ednut",

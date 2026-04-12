@@ -1,69 +1,102 @@
 const { InlineKeyboard } = require('grammy');
-const { getUser, isAdmin } = require('../db/db');
-const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
 const config = require('../config');
+const { getAccessProfile } = require('../utils/capabilities');
+const { cancelActiveFlow, resetSession } = require('../utils/sessionState');
+const { escapeHtml, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 
-module.exports = (bot) => {
-    // Menu command
-    bot.command('menu', async (ctx) => {
-        try {
-            // Check user authorization
-            await cancelActiveFlow(ctx, 'command:/menu');
-            resetSession(ctx);
+function getMiniAppLaunchUrl() {
+    const configured = String(config.miniApp?.url || '').trim();
+    if (configured) return configured;
+    try {
+        return new URL('/miniapp', config.apiUrl).toString();
+    } catch {
+        return '';
+    }
+}
 
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
+function appendMiniAppLaunchButton(keyboard, label = '🧭 Admin Console') {
+    const launchUrl = getMiniAppLaunchUrl();
+    if (!launchUrl) return false;
+    if (typeof keyboard.webApp === 'function') {
+        keyboard.row().webApp(label, launchUrl);
+    } else {
+        keyboard.row().url(label, launchUrl);
+    }
+    return true;
+}
 
-            const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
-            
-            const kb = new InlineKeyboard();
+async function handleMenu(ctx) {
+    try {
+        await cancelActiveFlow(ctx, 'command:/menu');
+        resetSession(ctx);
 
-            if (config.miniAppUrl) {
-                kb.webApp('📱 Open Mini App', config.miniAppUrl).row();
-            }
+        const access = await getAccessProfile(ctx);
+        const isAuthorized = Boolean(access.isAuthorized);
+        const isOwner = access.isAdmin;
 
-            kb.text('📞 New Call', 'CALL')
-            .text('📱 Send SMS', 'SMS')
+        const kb = new InlineKeyboard()
+            .text(isAuthorized ? '📞 Call' : '🔒 Call', buildCallbackData(ctx, 'CALL'))
+            .text(isAuthorized ? '💬 SMS' : '🔒 SMS', buildCallbackData(ctx, 'SMS'))
             .row()
-            .text('📋 Recent Calls', 'CALLS')
-            .text('📚 Guide', 'GUIDE')
-            .row()
-            .text('🏥 Health Check', 'HEALTH')
-            .text('ℹ️ Help', 'HELP');
+            .text(isAuthorized ? '📧 Email' : '🔒 Email', buildCallbackData(ctx, 'EMAIL'))
+            .text(isAuthorized ? '📜 Call Log' : '🔒 Call Log', buildCallbackData(ctx, 'CALLLOG'));
 
+        if (isAuthorized) {
+            kb.row()
+                .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
             if (isOwner) {
                 kb.row()
-                    .text('📤 Bulk SMS', 'BULK_SMS')
-                    .text('⏰ Schedule SMS', 'SCHEDULE_SMS')
-                    .row()
-                    .text('➕ Add User', 'ADDUSER')
-                    .text('⬆️ Promote', 'PROMOTE')
-                    .row()
-                    .text('👥 Users', 'USERS')
-                    .text('❌ Remove', 'REMOVE')
-                    .row()
-                    .text('🧰 Templates', 'TEMPLATES')
-                    .text('📊 SMS Stats', 'SMS_STATS')
-                    .row()
-                    .text('☎️ Provider', 'PROVIDER_STATUS')
-                    .row()
-                    .text('🔍 Status', 'STATUS')
-                    .text('🧪 Test API', 'TEST_API');
+                    .text('🏥 Health', buildCallbackData(ctx, 'HEALTH'))
+                    .text('🔍 Status', buildCallbackData(ctx, 'STATUS'));
+            } else {
+                kb.row().text('🏥 Health', buildCallbackData(ctx, 'HEALTH'));
             }
-
-            const menuText = isOwner ? 
-                '🛡️ *Administrator Menu*\n\nSelect an action below:' :
-                '📋 *Quick Actions Menu*\n\nSelect an action below:';
-
-            await ctx.reply(menuText, {
-                parse_mode: 'Markdown',
-                reply_markup: kb
-            });
-        } catch (error) {
-            console.error('Menu command error:', error);
-            await ctx.reply('❌ Error displaying menu. Please try again.');
+        } else {
+            kb.row()
+                .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
         }
-    });
+
+        if (isOwner) {
+            kb.row()
+                .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                .text('🧰 Scripts', buildCallbackData(ctx, 'SCRIPTS'))
+                .row()
+                .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
+                .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'))
+                .row()
+                .text('📤 SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
+                .text('📧 Mailer', buildCallbackData(ctx, 'BULK_EMAIL'));
+            appendMiniAppLaunchButton(kb);
+        } else if (!isAuthorized) {
+            const adminUsername = (config.admin.username || '').replace(/^@/, '');
+            if (adminUsername) {
+                kb.row().url('📱 Request Access', `https://t.me/${adminUsername}`);
+            }
+        }
+
+        const commonHint = 'SMS and Email actions are grouped under /sms and /email.';
+        const accessHint = isAuthorized
+            ? 'Authorized access enabled.'
+            : 'Limited access: request approval to run actions.';
+        const menuText = isOwner
+            ? `<b>${escapeHtml('Administrator Menu')}</b>\n${escapeHtml('Choose an action')}\n• ${escapeHtml('Admin tools enabled')}\n• ${escapeHtml(commonHint)}`
+            : `<b>${escapeHtml('Quick Actions Menu')}</b>\n${escapeHtml('Tap a shortcut')}\n• ${escapeHtml(commonHint)}\n• ${escapeHtml(accessHint)}`;
+
+        await renderMenu(ctx, menuText, kb, { parseMode: 'HTML' });
+    } catch (error) {
+        console.error('Menu command error:', error);
+        await ctx.reply('❌ Unable to open the menu right now. Please run /menu again.');
+    }
+}
+
+function registerMenuCommand(bot) {
+    bot.command('menu', handleMenu);
+}
+
+module.exports = {
+    registerMenuCommand,
+    handleMenu
 };

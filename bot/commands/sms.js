@@ -1,6 +1,6 @@
 const config = require('../config');
-const axios = require('axios');
-const { getUser, isAdmin } = require('../db/db');
+const httpClient = require('../utils/httpClient');
+const { InlineKeyboard } = require('grammy');
 const {
     startOperation,
     ensureOperationActive,
@@ -18,16 +18,599 @@ const {
 } = require('../utils/persona');
 
 const {
-    buildTemplateOption,
-    CUSTOM_TEMPLATE_OPTION,
-    extractTemplateVariables,
-    TEMPLATE_METADATA
-} = require('../utils/templates');
+    buildScriptOption,
+    CUSTOM_SCRIPT_OPTION,
+    extractScriptVariables,
+    SCRIPT_METADATA
+} = require('../utils/scripts');
+const {
+    section: formatSection,
+    buildLine,
+    buildTextProgressBar,
+    renderMenu,
+    escapeMarkdown,
+    sendEphemeral,
+    buildBackToMenuKeyboard: buildStandardBackKeyboard,
+    appendBackToMenuRows,
+    cancelledMessage,
+    setupStepMessage
+} = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
+const { getAccessProfile } = require('../utils/capabilities');
+
+const RECENT_SMS_PAGE_SIZE = 5;
+
+async function smsAlert(ctx, text) {
+    await ctx.reply(formatSection('⚠️ SMS Alert', [text]));
+}
+
+async function replyApiError(ctx, error, fallback) {
+    const message = httpClient.getUserMessage(error, fallback);
+    await ctx.reply(message);
+}
+
+function buildBackToMenuKeyboard(ctx, action = 'SMS', label = '⬅️ Back to SMS Center') {
+    return buildStandardBackKeyboard(ctx, {
+        backAction: action,
+        backLabel: label
+    });
+}
+
+async function ensureAuthorizedUser(ctx) {
+    const access = await getAccessProfile(ctx);
+    if (!access?.isAuthorized) {
+        await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
+        return false;
+    }
+    return true;
+}
+
+async function ensureAuthorizedAdmin(ctx) {
+    const access = await getAccessProfile(ctx);
+    if (!access?.isAuthorized) {
+        await ctx.reply('❌ Access denied. Your account is not authorized for this action.');
+        return false;
+    }
+    if (!access.isAdmin) {
+        await ctx.reply('❌ Access denied. This action is available to administrators only.');
+        return false;
+    }
+    return true;
+}
+
+async function maybeSendSmsAliasTip(ctx) {
+    if (!ctx.session) return;
+    ctx.session.hints = ctx.session.hints || {};
+    if (ctx.session.hints.smsMenuTipSent) return;
+    ctx.session.hints.smsMenuTipSent = true;
+    await sendEphemeral(ctx, 'ℹ️ Tip: /sms is now the single entry point for all SMS actions.');
+}
+
+function formatSmsStatusMessage(msg = {}) {
+    const bodyPreview = msg.body ? escapeMarkdown(msg.body.substring(0, 100)) : '—';
+    const aiPreview = msg.ai_response ? escapeMarkdown(msg.ai_response.substring(0, 100)) : null;
+    let statusText =
+        `📱 *SMS Status Report*\n\n` +
+        `🆔 **Message SID:** \`${escapeMarkdown(msg.message_sid || '—')}\`\n` +
+        `📞 **To:** ${escapeMarkdown(msg.to_number || 'N/A')}\n` +
+        `📤 **From:** ${escapeMarkdown(msg.from_number || 'N/A')}\n` +
+        `📊 **Status:** ${escapeMarkdown(msg.status || 'unknown')}\n` +
+        `📅 **Created:** ${escapeMarkdown(new Date(msg.created_at || Date.now()).toLocaleString())}\n` +
+        `🔄 **Updated:** ${escapeMarkdown(new Date(msg.updated_at || Date.now()).toLocaleString())}\n` +
+        `📝 **Message:** ${bodyPreview}${msg.body && msg.body.length > 100 ? '…' : ''}\n`;
+
+    if (msg.error_code || msg.error_message) {
+        statusText += `\n❌ **Error:** ${escapeMarkdown(String(msg.error_code || ''))} - ${escapeMarkdown(msg.error_message || '')}`;
+    }
+    if (aiPreview) {
+        statusText += `\n🤖 **AI Response:** ${aiPreview}${msg.ai_response.length > 100 ? '…' : ''}`;
+    }
+    return statusText;
+}
+
+function buildSmsMenuKeyboard(ctx, isAdminUser) {
+    const keyboard = new InlineKeyboard()
+        .text('✉️ Send SMS', buildCallbackData(ctx, 'SMS_SEND'))
+        .text('⏰ Schedule SMS', buildCallbackData(ctx, 'SMS_SCHEDULE'))
+        .row()
+        .text('📬 Delivery Status', buildCallbackData(ctx, 'SMS_STATUS'));
+
+    if (isAdminUser) {
+        keyboard
+            .text('🧾 Conversation', buildCallbackData(ctx, 'SMS_CONVO'))
+            .row()
+            .text('🕒 Recent SMS', buildCallbackData(ctx, 'SMS_RECENT'))
+            .text('📊 SMS Stats', buildCallbackData(ctx, 'SMS_STATS'));
+    }
+
+    keyboard.row().text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+
+    return keyboard;
+}
+
+async function renderSmsMenu(ctx) {
+    const access = await getAccessProfile(ctx);
+    const isAuthorized = Boolean(access.isAuthorized);
+    const isAdminUser = access.isAdmin;
+    startOperation(ctx, 'sms-menu');
+    const keyboard = buildSmsMenuKeyboard(ctx, isAdminUser);
+    const title = isAuthorized ? '💬 *SMS Center*' : '🔒 *SMS Center (Access limited)*';
+    const lines = [
+        'Choose an SMS action below.',
+        isAdminUser ? 'Admin tools are included.' : 'Admin-only tools are hidden.',
+        isAuthorized ? 'Authorized access enabled.' : 'Limited access: request approval to send messages.',
+        isAuthorized ? '' : '🔒 Actions are locked without approval.'
+    ].filter(Boolean);
+    await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
+}
+
+async function sendSmsStatusBySid(ctx, messageSid) {
+    try {
+        const allowed = await ensureAuthorizedUser(ctx);
+        if (!allowed) {
+            return;
+        }
+        const response = await httpClient.get(null, `${config.apiUrl}/api/sms/status/${messageSid}`, {
+            timeout: 10000
+        });
+        if (!response.data?.success) {
+            await ctx.reply(`❌ ${response.data?.error || 'Message not found'}`);
+            return;
+        }
+        const msg = response.data.message || {};
+        const statusText = formatSmsStatusMessage(msg);
+        await ctx.reply(statusText, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await replyApiError(ctx, error, 'Unable to fetch SMS status.');
+    }
+}
+
+async function smsStatusFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-status');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const allowed = await ensureAuthorizedUser(ctx);
+        ensureActive();
+        if (!allowed) {
+            return;
+        }
+        await ctx.reply(setupStepMessage('SMS delivery status', [
+            'Enter the SMS message SID to check delivery status.'
+        ]), { parse_mode: 'Markdown' });
+        const update = await conversation.wait();
+        ensureActive();
+        const messageSid = update?.message?.text?.trim();
+        if (!messageSid) {
+            await ctx.reply('❌ Message SID is required.');
+            return;
+        }
+        await sendSmsStatusBySid(ctx, messageSid);
+    } catch (error) {
+        console.error('SMS status flow error:', error);
+        await replyApiError(ctx, error, 'Error checking SMS status. Please try again.');
+    }
+}
+
+async function smsConversationFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-conversation');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const allowed = await ensureAuthorizedAdmin(ctx);
+        ensureActive();
+        if (!allowed) {
+            return;
+        }
+        await ctx.reply('📱 Enter the phone number (E.164 format):');
+        const update = await conversation.wait();
+        ensureActive();
+        const phoneNumber = update?.message?.text?.trim();
+        if (!phoneNumber || !isValidPhoneNumber(phoneNumber)) {
+            await ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
+            return;
+        }
+        await sendEphemeral(ctx, `🔍 Fetching conversation for ${phoneNumber}...`);
+        await viewSmsConversation(ctx, phoneNumber);
+    } catch (error) {
+        console.error('SMS conversation flow error:', error);
+        await replyApiError(ctx, error, 'Error viewing SMS conversation. Please try again.');
+    }
+}
+
+function buildRecentSmsKeyboard(ctx, page, totalPages, requestedLimit) {
+    const keyboard = new InlineKeyboard();
+    if (totalPages > 1) {
+        if (page > 1) {
+            keyboard.text('⬅️ Prev', buildCallbackData(ctx, `SMS_RECENT_PAGE:${page - 1}`));
+        }
+        keyboard.text('🔄 Refresh', buildCallbackData(ctx, `SMS_RECENT_PAGE:${page}`));
+        if (page < totalPages) {
+            keyboard.text('Next ➡️', buildCallbackData(ctx, `SMS_RECENT_PAGE:${page + 1}`));
+        }
+        keyboard.row();
+    }
+    keyboard.text('↕️ Change Count', buildCallbackData(ctx, 'SMS_RECENT'));
+    keyboard.text('⬅️ Back to SMS Center', buildCallbackData(ctx, 'SMS'));
+    keyboard.row();
+    keyboard.text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+    if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
+        keyboard.row().text(`🧮 Showing ${requestedLimit}`, buildCallbackData(ctx, `SMS_RECENT_PAGE:${page}`));
+    }
+    return keyboard;
+}
+
+async function sendRecentSms(ctx, options = {}) {
+    try {
+        const allowed = await ensureAuthorizedAdmin(ctx);
+        if (!allowed) {
+            return;
+        }
+
+        const normalized = typeof options === 'number' ? { limit: options } : (options || {});
+        const requestedLimitRaw = Number(normalized.limit);
+        const requestedLimit = Number.isFinite(requestedLimitRaw)
+            ? Math.max(1, Math.min(Math.floor(requestedLimitRaw), 20))
+            : 10;
+        const pageRaw = Number(normalized.page);
+        const requestedPage = Number.isFinite(pageRaw) ? Math.max(1, Math.floor(pageRaw)) : 1;
+        const response = await httpClient.get(null, `${config.apiUrl}/api/sms/messages/recent`, {
+            params: { limit: requestedLimit },
+            timeout: 10000
+        });
+        if (!response.data?.success || !Array.isArray(response.data.messages) || response.data.messages.length === 0) {
+            await renderMenu(
+                ctx,
+                formatSection('🕒 Recent SMS', [
+                    'No recent SMS messages found.',
+                    'Try again after sending or receiving new messages.'
+                ]),
+                buildBackToMenuKeyboard(ctx, 'SMS', '⬅️ Back to SMS Center'),
+                { parseMode: 'Markdown' }
+            );
+            return;
+        }
+        const messages = response.data.messages;
+        const totalPages = Math.max(1, Math.ceil(messages.length / RECENT_SMS_PAGE_SIZE));
+        const page = Math.min(requestedPage, totalPages);
+        const offset = (page - 1) * RECENT_SMS_PAGE_SIZE;
+        const pageItems = messages.slice(offset, offset + RECENT_SMS_PAGE_SIZE);
+
+        const cards = pageItems.map((msg, index) => {
+            const time = new Date(msg.created_at).toLocaleString();
+            const direction = msg.direction === 'inbound' ? '📨' : '📤';
+            const toNumber = escapeMarkdown(msg.to_number || 'N/A');
+            const fromNumber = escapeMarkdown(msg.from_number || 'N/A');
+            const preview = escapeMarkdown((msg.body || '').substring(0, 80));
+            return formatSection(`${direction} SMS #${offset + index + 1}`, [
+                buildLine('🕒', 'Time', escapeMarkdown(time)),
+                buildLine('📤', 'From', fromNumber),
+                buildLine('📨', 'To', toNumber),
+                buildLine('📝', 'Message', `${preview}${msg.body && msg.body.length > 80 ? '…' : ''}`)
+            ]);
+        });
+        const header = formatSection('📱 Recent SMS', [
+            buildLine('📄', 'Page', `${page}/${totalPages}`),
+            buildLine('📊', 'Loaded', `${messages.length} recent messages`)
+        ]);
+
+        await renderMenu(
+            ctx,
+            `${header}\n\n${cards.join('\n\n')}`,
+            buildRecentSmsKeyboard(ctx, page, totalPages, requestedLimit),
+            { parseMode: 'Markdown' }
+        );
+    } catch (error) {
+        await renderMenu(
+            ctx,
+            formatSection('❌ Recent SMS Error', [
+                'Unable to fetch recent SMS messages.',
+                'Use refresh or return to SMS Center.'
+            ]),
+            buildBackToMenuKeyboard(ctx, 'SMS', '⬅️ Back to SMS Center'),
+            { parseMode: 'Markdown' }
+        );
+    }
+}
+
+async function recentSmsFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-recent');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const allowed = await ensureAuthorizedAdmin(ctx);
+        ensureActive();
+        if (!allowed) {
+            return;
+        }
+        await ctx.reply('🕒 Enter number of messages to fetch (max 20).');
+        const update = await conversation.wait();
+        ensureActive();
+        const raw = update?.message?.text?.trim();
+        const parsedLimit = Number(raw);
+        const limit = Number.isFinite(parsedLimit)
+            ? Math.max(1, Math.min(parsedLimit, 20))
+            : 10;
+        await sendEphemeral(ctx, `📱 Fetching last ${limit} SMS messages...`);
+        await sendRecentSms(ctx, { limit, page: 1 });
+    } catch (error) {
+        console.error('Recent SMS flow error:', error);
+        await replyApiError(ctx, error, 'Error fetching recent SMS messages.');
+    }
+}
+
+async function smsStatsFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'sms-stats');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const allowed = await ensureAuthorizedAdmin(ctx);
+        ensureActive();
+        if (!allowed) {
+            return;
+        }
+        await sendEphemeral(ctx, '📊 Fetching SMS statistics...');
+        await getSmsStats(ctx);
+    } catch (error) {
+        console.error('SMS stats flow error:', error);
+        await replyApiError(ctx, error, 'Error fetching SMS statistics.');
+    }
+}
+
+async function fetchBulkSmsStatus(ctx, { limit = 10, hours = 24 } = {}) {
+    const response = await httpClient.get(null, `${config.apiUrl}/api/sms/bulk/status`, {
+        params: { limit, hours },
+        timeout: 15000
+    });
+    return response.data;
+}
+
+async function fetchSmsProviderStatus() {
+    const response = await httpClient.get(null, `${config.apiUrl}/admin/provider`, {
+        params: { channel: 'sms' },
+        timeout: 10000,
+        headers: {
+            'x-admin-token': config.admin.apiToken,
+            'Content-Type': 'application/json'
+        }
+    });
+    return response.data || {};
+}
+
+async function sendBulkSmsPreflightCard(ctx) {
+    try {
+        const status = await fetchSmsProviderStatus();
+        const smsProvider = String(status.sms_provider || status.provider || 'unknown').toLowerCase();
+        const readinessMap = status.sms_readiness || status.providers?.sms?.readiness || {};
+        const isReady = readinessMap[smsProvider] !== false;
+        const lines = [
+            buildLine('🔌', 'Provider', escapeMarkdown(smsProvider.toUpperCase())),
+            buildLine('🛡️', 'Readiness', isReady ? '✅ Ready' : '⚠️ Check configuration'),
+            buildLine('📬', 'Channel', 'SMS'),
+            '',
+            isReady
+                ? 'Run a small test batch first if this is your first send today.'
+                : 'Readiness checks failed. Avoid live sends until the provider is fixed.'
+        ];
+        const keyboard = new InlineKeyboard()
+            .text('✅ Continue to Send', buildCallbackData(ctx, 'BULK_SMS_SEND'))
+            .row()
+            .text('🔄 Re-run Preflight', buildCallbackData(ctx, 'BULK_SMS_PRECHECK'))
+            .text('⬅️ Back to SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
+            .row()
+            .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+        await renderMenu(ctx, formatSection('🧪 Bulk SMS Preflight', lines), keyboard, { parseMode: 'Markdown' });
+    } catch (error) {
+        const keyboard = new InlineKeyboard()
+            .text('✅ Continue to Send', buildCallbackData(ctx, 'BULK_SMS_SEND'))
+            .row()
+            .text('⬅️ Back to SMS Sender', buildCallbackData(ctx, 'BULK_SMS'))
+            .row()
+            .text('⬅️ Main Menu', buildCallbackData(ctx, 'MENU'));
+        await renderMenu(
+            ctx,
+            formatSection('⚠️ Bulk SMS Preflight', [
+                'Could not verify provider readiness right now.',
+                'You can continue, but consider checking /provider first.'
+            ]),
+            keyboard,
+            { parseMode: 'Markdown' }
+        );
+    }
+}
+
+function formatBulkSmsOperation(operation) {
+    const createdAt = new Date(operation.created_at).toLocaleString();
+    const total = Number(operation.total_recipients || 0);
+    const success = Number(operation.successful || 0);
+    const failed = Number(operation.failed || 0);
+    const processed = Math.min(total, Math.max(0, success + failed));
+    const progress = total > 0 ? Math.round((processed / total) * 100) : 0;
+    const deliveryRate = total > 0 ? Math.round((success / total) * 100) : 0;
+    const preview = operation.message
+        ? escapeMarkdown(operation.message.substring(0, 60))
+        : '—';
+    return [
+        `🆔 ${operation.id}`,
+        `📅 ${createdAt}`,
+        `📨 ${success}/${total} sent (${failed} failed)`,
+        `📈 Progress: ${buildTextProgressBar(progress)}`,
+        `✅ Delivery: ${buildTextProgressBar(deliveryRate)}`,
+        `📝 ${preview}${operation.message && operation.message.length > 60 ? '…' : ''}`
+    ].join('\n');
+}
+
+async function sendBulkSmsList(ctx, { limit = 10, hours = 24 } = {}) {
+    try {
+        const data = await fetchBulkSmsStatus(ctx, { limit, hours });
+        const operations = data?.operations || [];
+        if (!operations.length) {
+            await renderMenu(
+                ctx,
+                formatSection('📦 Recent Bulk SMS Jobs', ['No jobs found in the selected window.']),
+                buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+                { parseMode: 'Markdown' }
+            );
+            return;
+        }
+        const blocks = operations.map((op) => formatBulkSmsOperation(op));
+        await renderMenu(
+            ctx,
+            `📦 *Recent Bulk SMS Jobs*\n\n${blocks.join('\n\n')}`,
+            buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+            { parseMode: 'Markdown' }
+        );
+    } catch (error) {
+        await replyApiError(ctx, error, 'Failed to fetch bulk SMS jobs.');
+    }
+}
+
+async function sendBulkSmsStats(ctx, { hours = 24 } = {}) {
+    try {
+        const data = await fetchBulkSmsStatus(ctx, { limit: 20, hours });
+        const summary = data?.summary;
+        if (!summary) {
+            await renderMenu(
+                ctx,
+                formatSection('📊 Bulk SMS Summary', ['Stats are unavailable for the selected period.']),
+                buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+                { parseMode: 'Markdown' }
+            );
+            return;
+        }
+        const totalRecipients = Number(summary.totalRecipients || 0);
+        const totalSuccess = Number(summary.totalSuccessful || 0);
+        const totalFailed = Number(summary.totalFailed || 0);
+        const processed = Math.max(0, Math.min(totalRecipients, totalSuccess + totalFailed));
+        const completionRate = totalRecipients > 0 ? Math.round((processed / totalRecipients) * 100) : 0;
+        const successRate = totalRecipients > 0 ? Math.round((totalSuccess / totalRecipients) * 100) : 0;
+        const failureRate = totalRecipients > 0 ? Math.round((totalFailed / totalRecipients) * 100) : 0;
+        const lines = [
+            `Total jobs: ${summary.totalOperations || 0}`,
+            `Recipients: ${totalRecipients}`,
+            `Success: ${totalSuccess}`,
+            `Failed: ${totalFailed}`,
+            `Progress: ${buildTextProgressBar(completionRate)}`,
+            `Success rate: ${buildTextProgressBar(successRate)}`,
+            `Failure rate: ${buildTextProgressBar(failureRate)}`
+        ];
+        await renderMenu(
+            ctx,
+            `📊 *Bulk SMS Summary (last ${data.time_period_hours || hours}h)*\n${lines.join('\n')}`,
+            buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender'),
+            { parseMode: 'Markdown' }
+        );
+    } catch (error) {
+        await replyApiError(ctx, error, 'Failed to fetch bulk SMS statistics.');
+    }
+}
+
+async function bulkSmsStatusFlow(conversation, ctx) {
+    const opId = startOperation(ctx, 'bulk-sms-status');
+    const ensureActive = () => ensureOperationActive(ctx, opId);
+    try {
+        const allowed = await ensureAuthorizedAdmin(ctx);
+        ensureActive();
+        if (!allowed) {
+            return;
+        }
+        await ctx.reply('🆔 Enter the bulk SMS job ID:');
+        const update = await conversation.wait();
+        ensureActive();
+        const rawId = update?.message?.text?.trim();
+        if (!rawId) {
+            await ctx.reply('❌ Job ID is required.');
+            return;
+        }
+        const data = await fetchBulkSmsStatus(ctx, { limit: 50, hours: 72 });
+        const operations = data?.operations || [];
+        const match = operations.find((op) => String(op.id) === rawId);
+        if (!match) {
+            await ctx.reply('ℹ️ Job not found in recent history.');
+            return;
+        }
+        await ctx.reply(`📦 *Bulk SMS Job*\n\n${formatBulkSmsOperation(match)}`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error('Bulk SMS status flow error:', error);
+        await replyApiError(ctx, error, 'Error fetching bulk SMS status.');
+    }
+}
+
+function buildBulkSmsMenuKeyboard(ctx) {
+    const keyboard = new InlineKeyboard()
+        .text('🧪 Preflight', buildCallbackData(ctx, 'BULK_SMS_PRECHECK'))
+        .text('📤 Send Bulk SMS', buildCallbackData(ctx, 'BULK_SMS_SEND'))
+        .row()
+        .text('🕒 Recent Jobs', buildCallbackData(ctx, 'BULK_SMS_LIST'))
+        .row()
+        .text('🧾 Job Status', buildCallbackData(ctx, 'BULK_SMS_STATUS'))
+        .text('📊 Bulk Stats', buildCallbackData(ctx, 'BULK_SMS_STATS'));
+    return appendBackToMenuRows(keyboard, ctx, {
+        backAction: 'SMS',
+        backLabel: '⬅️ Back to SMS Center'
+    });
+}
+
+async function renderBulkSmsMenu(ctx) {
+    const allowed = await ensureAuthorizedAdmin(ctx);
+    if (!allowed) {
+        return;
+    }
+    startOperation(ctx, 'bulk-sms-menu');
+    const keyboard = buildBulkSmsMenuKeyboard(ctx);
+    const title = '📤 *SMS Sender*';
+    const lines = [
+        'Manage bulk SMS sends below.',
+        'Run preflight before large batches.'
+    ];
+    await renderMenu(ctx, `${title}\n${lines.join('\n')}`, keyboard, { parseMode: 'Markdown' });
+}
 
 // Simple phone number validation
 function isValidPhoneNumber(number) {
     const e164Regex = /^\+[1-9]\d{1,14}$/;
     return e164Regex.test(number.trim());
+}
+
+const GSM7_BASIC_CHARS = new Set([
+    '@', '£', '$', '¥', 'è', 'é', 'ù', 'ì', 'ò', 'Ç', '\n', 'Ø', 'ø', '\r', 'Å', 'å',
+    'Δ', '_', 'Φ', 'Γ', 'Λ', 'Ω', 'Π', 'Ψ', 'Σ', 'Θ', 'Ξ', 'Æ', 'æ', 'ß', 'É', ' ',
+    '!', '"', '#', '¤', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
+    '¡', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
+    'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'Ä', 'Ö', 'Ñ', 'Ü', '§',
+    '¿', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+    'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'ä', 'ö', 'ñ', 'ü', 'à'
+]);
+const GSM7_EXT_CHARS = new Set(['^', '{', '}', '\\', '[', '~', ']', '|', '€']);
+
+function getSmsSegmentInfo(text) {
+    const value = String(text || '');
+    if (!value) {
+        return { encoding: 'gsm-7', length: 0, units: 0, per_segment: 160, segments: 0 };
+    }
+
+    let units = 0;
+    let isGsm7 = true;
+    for (const ch of value) {
+        if (GSM7_BASIC_CHARS.has(ch)) {
+            units += 1;
+            continue;
+        }
+        if (GSM7_EXT_CHARS.has(ch)) {
+            units += 2;
+            continue;
+        }
+        isGsm7 = false;
+        break;
+    }
+
+    if (!isGsm7) {
+        const length = value.length;
+        const perSegment = length <= 70 ? 70 : 67;
+        const segments = Math.ceil(length / perSegment);
+        return { encoding: 'ucs-2', length, units: length, per_segment: perSegment, segments };
+    }
+
+    const perSegment = units <= 160 ? 160 : 153;
+    const segments = Math.ceil(units / perSegment);
+    return { encoding: 'gsm-7', length: value.length, units, per_segment: perSegment, segments };
 }
 
 // SMS sending flow (UNCHANGED - already working)
@@ -52,7 +635,7 @@ async function smsFlow(conversation, ctx) {
         const controller = new AbortController();
         const release = registerAbortController(ctx, controller);
         try {
-            const response = await axios.get(url, { timeout: 20000, signal: controller.signal, ...options });
+            const response = await httpClient.get(null, url, { timeout: 20000, signal: controller.signal, ...options });
             ensureActive();
             return response;
         } finally {
@@ -63,7 +646,7 @@ async function smsFlow(conversation, ctx) {
         const controller = new AbortController();
         const release = registerAbortController(ctx, controller);
         try {
-            const response = await axios.post(url, data, { timeout: 30000, signal: controller.signal, ...options });
+            const response = await httpClient.post(null, url, data, { timeout: 30000, signal: controller.signal, ...options });
             ensureActive();
             return response;
         } finally {
@@ -73,10 +656,9 @@ async function smsFlow(conversation, ctx) {
 
     try {
         ensureActive();
-        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        const userAllowed = await ensureAuthorizedUser(ctx);
         ensureActive();
-        if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+        if (!userAllowed) {
             return;
         }
 
@@ -84,39 +666,54 @@ async function smsFlow(conversation, ctx) {
         let number = prefill.phoneNumber || null;
 
         if (number) {
-            await ctx.reply(`📞 Using follow-up number: ${number}`);
+            await ctx.reply(formatSection('📞 Follow-up number', [
+                buildLine('➡️', 'Using', number)
+            ]));
             if (ctx.session.meta) {
                 delete ctx.session.meta.prefill;
             }
         } else {
-            await ctx.reply('📱 Enter phone number (E.164 format, e.g., +1234567890):');
+            await ctx.reply(setupStepMessage('SMS setup', [
+                'Enter phone number in E.164 format.',
+                'Example: +1234567890'
+            ]), { parse_mode: 'Markdown' });
             const numMsg = await waitForMessage();
             number = numMsg?.message?.text?.trim();
 
-            if (!number) return ctx.reply('❌ Please provide a phone number.');
+            if (!number) return smsAlert(ctx, 'Please provide a phone number.');
             if (!isValidPhoneNumber(number)) {
-                return ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
+                return smsAlert(ctx, 'Invalid phone number format. Use E.164 format: +1234567890');
             }
         }
 
         const businessOptions = await getBusinessOptions();
         ensureActive();
+        const personaChoices = [
+            ...businessOptions,
+            { id: 'cancel', label: '🛑 Cancel', custom: true }
+        ];
 
         const selectedBusiness = await askWithGuard(
             conversation,
             ctx,
             `🎭 *Select SMS persona:*
 Choose the business profile for this message.`,
-            businessOptions,
+            personaChoices,
             {
                 prefix: 'sms-persona',
                 columns: 2,
-                formatLabel: (option) => option.custom ? '✍️ Custom Message' : option.label
+                formatLabel: (option) => {
+                    if (option.id === 'cancel') return option.label;
+                    return option.custom ? '✍️ Custom Message' : option.label;
+                }
             }
         );
 
-        if (!selectedBusiness) {
-            await ctx.reply('❌ Invalid persona selection. Please try again.');
+        if (!selectedBusiness || selectedBusiness.id === 'cancel') {
+            await ctx.reply(cancelledMessage('SMS flow', 'Use /sms to start again.'), {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
             return;
         }
 
@@ -129,9 +726,9 @@ Choose the business profile for this message.`,
         let selectedPurpose = null;
         let recommendedEmotion = 'neutral';
         let recommendedUrgency = 'normal';
-        let templateSelection = null;
-        let templateName = null;
-        let templateVariables = {};
+        let scriptSelection = null;
+        let scriptName = null;
+        let scriptVariables = {};
         let message = '';
 
         if (!selectedBusiness.custom) {
@@ -218,79 +815,88 @@ How comfortable is the recipient with technical details?`,
             }
         }
 
-        // Fetch available templates
-        let templateChoices = [];
+        // Fetch available scripts
+        let scriptChoices = [];
         try {
-            const templateResponse = await guardedGet(`${config.apiUrl}/api/sms/templates`, {
+            const scriptResponse = await guardedGet(`${config.apiUrl}/api/sms/scripts`, {
                 params: { include_builtins: true, detailed: true }
             });
 
-            const builtinTemplates = (templateResponse.data.builtin || []).map((template) => ({
-                id: template.name,
-                label: buildTemplateOption(template.name).label,
-                description: buildTemplateOption(template.name).description,
-                content: template.content,
+            const builtinScripts = (scriptResponse.data.builtin || []).map((script) => ({
+                id: script.name,
+                label: buildScriptOption(script.name).label,
+                description: buildScriptOption(script.name).description,
+                content: script.content,
                 is_builtin: true
             }));
 
-            const customTemplates = (templateResponse.data.templates || []).map((template) => ({
-                id: template.name,
-                label: `📝 ${template.name}`,
-                description: template.description || 'Custom template',
-                content: template.content,
+            const customScripts = (scriptResponse.data.scripts || []).map((script) => ({
+                id: script.name,
+                label: `📝 ${script.name}`,
+                description: script.description || 'Custom script',
+                content: script.content,
                 is_builtin: false
             }));
 
-            templateChoices = [...builtinTemplates, ...customTemplates];
-        } catch (templateError) {
-            console.error('❌ Failed to fetch SMS templates:', templateError);
-            templateChoices = Object.keys(TEMPLATE_METADATA || {})
-                .map(buildTemplateOption);
+            scriptChoices = [...builtinScripts, ...customScripts];
+        } catch (scriptError) {
+            console.error('❌ Failed to fetch SMS scripts:', scriptError);
+            scriptChoices = Object.keys(SCRIPT_METADATA || {})
+                .map(buildScriptOption);
         }
 
-        templateChoices.push(CUSTOM_TEMPLATE_OPTION);
+        scriptChoices.push(CUSTOM_SCRIPT_OPTION);
+        scriptChoices.push({ id: 'cancel', label: '🛑 Cancel', description: 'Exit SMS flow' });
 
-        const templateListText = templateChoices
+        const scriptListText = scriptChoices
             .map((option) => `• ${option.label}${option.description ? ` - ${option.description}` : ''}`)
             .join('\n');
 
-        const templatePrompt = `📝 *Choose SMS template:*
-${templateListText}
+        const scriptPrompt = `📝 *Choose SMS script:*
+${scriptListText}
 
 Tap an option below to continue.`;
 
-        templateSelection = await askWithGuard(
+        scriptSelection = await askWithGuard(
             conversation,
             ctx,
-            templatePrompt,
-            templateChoices,
-            { prefix: 'sms-template', columns: 1, formatLabel: (option) => option.label }
+            scriptPrompt,
+            scriptChoices,
+            { prefix: 'sms-script', columns: 1, formatLabel: (option) => option.label }
         );
 
-        if (templateSelection.id === 'custom') {
+        if (!scriptSelection || scriptSelection.id === 'cancel') {
+            await ctx.reply(cancelledMessage('SMS flow', 'Use /sms to start again.'), {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
+            return;
+        }
+
+        if (scriptSelection.id === 'custom') {
             await ctx.reply('💬 Enter the SMS message (max 1600 characters):');
             const msgContent = await waitForMessage();
             message = msgContent?.message?.text?.trim();
 
-            if (!message) return ctx.reply('❌ Please provide a message.');
+            if (!message) return smsAlert(ctx, 'Please provide a message.');
             if (message.length > 1600) {
                 return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
             }
-            personaSummary.push('Template: Custom message');
+            personaSummary.push('Script: Custom message');
         } else {
-            templateName = templateSelection.id;
+            scriptName = scriptSelection.id;
 
             try {
-                const templateResponse = await guardedGet(`${config.apiUrl}/api/sms/templates/${templateName}`, {
+                const scriptResponse = await guardedGet(`${config.apiUrl}/api/sms/scripts/${scriptName}`, {
                     params: { detailed: true }
                 });
 
-                const templatePayload = templateResponse.data.template;
-                let templateText = templatePayload?.content || '';
-                const placeholders = extractTemplateVariables(templatePayload?.content || '');
+                const scriptPayload = scriptResponse.data.script;
+                let scriptText = scriptPayload?.content || '';
+                const placeholders = extractScriptVariables(scriptPayload?.content || '');
 
                 if (placeholders.length > 0) {
-                    await ctx.reply('🧩 This template includes placeholders. Provide values or type skip to leave them unchanged.');
+                    await ctx.reply('🧩 This script includes placeholders. Provide values or type skip to leave them unchanged.');
 
                     for (const token of placeholders) {
                         await ctx.reply(`✏️ Enter value for *${token}* (type skip to leave as is):`, { parse_mode: 'Markdown' });
@@ -298,33 +904,33 @@ Tap an option below to continue.`;
                         const value = valueMsg?.message?.text?.trim();
 
                         if (value && value.toLowerCase() !== 'skip') {
-                            templateVariables[token] = value;
+                            scriptVariables[token] = value;
                         }
                     }
 
-                    for (const [token, value] of Object.entries(templateVariables)) {
-                        templateText = templateText.replace(new RegExp(`{${token}}`, 'g'), value);
+                    for (const [token, value] of Object.entries(scriptVariables)) {
+                        scriptText = scriptText.replace(new RegExp(`{${token}}`, 'g'), value);
                     }
                 }
 
-                message = templateText;
-                personaSummary.push(`Template: ${templateSelection.label}`);
-                if (Object.keys(templateVariables).length > 0) {
-                    personaSummary.push(`Filled variables: ${Object.keys(templateVariables).join(', ')}`);
+                message = scriptText;
+                personaSummary.push(`Script: ${scriptSelection.label}`);
+                if (Object.keys(scriptVariables).length > 0) {
+                    personaSummary.push(`Filled variables: ${Object.keys(scriptVariables).join(', ')}`);
                 }
-            } catch (templateFetchError) {
-                console.error('❌ Failed to load template content:', templateFetchError);
-                await ctx.reply('⚠️ Could not load the selected template. Please type a custom message instead.');
+            } catch (scriptFetchError) {
+                console.error('❌ Failed to load script content:', scriptFetchError);
+                await ctx.reply('⚠️ Could not load the selected script. Please type a custom message instead.');
 
                 await ctx.reply('💬 Enter the SMS message (max 1600 characters):');
                 const msgContent = await waitForMessage();
                 message = msgContent?.message?.text?.trim();
 
-                if (!message) return ctx.reply('❌ Please provide a message.');
+                if (!message) return smsAlert(ctx, 'Please provide a message.');
                 if (message.length > 1600) {
                     return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
                 }
-                personaSummary.push('Template: Custom message (fallback)');
+                personaSummary.push('Script: Custom message (fallback)');
             }
         }
 
@@ -336,29 +942,74 @@ Tap an option below to continue.`;
             return ctx.reply(`❌ Message too long (${message.length} characters). Please shorten it below 1600 characters.`);
         }
 
-        if (templateName) {
-            payload.template_name = templateName;
+        if (scriptName) {
+            payload.script_name = scriptName;
         }
 
-        if (Object.keys(templateVariables).length > 0) {
-            payload.template_variables = templateVariables;
+        if (Object.keys(scriptVariables).length > 0) {
+            payload.script_variables = scriptVariables;
         }
 
-        const summaryLines = [
-            '📱 *SMS Details:*',
-            '',
-            `📞 To: ${number}`,
-            `💬 Message: ${message.substring(0, 100)}${message.length > 100 ? '...' : ''}`,
-            `📏 Length: ${message.length} characters`,
-        ];
+        let previewAction = null;
+        while (true) {
+            const segmentInfo = getSmsSegmentInfo(message);
+            const previewLines = [
+                '📱 SMS Preview',
+                '',
+                `📞 To: ${number}`,
+                `📏 Length: ${segmentInfo.length} characters`,
+                `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})`,
+                '',
+                '💬 Message:',
+                message
+            ];
 
-        if (personaSummary.length > 0) {
-            summaryLines.push('', ...personaSummary.map((line) => `• ${line}`));
+            if (personaSummary.length > 0) {
+                previewLines.push('', 'Details:', ...personaSummary.map((line) => `• ${line}`));
+            }
+
+            previewAction = await askWithGuard(
+                conversation,
+                ctx,
+                previewLines.join('\n'),
+                [
+                    { id: 'send', label: '✅ Send now' },
+                    { id: 'edit', label: '✏️ Edit message' },
+                    { id: 'cancel', label: '🛑 Cancel' }
+                ],
+                { prefix: 'sms-preview', columns: 2 }
+            );
+
+            if (!previewAction || previewAction.id === 'cancel') {
+                await ctx.reply(cancelledMessage('SMS flow', 'Use /sms to start again.'), {
+                    parse_mode: 'Markdown',
+                    reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+                });
+                return;
+            }
+
+            if (previewAction.id === 'edit') {
+                await ctx.reply('✏️ Edit the SMS message (max 1600 characters):');
+                const msgContent = await waitForMessage();
+                const edited = msgContent?.message?.text?.trim();
+                if (!edited) {
+                    await smsAlert(ctx, 'Please provide a message.');
+                    continue;
+                }
+                if (edited.length > 1600) {
+                    await ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
+                    continue;
+                }
+                message = edited;
+                continue;
+            }
+
+            if (previewAction.id === 'send') {
+                break;
+            }
         }
 
-        summaryLines.push('', '⏳ Sending SMS...');
-
-        await ctx.reply(summaryLines.join('\n'), { parse_mode: 'Markdown' });
+        await sendEphemeral(ctx, '⏳ Sending SMS...');
 
         const response = await guardedPost(`${config.apiUrl}/api/sms/send`, {
             ...payload,
@@ -370,15 +1021,20 @@ Tap an option below to continue.`;
         const data = response?.data || {};
 
         if (data.success) {
+            const segmentInfo = data.segment_info || getSmsSegmentInfo(message);
             const successMsg =
                 `✅ *SMS Sent Successfully!*\n\n` +
                 `📱 To: ${data.to}\n` +
                 `🆔 Message SID: \`${data.message_sid}\`\n` +
                 `📊 Status: ${data.status}\n` +
-                `📤 From: ${data.from}\n\n` +
+                `📤 From: ${data.from}\n` +
+                `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 You'll receive delivery notifications`;
 
-            await ctx.reply(successMsg, { parse_mode: 'Markdown' });
+            await ctx.reply(successMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
         } else {
             await ctx.reply('⚠️ SMS was sent but response format unexpected. Check logs.');
         }
@@ -388,28 +1044,7 @@ Tap an option below to continue.`;
             return;
         }
         console.error('SMS send error:', error);
-        if (error.response) {
-            console.error('SMS send error response data:', error.response.data);
-        }
-        let errorMsg = '❌ *SMS Failed*\n\n';
-
-        if (error.response) {
-            const status = error.response.status;
-            const errorData = error.response.data;
-            if (status === 400) {
-                errorMsg += `Bad Request: ${errorData?.error || 'Invalid data'}`;
-            } else if (status === 500) {
-                errorMsg += `Server Error: ${errorData?.error || 'Internal server error'}`;
-            } else {
-                errorMsg += `HTTP ${status}: ${errorData?.error || error.response.statusText}`;
-            }
-        } else if (error.request) {
-            errorMsg += `Network Error: Cannot reach API server\nURL: ${config.apiUrl}`;
-        } else {
-            errorMsg += `Error: ${error.message}`;
-        }
-
-        await ctx.reply(errorMsg, { parse_mode: 'Markdown' });
+        await replyApiError(ctx, error, 'SMS failed. Please try again.');
     }
 }
 
@@ -426,29 +1061,40 @@ async function bulkSmsFlow(conversation, ctx) {
         }
         return update;
     };
+    const askWithGuard = async (...params) => {
+        const result = await askOptionWithButtons(...params);
+        ensureActive();
+        return result;
+    };
+    const guardedPost = async (url, data, options = {}) => {
+        const controller = new AbortController();
+        const release = registerAbortController(ctx, controller);
+        try {
+            const response = await httpClient.post(null, url, data, { timeout: 30000, signal: controller.signal, ...options });
+            ensureActive();
+            return response;
+        } finally {
+            release();
+        }
+    };
 
     try {
         ensureActive();
-        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        const adminAllowed = await ensureAuthorizedAdmin(ctx);
         ensureActive();
-        if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+        if (!adminAllowed) {
             return;
         }
 
-        const adminStatus = await new Promise((resolve) => isAdmin(ctx.from.id, resolve));
-        ensureActive();
-        if (!adminStatus) {
-            await ctx.reply('❌ Bulk SMS is for administrators only.');
-            return;
-        }
-
-        await ctx.reply('📱 Enter phone numbers separated by commas or newlines (max 100):');
+        await ctx.reply(setupStepMessage('Bulk SMS setup (Step 1/3)', [
+            'Enter phone numbers separated by commas or new lines.',
+            'Maximum recipients: 100'
+        ]), { parse_mode: 'Markdown' });
 
         const numbersMsg = await waitForMessage();
         const numbersText = numbersMsg?.message?.text?.trim();
 
-        if (!numbersText) return ctx.reply('❌ Please provide phone numbers.');
+        if (!numbersText) return smsAlert(ctx, 'Please provide phone numbers.');
 
         const numbers = numbersText
             .split(/[,\n]/)
@@ -465,24 +1111,75 @@ async function bulkSmsFlow(conversation, ctx) {
             );
         }
 
-        await ctx.reply(`💬 Enter the message to send to ${numbers.length} recipients (max 1600 chars):`);
+        await ctx.reply(setupStepMessage('Bulk SMS setup (Step 2/3)', [
+            `Enter the message for ${numbers.length} recipient(s).`,
+            'Maximum length: 1600 characters'
+        ]), { parse_mode: 'Markdown' });
         const msgContent = await waitForMessage();
-        const message = msgContent?.message?.text?.trim();
+        let message = msgContent?.message?.text?.trim();
 
-        if (!message) return ctx.reply('❌ Please provide a message.');
+        if (!message) return smsAlert(ctx, 'Please provide a message.');
         if (message.length > 1600) {
             return ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
         }
 
-        const confirmText =
-            `📱 *Bulk SMS Details:*\n\n` +
-            `👥 Recipients: ${numbers.length}\n` +
-            `📱 Numbers: ${numbers.slice(0, 3).join(', ')}${numbers.length > 3 ? '...' : ''}\n` +
-            `💬 Message: ${message.substring(0, 80)}${message.length > 80 ? '...' : ''}\n` +
-            `📏 Length: ${message.length} characters\n\n` +
-            `⏳ Sending bulk SMS...`;
+        let previewAction = null;
+        while (true) {
+            const segmentInfo = getSmsSegmentInfo(message);
+            const previewLines = [
+                '📣 Bulk SMS Preview (Step 3/3)',
+                '',
+                `👥 Recipients: ${numbers.length}`,
+                `📱 Sample: ${numbers.slice(0, 3).join(', ')}${numbers.length > 3 ? '...' : ''}`,
+                `📏 Length: ${segmentInfo.length} characters`,
+                `📦 Segments: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})`,
+                '',
+                '💬 Message:',
+                message
+            ];
 
-        await ctx.reply(confirmText, { parse_mode: 'Markdown' });
+            previewAction = await askWithGuard(
+                conversation,
+                ctx,
+                previewLines.join('\n'),
+                [
+                    { id: 'send', label: '✅ Send now' },
+                    { id: 'edit', label: '✏️ Edit message' },
+                    { id: 'cancel', label: '🛑 Cancel' }
+                ],
+                { prefix: 'bulk-sms-preview', columns: 2 }
+            );
+
+            if (!previewAction || previewAction.id === 'cancel') {
+                await ctx.reply(cancelledMessage('Bulk SMS flow', 'Use /smssender to start again.'), {
+                    parse_mode: 'Markdown',
+                    reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
+                });
+                return;
+            }
+
+            if (previewAction.id === 'edit') {
+                await ctx.reply('✏️ Edit the bulk SMS message (max 1600 characters):');
+                const editedMsg = await waitForMessage();
+                const edited = editedMsg?.message?.text?.trim();
+                if (!edited) {
+                    await smsAlert(ctx, 'Please provide a message.');
+                    continue;
+                }
+                if (edited.length > 1600) {
+                    await ctx.reply('❌ Message too long. SMS messages must be under 1600 characters.');
+                    continue;
+                }
+                message = edited;
+                continue;
+            }
+
+            if (previewAction.id === 'send') {
+                break;
+            }
+        }
+
+        await sendEphemeral(ctx, '⏳ Sending bulk SMS...');
 
         const payload = {
             recipients: numbers,
@@ -499,19 +1196,32 @@ async function bulkSmsFlow(conversation, ctx) {
 
         if (data.success) {
             const result = data;
+            const segmentInfo = result.segment_info || getSmsSegmentInfo(message);
+            const scheduledCount = Number(result.scheduled) || 0;
+            const suppressedCount = Number(result.suppressed) || 0;
+            const invalidCount = Number(result.invalid) || 0;
+            const hardFailed = Math.max(0, result.failed - suppressedCount - invalidCount);
+            const immediateSent = Math.max(0, result.successful - scheduledCount);
             const successMsg =
                 `✅ *Bulk SMS Completed!*\n\n` +
                 `👥 Total Recipients: ${result.total}\n` +
-                `✅ Successful: ${result.successful}\n` +
-                `❌ Failed: ${result.failed}\n` +
+                `✅ Sent now: ${immediateSent}\n` +
+                `🗓️ Scheduled: ${scheduledCount}\n` +
+                `🚫 Suppressed (opt-out): ${suppressedCount}\n` +
+                `⚠️ Invalid numbers: ${invalidCount}\n` +
+                `❌ Failed: ${hardFailed}\n` +
                 `📊 Success Rate: ${Math.round((result.successful / result.total) * 100)}%\n\n` +
+                `📦 Segments per SMS: ${segmentInfo.segments} (${segmentInfo.encoding.toUpperCase()} ${segmentInfo.units}/${segmentInfo.per_segment})\n\n` +
                 `🔔 Individual delivery reports will follow`;
 
-            await ctx.reply(successMsg, { parse_mode: 'Markdown' });
+            await ctx.reply(successMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
+            });
 
-            if (result.failed > 0) {
-                const failedResults = result.results.filter(r => !r.success);
-                if (failedResults.length <= 10) {
+            if (hardFailed > 0) {
+                const failedResults = result.results.filter(r => !r.success && !r.suppressed && r.error !== 'invalid_phone_format');
+                if (failedResults.length <= 10 && failedResults.length > 0) {
                     let failedMsg = '❌ *Failed Numbers:*\n\n';
                     failedResults.forEach(r => {
                         failedMsg += `• ${r.recipient}: ${r.error}\n`;
@@ -520,7 +1230,9 @@ async function bulkSmsFlow(conversation, ctx) {
                 }
             }
         } else {
-            await ctx.reply('⚠️ Bulk SMS completed but response format unexpected.');
+            await ctx.reply('⚠️ Bulk SMS completed but response format unexpected.', {
+                reply_markup: buildBackToMenuKeyboard(ctx, 'BULK_SMS', '⬅️ Back to SMS Sender')
+            });
         }
     } catch (error) {
         if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
@@ -528,9 +1240,7 @@ async function bulkSmsFlow(conversation, ctx) {
             return;
         }
         console.error('Bulk SMS error:', error);
-        let errorMsg = '❌ *Bulk SMS Failed*\n\n';
-        errorMsg += error.response ? `Error: ${error.response.data?.error || 'Unknown error'}` : `Error: ${error.message}`;
-        await ctx.reply(errorMsg, { parse_mode: 'Markdown' });
+        await replyApiError(ctx, error, 'Bulk SMS failed. Please try again.');
     }
 }
 
@@ -551,7 +1261,7 @@ async function scheduleSmsFlow(conversation, ctx) {
         const controller = new AbortController();
         const release = registerAbortController(ctx, controller);
         try {
-            const response = await axios.post(url, data, { timeout: 30000, signal: controller.signal, ...options });
+            const response = await httpClient.post(null, url, data, { timeout: 30000, signal: controller.signal, ...options });
             ensureActive();
             return response;
         } finally {
@@ -561,10 +1271,9 @@ async function scheduleSmsFlow(conversation, ctx) {
 
     try {
         ensureActive();
-        const user = await new Promise((resolve) => getUser(ctx.from.id, resolve));
+        const userAllowed = await ensureAuthorizedUser(ctx);
         ensureActive();
-        if (!user) {
-            await ctx.reply('❌ You are not authorized to use this bot.');
+        if (!userAllowed) {
             return;
         }
 
@@ -577,7 +1286,10 @@ async function scheduleSmsFlow(conversation, ctx) {
                 delete ctx.session.meta.prefill;
             }
         } else {
-            await ctx.reply('📱 Enter phone number (E.164 format):');
+            await ctx.reply(setupStepMessage('Schedule SMS', [
+                'Enter phone number in E.164 format.',
+                'Example: +1234567890'
+            ]), { parse_mode: 'Markdown' });
             const numMsg = await waitForMessage();
             number = numMsg?.message?.text?.trim();
 
@@ -586,15 +1298,17 @@ async function scheduleSmsFlow(conversation, ctx) {
             }
         }
 
-        await ctx.reply('💬 Enter the message:');
+        await ctx.reply(setupStepMessage('Schedule SMS', [
+            'Enter the message to schedule.'
+        ]), { parse_mode: 'Markdown' });
         const msgContent = await waitForMessage();
         const message = msgContent?.message?.text?.trim();
-        if (!message) return ctx.reply('❌ Please provide a message.');
+        if (!message) return smsAlert(ctx, 'Please provide a message.');
 
         await ctx.reply('⏰ Enter schedule time (e.g., "2024-12-25 14:30" or "in 2 hours"):');
         const timeMsg = await waitForMessage();
         const timeText = timeMsg?.message?.text?.trim();
-        if (!timeText) return ctx.reply('❌ Please provide a schedule time.');
+        if (!timeText) return smsAlert(ctx, 'Please provide a schedule time.');
 
         let scheduledTime;
         try {
@@ -650,7 +1364,10 @@ async function scheduleSmsFlow(conversation, ctx) {
                 `📱 To: ${number}\n\n` +
                 `🔔 You'll receive confirmation when sent`;
 
-            await ctx.reply(successMsg, { parse_mode: 'Markdown' });
+            await ctx.reply(successMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: buildBackToMenuKeyboard(ctx, 'SMS')
+            });
         }
     } catch (error) {
         if (error instanceof OperationCancelledError || error?.name === 'AbortError' || error?.name === 'CanceledError') {
@@ -658,17 +1375,18 @@ async function scheduleSmsFlow(conversation, ctx) {
             return;
         }
         console.error('Schedule SMS error:', error);
-        await ctx.reply('❌ Failed to schedule SMS. Please try again.');
+        await replyApiError(ctx, error, 'Failed to schedule SMS. Please try again.');
     }
 }
 
 // FIXED: SMS conversation viewer - now gets data from database via API
 async function viewSmsConversation(ctx, phoneNumber) {
     try {
-        console.log(`Fetching SMS conversation for ${phoneNumber}`);
+        console.log('Fetching SMS conversation');
         
         // First try to get conversation from SMS service (in-memory)
-        const response = await axios.get(
+        const response = await httpClient.get(
+            null,
             `${config.apiUrl}/api/sms/conversation/${encodeURIComponent(phoneNumber)}`,
             { timeout: 15000 }
         );
@@ -689,7 +1407,7 @@ async function viewSmsConversation(ctx, phoneNumber) {
             const recentMessages = messages.slice(-10);
             recentMessages.forEach(msg => {
                 const time = new Date(msg.timestamp).toLocaleTimeString();
-                const sender = msg.role === 'user' ? '👤 Customer' : '🤖 AI';
+                const sender = msg.role === 'user' ? '👤 Victim' : '🤖 AI';
                 const cleanMsg = msg.content.replace(/[*_`[\]()~>#+=|{}.!-]/g, '\\$&');
                 conversationText += `\n${sender} _(${time})_\n${cleanMsg}\n`;
             });
@@ -701,7 +1419,7 @@ async function viewSmsConversation(ctx, phoneNumber) {
             await ctx.reply(conversationText, { parse_mode: 'Markdown' });
         } else {
             // If no active conversation, check database for stored SMS messages
-            console.log('No active conversation found, checking database...');
+            console.log('No active conversation found, checking database');
             await viewStoredSmsConversation(ctx, phoneNumber);
         }
     } catch (error) {
@@ -719,7 +1437,8 @@ async function viewSmsConversation(ctx, phoneNumber) {
 async function viewStoredSmsConversation(ctx, phoneNumber) {
     try {
         // Call API endpoint to get stored SMS messages from database
-        const response = await axios.get(
+        const response = await httpClient.get(
+            null,
             `${config.apiUrl}/api/sms/messages/conversation/${encodeURIComponent(phoneNumber)}`,
             { timeout: 15000 }
         );
@@ -763,7 +1482,7 @@ async function viewStoredSmsConversation(ctx, phoneNumber) {
         }
     } catch (error) {
         console.error('Error fetching stored SMS conversation:', error);
-        await ctx.reply('❌ No conversation found with this phone number');
+        await replyApiError(ctx, error, 'No conversation found with this phone number.');
     }
 }
 
@@ -773,10 +1492,10 @@ async function getSmsStats(ctx) {
         console.log('Fetching SMS stats...');
         
         // Get stats from SMS service (in-memory data)
-        const serviceResponse = await axios.get(`${config.apiUrl}/api/sms/stats`, { timeout: 10000 });
+        const serviceResponse = await httpClient.get(null, `${config.apiUrl}/api/sms/stats`, { timeout: 10000 });
         
         // Get additional stats from database
-        const dbStatsResponse = await axios.get(`${config.apiUrl}/api/sms/database-stats`, { timeout: 10000 });
+        const dbStatsResponse = await httpClient.get(null, `${config.apiUrl}/api/sms/database-stats`, { timeout: 10000 });
 
         let statsText = `📊 *SMS Statistics*\n\n`;
 
@@ -830,9 +1549,9 @@ async function getSmsStats(ctx) {
         
         // Fallback: try to get basic stats
         try {
-            const basicResponse = await axios.get(`${config.apiUrl}/api/sms/database-stats`, { timeout: 5000 });
+            const basicResponse = await httpClient.get(null, `${config.apiUrl}/api/sms/database-stats`, { timeout: 5000 });
             if (basicResponse.data.success) {
-                const stats = basicResponse.data.statistics;
+                const stats = basicResponse.data.statistics || basicResponse.data || {};
                 const basicStatsText = 
                     `📊 *Basic SMS Statistics*\n\n` +
                     `💬 Active Conversations: ${stats.active_conversations || 0}\n` +
@@ -842,251 +1561,98 @@ async function getSmsStats(ctx) {
                     
                 await ctx.reply(basicStatsText, { parse_mode: 'Markdown' });
             } else {
-                await ctx.reply('❌ Error fetching SMS statistics. Service may be down.');
+                await ctx.reply('Error fetching SMS statistics. Service may be down.');
             }
         } catch (fallbackError) {
-            await ctx.reply('❌ Error fetching SMS statistics. API server unreachable.');
+            await replyApiError(ctx, fallbackError, 'Error fetching SMS statistics. API server unreachable.');
         }
     }
 }
 
-// FIXED: SMS templates - now properly handles the API response
-// Register SMS command handlers with conversation flows
+// Register SMS command handlers with menu entry points
 function registerSmsCommands(bot) {
-
-    // Main SMS command
     bot.command('sms', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            await ctx.conversation.enter('sms-conversation');
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('SMS command error:', error);
-            await ctx.reply('❌ Could not start SMS process. Please try again.');
+            await ctx.reply('❌ Could not open SMS menu. Please try again.');
         }
     });
 
-    // Bulk SMS command
-    bot.command('bulksms', async ctx => {
+    bot.command('smssender', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) { 
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            const adminStatus = await new Promise(resolve => isAdmin(ctx.from.id, resolve));
-            if (!adminStatus) {
-                return ctx.reply('❌ Bulk SMS is for administrators only.');
-            }
-            await ctx.conversation.enter('bulk-sms-conversation');
+            await sendBulkSmsPreflightCard(ctx);
         } catch (error) {
             console.error('Bulk SMS command error:', error);
-            await ctx.reply('❌ Could not start bulk SMS process.');
+            await ctx.reply('❌ Could not open bulk SMS menu.');
         }
     });
 
-    // Schedule SMS command
     bot.command('schedulesms', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            await ctx.conversation.enter('schedule-sms-conversation');
+            await sendEphemeral(ctx, 'ℹ️ /schedulesms is now under /sms. Opening SMS menu…');
+            await maybeSendSmsAliasTip(ctx);
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('Schedule SMS command error:', error);
-            await ctx.reply('❌ Could not start SMS scheduling.');
+            await ctx.reply('❌ Could not open SMS menu.');
         }
     });
 
-    // FIXED: SMS conversation command
     bot.command('smsconversation', async ctx => {
         try {
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-            
-            const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
-            if (!adminStatus) {
-                return ctx.reply('❌ This command is for administrators only.');
-            }
-
-            const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                return ctx.reply(
-                    '📱 *Usage:* `/smsconversation <phone_number>`\n\n' +
-                    '**Example:** `/smsconversation +1234567890`\n\n' +
-                    'This will show the SMS conversation history with the specified phone number.',
-                    { parse_mode: 'Markdown' }
-                );
-            }
-            
-            const phoneNumber = args[1].trim();
-            if (!isValidPhoneNumber(phoneNumber)) {
-                return ctx.reply('❌ Invalid phone number format. Use E.164 format: +1234567890');
-            }
-            
-            await ctx.reply(`🔍 Searching for SMS conversation with ${phoneNumber}...`);
-            await viewSmsConversation(ctx, phoneNumber);
-            
+            await sendEphemeral(ctx, 'ℹ️ /smsconversation is now under /sms. Opening SMS menu…');
+            await maybeSendSmsAliasTip(ctx);
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('SMS conversation command error:', error);
-            await ctx.reply('❌ Error viewing SMS conversation. Please check the phone number format and try again.');
+            await ctx.reply('❌ Could not open SMS menu.');
         }
     });
 
-    // FIXED: SMS statistics command
     bot.command('smsstats', async ctx => {
         try {
-            const user = await new Promise(resolve => getUser(ctx.from.id, resolve));
-            if (!user) { 
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-
-            const adminStatus = await new Promise(resolve => isAdmin(ctx.from.id, resolve));
-            if (!adminStatus) {
-                return ctx.reply('❌ SMS statistics are for administrators only.');
-            }
-
-            await ctx.reply('📊 Fetching SMS statistics...');
-            await getSmsStats(ctx);
-            
+            await sendEphemeral(ctx, 'ℹ️ /smsstats is now under /sms. Opening SMS menu…');
+            await maybeSendSmsAliasTip(ctx);
+            await renderSmsMenu(ctx);
         } catch (error) {
             console.error('SMS stats command error:', error);
-            await ctx.reply('❌ Error fetching SMS statistics. Please try again later.');
+            await ctx.reply('❌ Could not open SMS menu.');
         }
     });
 
-    // Template designer commands are managed through /templates (see bot/commands/templates.js)
-
-    // NEW: SMS delivery status check command
     bot.command('smsstatus', async ctx => {
         try {
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-
             const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                return ctx.reply(
-                    '📱 *Usage:* `/smsstatus <message_sid>`\n\n' +
-                    '**Example:** `/smsstatus SM1234567890abcdef`\n\n' +
-                    'This will show the delivery status of a specific SMS message.',
-                    { parse_mode: 'Markdown' }
-                );
+            const messageSid = args.length > 1 ? args[1].trim() : '';
+            if (!messageSid) {
+                await sendEphemeral(ctx, 'ℹ️ /smsstatus is now under /sms. Opening SMS menu…');
+                await maybeSendSmsAliasTip(ctx);
+                await renderSmsMenu(ctx);
+                return;
             }
-
-            const messageSid = args[1].trim();
-            
-            await ctx.reply(`🔍 Checking status for message: ${messageSid}...`);
-            
-            try {
-                const response = await axios.get(`${config.apiUrl}/api/sms/status/${messageSid}`, {
-                    timeout: 10000
-                });
-                
-                if (response.data.success) {
-                    const msg = response.data.message;
-                    const statusText =
-                        `📱 *SMS Status Report*\n\n` +
-                        `🆔 **Message SID:** \`${msg.message_sid}\`\n` +
-                        `📞 **To:** ${msg.to_number || 'N/A'}\n` +
-                        `📤 **From:** ${msg.from_number || 'N/A'}\n` +
-                        `📊 **Status:** ${msg.status}\n` +
-                        `📅 **Created:** ${new Date(msg.created_at).toLocaleString()}\n` +
-                        `🔄 **Updated:** ${new Date(msg.updated_at).toLocaleString()}\n` +
-                        `📝 **Message:** ${msg.body.substring(0, 100)}${msg.body.length > 100 ? '...' : ''}\n`;
-                        
-                    if (msg.error_code || msg.error_message) {
-                        statusText += `\n❌ **Error:** ${msg.error_code} - ${msg.error_message}`;
-                    }
-                    
-                    if (msg.ai_response) {
-                        statusText += `\n🤖 **AI Response:** ${msg.ai_response.substring(0, 100)}${msg.ai_response.length > 100 ? '...' : ''}`;
-                    }
-                    
-                    await ctx.reply(statusText, { parse_mode: 'Markdown' });
-                } else {
-                    await ctx.reply(`❌ ${response.data.error || 'Message not found'}`);
-                }
-            } catch (apiError) {
-                console.error('SMS status API error:', apiError);
-                await ctx.reply('❌ Error checking SMS status. Message may not exist or API is unavailable.');
-            }
-            
+            await sendSmsStatusBySid(ctx, messageSid);
         } catch (error) {
             console.error('SMS status command error:', error);
             await ctx.reply('❌ Error checking SMS status. Please try again.');
         }
     });
 
-    // NEW: Recent SMS messages command
     bot.command('recentsms', async ctx => {
         try {
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
-
-            const adminStatus = await new Promise(r => isAdmin(ctx.from.id, r));
-            if (!adminStatus) {
-                return ctx.reply('❌ This command is for administrators only.');
-            }
-            
             const args = ctx.message.text.split(' ');
-            const limit = args.length > 1 ? Math.min(parseInt(args[1]) || 10, 20) : 10;
-            
-            await ctx.reply(`📱 Fetching last ${limit} SMS messages...`);
-            
-            try {
-                const response = await axios.get(`${config.apiUrl}/api/sms/messages/recent`, {
-                    params: { limit },
-                    timeout: 10000
-                });
-                
-                if (response.data.success && response.data.messages.length > 0) {
-                    const messages = response.data.messages;
-                    
-                    let messagesText = `📱 *Recent SMS Messages (${messages.length})*\n\n`;
-                    
-                    messages.forEach((msg, index) => {
-                        const time = new Date(msg.created_at).toLocaleString();
-                        const direction = msg.direction === 'inbound' ? '📨' : '📤';
-                        const phone = msg.to_number || msg.from_number || 'Unknown';
-                        const statusIcon = msg.status === 'delivered' ? '✅' : 
-                                         msg.status === 'failed' ? '❌' : 
-                                         msg.status === 'pending' ? '⏳' : '❓';
-                        
-                        messagesText += 
-                            `${index + 1}. ${direction} ${phone} ${statusIcon}\n` +
-                            `   Status: ${msg.status} | ${time}\n` +
-                            `   Message: ${msg.body.substring(0, 60)}${msg.body.length > 60 ? '...' : ''}\n`;
-                            
-                        if (msg.error_message) {
-                            messagesText += `   Error: ${msg.error_message}\n`;
-                        }
-                        
-                        messagesText += '\n';
-                    });
-                    
-                    messagesText += `Use /smsstatus <message_sid> for detailed status info`;
-                    
-                    await ctx.reply(messagesText, { parse_mode: 'Markdown' });
-                } else {
-                    await ctx.reply('📱 No recent SMS messages found.');
-                }
-                
-            } catch (apiError) {
-                console.error('Recent SMS API error:', apiError);
-                await ctx.reply('❌ Error fetching recent SMS messages. API may be unavailable.');
+            const limit = args.length > 1 ? Math.min(parseInt(args[1]) || 10, 20) : null;
+            if (!limit) {
+                await sendEphemeral(ctx, 'ℹ️ /recentsms is now under /sms. Opening SMS menu…');
+                await maybeSendSmsAliasTip(ctx);
+                await renderSmsMenu(ctx);
+                return;
             }
-            
+            await sendRecentSms(ctx, limit);
         } catch (error) {
             console.error('Recent SMS command error:', error);
-            await ctx.reply('❌ Error fetching recent SMS messages.');
+            await ctx.reply('❌ Error fetching recent SMS messages. Please try again later.');
         }
     });
 }
@@ -1095,9 +1661,19 @@ module.exports = {
     smsFlow,
     bulkSmsFlow,
     scheduleSmsFlow,
+    smsStatusFlow,
+    smsConversationFlow,
+    recentSmsFlow,
+    smsStatsFlow,
+    bulkSmsStatusFlow,
+    renderSmsMenu,
+    renderBulkSmsMenu,
+    sendRecentSms,
+    sendBulkSmsList,
+    sendBulkSmsStats,
+    sendBulkSmsPreflightCard,
     registerSmsCommands,
     viewSmsConversation,
     getSmsStats,
-    // Export new functions
     viewStoredSmsConversation
 };

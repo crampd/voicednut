@@ -1,93 +1,176 @@
 const { InlineKeyboard } = require('grammy');
-const { isAdmin, getUser } = require('../db/db');
 const config = require('../config');
+const { getAccessProfile } = require('../utils/capabilities');
+const { escapeHtml, renderMenu } = require('../utils/ui');
+const { buildCallbackData } = require('../utils/actions');
 
-module.exports = (bot) => {
-    bot.command('help', async (ctx) => {
-        try {
-            // Check if user is authorized
-            const user = await new Promise(r => getUser(ctx.from.id, r));
-            if (!user) {
-                return ctx.reply('❌ You are not authorized to use this bot.');
-            }
+function getMiniAppLaunchUrl() {
+    const configured = String(config.miniApp?.url || '').trim();
+    if (configured) return configured;
+    try {
+        return new URL('/miniapp', config.apiUrl).toString();
+    } catch {
+        return '';
+    }
+}
 
-            const isOwner = await new Promise(r => isAdmin(ctx.from.id, r));
-            
-            // Build help text using HTML formatting (more reliable)
-            let helpText = `📱 <b>Basic Commands</b>
-• /start - Restart bot &amp; show main menu
-• /call - Start a new voice call
-• /sms - Send an SMS message
-• /miniapp - Open web app for advanced actions
-• /smsconversation &lt;phone&gt; - View SMS conversation
-• /transcript &lt;call_sid&gt; - Get call transcript
-• /calls [limit] - List recent calls (max 50)
-• /health or /ping - Check bot &amp; API health
-• /guide - Show detailed usage guide
-• /menu - Show quick action buttons
-• /help - Show this help message`;
+function appendMiniAppLaunchButton(keyboard, label = '🧭 Admin Console') {
+    const launchUrl = getMiniAppLaunchUrl();
+    if (!launchUrl) return false;
+    if (typeof keyboard.webApp === 'function') {
+        keyboard.row().webApp(label, launchUrl);
+    } else {
+        keyboard.row().url(label, launchUrl);
+    }
+    return true;
+}
 
-            if (isOwner) {
-                helpText += `
+async function handleHelp(ctx) {
+    try {
+        const access = await getAccessProfile(ctx);
+        const isAuthorized = Boolean(access?.isAuthorized);
+        const isOwner = Boolean(access?.isAdmin);
 
-👑 <b>Admin Commands</b>
-• /adduser - Add new authorized user
-• /promote - Promote user to admin
-• /removeuser - Remove user access
-• /users - List all authorized users
-• /bulksms - Send bulk SMS messages
-• /schedulesms - Schedule SMS for later
-• /templates - Manage call &amp; SMS templates
-• /persona - Manage adaptive personas
-• /provider - View or switch call provider
-• /smsstats - View SMS statistics
-• /status - Full system status check
-• /testapi - Test API connection`;
-            }
+        const formatLines = (items) => items.map((item) => `• ${escapeHtml(item)}`).join('\n');
 
-            helpText += `
+        const callList = [
+            '📞 /call — launch a fresh voice session (requires access)',
+            '📜 /calllog — browse recent calls, search, and events'
+        ];
 
-📖 <b>Quick Usage</b>
-1. Use /call or click 📞 Call button
-2. Enter phone number (E.164 format: +1234567890)
-3. Define agent behavior/prompt
-4. Set initial message to be spoken
-5. Monitor call progress and receive notifications
+        const smsList = [
+            '💬 /sms — open the SMS center (send, schedule, status, threads, stats)'
+        ];
 
-💡 <b>Examples</b>
-• Phone format: +1234567890 (not 123-456-7890)
-• Get transcript: /transcript CA1234567890abcdef
-• List calls: /calls 20
-• Check health: /health
+        const emailList = [
+            '📧 /email — open the Email center (send, status, templates)'
+        ];
 
-🆘 <b>Support &amp; Info</b>
-• Contact admin: @${config.admin.username}
-• Bot version: 2.0.0
-• For issues or questions, contact support`;
+        const infoList = [
+            '🩺 /health or /ping — check bot & API health',
+            '📚 /guide — view the master user guide (access required)',
+            '📋 /menu — reopen quick actions (access required)',
+            '❓ /help — show this message again'
+        ];
 
-            const kb = new InlineKeyboard()
-                .text('📞 New Call', 'CALL')
-                .text('📋 Menu', 'MENU')
-                .row()
-                .text('💬 New Sms', 'SMS')
-                .text('📚 Full Guide', 'GUIDE');
+        const quickUsage = [
+            'Use /call or the 📞 button to get started',
+            'Enter phone numbers in E.164 format (+1234567890)',
+            'Describe the AI agent personality and first message',
+            'Monitor live updates and ask for transcripts',
+            'End the call with the ✋ Interrupt or ⏹️ End button if needed'
+        ];
 
-            if (isOwner) {
-                kb.row()
-                    .text('👥 Users', 'USERS')
-                    .text('➕ Add User', 'ADDUSER')
-                    .row()
-                    .text('☎️ Provider', 'PROVIDER_STATUS');
-            }
+        const exampleUsage = [
+            '+1234567890 (not 123-456-7890)',
+            '/calllog',
+            '/health'
+        ];
 
-            await ctx.reply(helpText, {
-                parse_mode: 'HTML',
-                reply_markup: kb
-            });
+        const supportBlock = [
+            `🆘 Contact admin: @${escapeHtml(config.admin.username || '')}`,
+            '🧭 Bot edition: v2.0.0'
+        ];
 
-        } catch (error) {
-            console.error('Help command error:', error);
-            await ctx.reply('❌ Error displaying help. Please try again.');
+        const helpSections = [
+            `<b>${escapeHtml('AI calling controls and command guide.')}</b>`,
+            `<b>Call Tools</b>\n${formatLines(callList)}`,
+            `<b>SMS Tools</b>\n${formatLines(smsList)}`,
+            `<b>Email Tools</b>\n${formatLines(emailList)}`,
+            `<b>Navigation & Info</b>\n${formatLines(infoList)}`,
+            `<b>Quick Usage Flow</b>\n${formatLines(quickUsage)}`
+        ];
+
+        if (isOwner) {
+            const adminList = [
+                '👥 /users — manage authorized personnel',
+                '📵 /callerflags — manage inbound caller flags',
+                '📣 /smssender — bulk SMS center',
+                '📦 /mailer — bulk email center',
+                '🧪 /status — deep system status',
+                '🧭 /admin — open the Mini App admin console',
+                '🧰 /scripts — manage reusable prompts',
+                '🍃 /persona — sculpt adaptive agents',
+                '🔀 /provider — view or switch voice providers'
+            ];
+            helpSections.push(`<b>Admin Toolkit</b>\n${formatLines(adminList)}`);
         }
-    });
+
+        helpSections.push(
+            `<b>Examples</b>\n${formatLines(exampleUsage)}`,
+            `<b>Support & Info</b>\n${formatLines(supportBlock)}`
+        );
+
+        const unauthSections = [
+            `<b>${escapeHtml('⚠️ Access limited')}</b>\n${formatLines([
+                'You can browse menus, but actions require approval.'
+            ])}`,
+            `<b>${escapeHtml('Welcome! Access is required to use most commands.')}</b>`,
+            `<b>What this bot can do</b>\n${formatLines([
+                '🤖 Run AI-powered voice calls and SMS outreach',
+                '🧾 Track conversations and delivery status',
+                '🛡️ Admins manage users, scripts, and providers'
+            ])}`,
+            `<b>Get access</b>\n${formatLines([
+                `🆘 Contact admin: @${escapeHtml(config.admin.username || '')}`,
+                'Share your Telegram @ and reason to be approved.',
+                'Once approved, use /start to see your menu.'
+            ])}`,
+            `<b>${escapeHtml('🔒 Limited mode')}</b>\n${formatLines([
+                'Menus are visible, but execution is locked.'
+            ])}`
+        ];
+
+        const helpText = isAuthorized ? helpSections.join('\n\n') : unauthSections.join('\n\n');
+
+        const adminUsername = (config.admin.username || '').replace(/^@/, '');
+
+        const kb = isAuthorized
+            ? (() => {
+                const keyboard = new InlineKeyboard()
+                    .text('📞 Call', buildCallbackData(ctx, 'CALL'))
+                    .text('💬 SMS', buildCallbackData(ctx, 'SMS'))
+                    .row()
+                    .text('📧 Email', buildCallbackData(ctx, 'EMAIL'))
+                    .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
+
+                keyboard.row()
+                    .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                    .text('ℹ️ Help', buildCallbackData(ctx, 'HELP'));
+
+                if (isOwner) {
+                    keyboard.row()
+                        .text('👥 Users', buildCallbackData(ctx, 'USERS'))
+                        .text('📵 Caller Flags', buildCallbackData(ctx, 'CALLER_FLAGS'))
+                        .row()
+                        .text('☎️ Provider', buildCallbackData(ctx, 'PROVIDER_STATUS'));
+                    appendMiniAppLaunchButton(keyboard);
+                }
+                return keyboard;
+            })()
+            : (() => {
+                const keyboard = new InlineKeyboard()
+                    .text('📚 Guide', buildCallbackData(ctx, 'GUIDE'))
+                    .text('📋 Menu', buildCallbackData(ctx, 'MENU'));
+                if (adminUsername) {
+                    keyboard.row().url('🔓 Request Access', `https://t.me/${adminUsername}`);
+                }
+                return keyboard;
+            })();
+
+        await renderMenu(ctx, helpText, kb, { parseMode: 'HTML' });
+
+    } catch (error) {
+        console.error('Help command error:', error);
+        await ctx.reply('❌ Error displaying help. Please try again.');
+    }
+}
+
+function registerHelpCommand(bot) {
+    bot.command('help', handleHelp);
+}
+
+module.exports = {
+    registerHelpCommand,
+    handleHelp
 };

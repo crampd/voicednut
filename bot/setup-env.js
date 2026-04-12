@@ -21,17 +21,9 @@ const SECTIONS = [
     ],
   },
   {
-    comments: ['# Bot admin API token (must match API ADMIN_API_TOKEN)'],
+    comments: ['# API secret (must match API_SECRET on server)'],
     fields: [
-      { key: 'ADMIN_API_TOKEN', prompt: 'Admin API Token', defaultValue: 'change-me' },
-    ],
-  },
-  {
-    comments: ['# Mini App / web app embedding'],
-    fields: [
-      { key: 'MINI_APP_URL', prompt: 'Mini App URL', defaultValue: 'https://your-mini-app.example.com' },
-      { key: 'WEB_APP_SECRET', prompt: 'Web App Secret', defaultValue: 'change-me' },
-      { key: 'WEB_APP_PORT', prompt: 'Web App Port', defaultValue: '8080' },
+      { key: 'API_SECRET', prompt: 'API Secret', defaultValue: 'change-me' },
     ],
   },
 ];

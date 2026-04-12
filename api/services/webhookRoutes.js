@@ -1,0 +1,2445 @@
+const {
+  buildCanonicalCallStatusEvent,
+  buildCanonicalSmsInboundEvent,
+  buildCanonicalSmsDeliveryEvent,
+} = require("../adapters/providerFlowPolicy");
+
+const WEBHOOK_AUTH_POLICIES = Object.freeze({
+  telegram: Object.freeze({
+    id: "telegram",
+    label: "/webhook/telegram",
+    verifier: "requireValidTelegramWebhook",
+  }),
+  twilio_call_status: Object.freeze({
+    id: "twilio_call_status",
+    label: "/webhook/call-status",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_stream: Object.freeze({
+    id: "twilio_stream",
+    label: "/webhook/twilio-stream",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_pay_start: Object.freeze({
+    id: "twilio_pay_start",
+    label: "/webhook/twilio-pay/start",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_pay_complete: Object.freeze({
+    id: "twilio_pay_complete",
+    label: "/webhook/twilio-pay/complete",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_pay_status: Object.freeze({
+    id: "twilio_pay_status",
+    label: "/webhook/twilio-pay/status",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_sms: Object.freeze({
+    id: "twilio_sms",
+    label: "/webhook/sms",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_sms_status: Object.freeze({
+    id: "twilio_sms_status",
+    label: "/webhook/sms-status",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_sms_delivery: Object.freeze({
+    id: "twilio_sms_delivery",
+    label: "/webhook/sms-delivery",
+    verifier: "requireValidTwilioSignature",
+  }),
+  twilio_gather: Object.freeze({
+    id: "twilio_gather",
+    label: "/webhook/twilio-gather",
+    verifier: "requireValidTwilioSignature",
+  }),
+  aws_status: Object.freeze({
+    id: "aws_status",
+    label: "/webhook/aws/status",
+    verifier: "requireValidAwsWebhook",
+  }),
+  vonage_answer: Object.freeze({
+    id: "vonage_answer",
+    label: "/va",
+    verifier: "requireValidVonageWebhook",
+  }),
+  vonage_event: Object.freeze({
+    id: "vonage_event",
+    label: "/ve",
+    verifier: "requireValidVonageWebhook",
+  }),
+  vonage_sms: Object.freeze({
+    id: "vonage_sms",
+    label: "/vs",
+    verifier: "requireValidVonageWebhook",
+  }),
+  vonage_delivery: Object.freeze({
+    id: "vonage_delivery",
+    label: "/vd",
+    verifier: "requireValidVonageWebhook",
+  }),
+  email_events: Object.freeze({
+    id: "email_events",
+    label: "/webhook/email",
+    verifier: "requireValidEmailWebhook",
+  }),
+});
+
+function createWebhookAuthGuard(ctx = {}) {
+  return function withWebhookAuth(policyKey, handler) {
+    const policy = WEBHOOK_AUTH_POLICIES[policyKey];
+    if (!policy || typeof handler !== "function") {
+      return handler;
+    }
+    return function guardedWebhookHandler(req, res, next) {
+      if (res?.locals) {
+        res.locals.webhookAuthPolicy = policy.id;
+      }
+      const verifier = ctx[policy.verifier];
+      if (typeof verifier !== "function") {
+        console.warn("webhook_auth_verifier_missing", {
+          policy: policy.id,
+          verifier: policy.verifier,
+          request_id: req?.requestId || null,
+        });
+        return handler(req, res, next);
+      }
+      const label = req?.path || req?.originalUrl || policy.label;
+      const ok = verifier(req, res, label);
+      if (!ok) {
+        console.warn("webhook_auth_rejected", {
+          policy: policy.id,
+          request_id: req?.requestId || null,
+          path: label,
+        });
+        return;
+      }
+      return handler(req, res, next);
+    };
+  };
+}
+
+function getDb(ctx = {}) {
+  return typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+}
+
+function getDigitService(ctx = {}) {
+  return typeof ctx.getDigitService === "function" ? ctx.getDigitService() : ctx.digitService;
+}
+
+async function dedupeProviderEvent(asyncFn, syncFn, source, payload, options = {}) {
+  const fn = typeof asyncFn === "function"
+    ? asyncFn
+    : typeof syncFn === "function"
+      ? syncFn
+      : null;
+  if (!fn) {
+    return { allow: true };
+  }
+  try {
+    const result = await fn(source, payload, options);
+    if (result === false) {
+      return { allow: false, duplicate: true };
+    }
+    if (result && typeof result === "object" && Object.hasOwn(result, "allow")) {
+      return result;
+    }
+    return { allow: true };
+  } catch (error) {
+    const errorCode = error?.code || "provider_event_dedupe_error";
+    const retryable = errorCode === "provider_event_idempotency_unavailable";
+    console.error("provider_event_dedupe_error", {
+      source: source || null,
+      code: errorCode,
+      retryable,
+      error: error?.message || String(error || "unknown"),
+    });
+    return {
+      allow: false,
+      duplicate: false,
+      retryable,
+      reason: errorCode,
+    };
+  }
+}
+
+function shouldShortCircuitProviderDedupe(res, decision = {}) {
+  if (decision?.allow !== false) return false;
+  if (decision?.retryable) {
+    res.status(503).send("Service unavailable");
+    return true;
+  }
+  res.status(200).send("OK");
+  return true;
+}
+
+function shouldSkipProviderDedupeDecision(decision = {}) {
+  return decision?.allow === false && !decision?.retryable;
+}
+
+function shouldFailProviderDedupeDecision(decision = {}) {
+  return decision?.allow === false && decision?.retryable;
+}
+
+function logProviderDedupeSkip(eventName, req, decision = {}) {
+  if (!shouldSkipProviderDedupeDecision(decision)) return;
+  console.log(eventName, {
+    request_id: req?.requestId || null,
+    reason: decision?.reason || "duplicate",
+  });
+}
+
+function logProviderDedupeFailure(eventName, req, decision = {}) {
+  if (!shouldFailProviderDedupeDecision(decision)) return;
+  console.warn(eventName, {
+    request_id: req?.requestId || null,
+    reason: decision?.reason || "provider_event_dedupe_error",
+  });
+}
+
+function escapeHtml(value = "") {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function pickTranscriptAudioUrl(call = {}, states = []) {
+  const pickHttp = (value) => {
+    const candidate = String(value || "").trim();
+    if (!candidate) return null;
+    if (!/^https?:\/\//i.test(candidate)) return null;
+    return candidate;
+  };
+
+  const callCandidates = [
+    call.transcript_audio_url,
+    call.transcriptAudioUrl,
+    call.recording_url,
+    call.recordingUrl,
+    call.audio_url,
+    call.audioUrl,
+  ];
+  for (const candidate of callCandidates) {
+    const url = pickHttp(candidate);
+    if (url) return url;
+  }
+
+  for (const state of Array.isArray(states) ? states : []) {
+    const data =
+      state?.data && typeof state.data === "object" && !Array.isArray(state.data)
+        ? state.data
+        : {};
+    const stateCandidates = [
+      data.transcript_audio_url,
+      data.transcriptAudioUrl,
+      data.recording_url,
+      data.recordingUrl,
+      data.audio_url,
+      data.audioUrl,
+      data.media_url,
+      data.mediaUrl,
+      data.url,
+    ];
+    for (const candidate of stateCandidates) {
+      const url = pickHttp(candidate);
+      if (url) return url;
+    }
+  }
+
+  return null;
+}
+
+function normalizeTranscriptMessage(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function buildTranscriptAudioNarration(transcripts = [], call = {}, maxChars = 2600) {
+  const safeMaxChars = Math.max(800, Math.min(Number(maxChars) || 2600, 10000));
+  const label = normalizeTranscriptMessage(
+    call?.customer_name || call?.victim_name || call?.phone_number || "the contact",
+  );
+  const lines = [`Call transcript for ${label}.`];
+  let totalChars = lines[0].length;
+
+  for (const entry of Array.isArray(transcripts) ? transcripts : []) {
+    const message = normalizeTranscriptMessage(entry?.message);
+    if (!message) continue;
+    const speaker = String(entry?.speaker || "").toLowerCase() === "ai" ? "Agent" : "Customer";
+    const line = `${speaker}: ${message}.`;
+    if (totalChars + line.length + 1 > safeMaxChars) break;
+    lines.push(line);
+    totalChars += line.length + 1;
+  }
+
+  return lines.length > 1 ? lines.join(" ") : "";
+}
+
+function renderSecureCapturePage({
+  title = "Secure Capture",
+  message = "",
+  callSid = "",
+  token = "",
+  includeForm = false,
+  profile = "verification",
+  statusCode = 200,
+}) {
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
+  const safeCallSid = escapeHtml(callSid);
+  const safeToken = escapeHtml(token);
+  const safeProfile = escapeHtml(String(profile || "verification"));
+  const profileLabel = safeProfile.replace(/_/g, " ");
+  return {
+    statusCode,
+    body: `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${safeTitle}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f7f8fa; color: #111827; }
+    main { max-width: 420px; margin: 32px auto; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
+    h1 { font-size: 1.1rem; margin: 0 0 10px; }
+    p { margin: 8px 0 14px; line-height: 1.45; color: #374151; }
+    label { display: block; font-weight: 600; margin: 8px 0 6px; font-size: 0.95rem; }
+    input[type="text"] { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 1rem; }
+    button { margin-top: 12px; width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; font-size: 1rem; font-weight: 600; background: #111827; color: #fff; }
+    small { color: #6b7280; display: block; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${safeTitle}</h1>
+    <p>${safeMessage}</p>
+    ${includeForm ? `<form method="post" action="/capture/secure">
+      <input type="hidden" name="callSid" value="${safeCallSid}">
+      <input type="hidden" name="token" value="${safeToken}">
+      <label for="digits">Enter ${profileLabel}</label>
+      <input id="digits" name="digits" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" required maxlength="32">
+      <button type="submit">Submit securely</button>
+    </form>
+    <small>Digits are processed securely and never logged in raw form.</small>` : ""}
+  </main>
+</body>
+</html>`,
+  };
+}
+
+function createSecureCaptureViewHandler(ctx = {}) {
+  return async function handleSecureCaptureView(req, res) {
+    try {
+      const callSid = String(req.query?.callSid || "").trim();
+      const token = String(req.query?.token || "").trim();
+      if (!callSid || !token || callSid.length > 128 || token.length > 256) {
+        const page = renderSecureCapturePage({
+          title: "Secure session invalid",
+          message: "The secure capture link is missing required parameters.",
+          statusCode: 400,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.validateSecureCaptureToken) {
+        const page = renderSecureCapturePage({
+          title: "Service unavailable",
+          message: "Secure capture is temporarily unavailable. Please try again.",
+          statusCode: 503,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const validation = digitService.validateSecureCaptureToken(callSid, token);
+      if (!validation.ok) {
+        const expired = validation.reason === "token_expired" || validation.reason === "token_not_found";
+        const page = renderSecureCapturePage({
+          title: expired ? "Session expired" : "Unauthorized session",
+          message: expired
+            ? "This secure menu has expired. Request a new capture session from the call flow."
+            : "This secure menu is no longer valid.",
+          statusCode: expired ? 410 : 401,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const expectation = digitService.getExpectation ? digitService.getExpectation(callSid) : null;
+      const page = renderSecureCapturePage({
+        title: "Secure digit capture",
+        message: "Enter digits to continue your verification flow.",
+        callSid,
+        token,
+        includeForm: true,
+        profile: expectation?.profile || validation.profile || "verification",
+        statusCode: 200,
+      });
+      return res.status(page.statusCode).type("html").send(page.body);
+    } catch (error) {
+      console.error("Secure capture view handler error:", error);
+      const page = renderSecureCapturePage({
+        title: "Service unavailable",
+        message: "Secure capture is temporarily unavailable. Please try again.",
+        statusCode: 503,
+      });
+      return res.status(page.statusCode).type("html").send(page.body);
+    }
+  };
+}
+
+function createSecureCaptureSubmitHandler(ctx = {}) {
+  return async function handleSecureCaptureSubmit(req, res) {
+    try {
+      const callSid = String(req.body?.callSid || req.query?.callSid || "").trim();
+      const token = String(req.body?.token || req.query?.token || "").trim();
+      const digits = String(req.body?.digits || "").trim();
+      if (!callSid || !token || callSid.length > 128 || token.length > 256) {
+        const page = renderSecureCapturePage({
+          title: "Secure session invalid",
+          message: "Missing call session details. Open a fresh secure link.",
+          statusCode: 400,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      if (digits.length > 64) {
+        const page = renderSecureCapturePage({
+          title: "Secure capture failed",
+          message: "Please enter digits only.",
+          callSid,
+          token,
+          includeForm: true,
+          statusCode: 400,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.handleSecureCaptureInput) {
+        const page = renderSecureCapturePage({
+          title: "Service unavailable",
+          message: "Secure capture is temporarily unavailable. Please try again.",
+          statusCode: 503,
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      const result = await digitService.handleSecureCaptureInput({
+        callSid,
+        tokenRef: token,
+        digits,
+        source: "link",
+      });
+      if (!result?.ok) {
+        const expired = result?.code === "session_expired" || result?.code === "token_expired";
+        const invalidDigits = result?.code === "invalid_digits";
+        const page = renderSecureCapturePage({
+          title: expired ? "Session expired" : "Secure capture failed",
+          message: expired
+            ? "This secure menu expired. Request a fresh capture prompt."
+            : invalidDigits
+              ? "Please enter digits only."
+              : "Unable to submit digits for this session.",
+          callSid,
+          token,
+          includeForm: invalidDigits,
+          statusCode: Number(result?.status) || (expired ? 410 : 400),
+        });
+        return res.status(page.statusCode).type("html").send(page.body);
+      }
+      if (result.duplicate) {
+        const page = renderSecureCapturePage({
+          title: "Already processed",
+          message: "This input was already processed. You can close this page.",
+          statusCode: 200,
+        });
+        return res.status(200).type("html").send(page.body);
+      }
+      if (result.accepted) {
+        const page = renderSecureCapturePage({
+          title: "Code accepted",
+          message: "Your secure input was received successfully.",
+          statusCode: 200,
+        });
+        return res.status(200).type("html").send(page.body);
+      }
+      if (result.fallback) {
+        const page = renderSecureCapturePage({
+          title: "Need additional help",
+          message: "We could not verify that input. The call flow will continue with fallback handling.",
+          statusCode: 200,
+        });
+        return res.status(200).type("html").send(page.body);
+      }
+      const page = renderSecureCapturePage({
+        title: "Try again",
+        message: "That input was not accepted yet. Enter digits again to continue.",
+        callSid,
+        token,
+        includeForm: true,
+        statusCode: 200,
+      });
+      return res.status(200).type("html").send(page.body);
+    } catch (error) {
+      console.error("Secure capture submit handler error:", error);
+      const page = renderSecureCapturePage({
+        title: "Service unavailable",
+        message: "Secure capture is temporarily unavailable. Please try again.",
+        statusCode: 503,
+      });
+      return res.status(page.statusCode).type("html").send(page.body);
+    }
+  };
+}
+
+function createTelegramWebhookHandler(ctx = {}) {
+  const {
+    requireValidTelegramWebhook,
+    webhookService,
+    buildRetrySmsBody,
+    smsService,
+    buildRetryPayload,
+    scheduleCallJob,
+    formatContactLabel,
+    placeOutboundCall,
+    buildRecapSmsBody,
+    logConsoleAction,
+    buildInboundSmsBody,
+    config,
+    buildCallbackPayload,
+    normalizePhoneForFlag,
+    endCallForProvider,
+  } = ctx;
+
+  return async function handleTelegramWebhook(req, res) {
+    try {
+      if (!requireValidTelegramWebhook(req, res, "/webhook/telegram")) {
+        return;
+      }
+      const db = getDb(ctx);
+      const update = req.body;
+      res.status(200).send("OK");
+
+      if (!update) return;
+      const cb = update.callback_query;
+      if (!cb?.data) return;
+
+      const parts = cb.data.split(":");
+      const prefix = parts[0];
+      let action = null;
+      let callSid = null;
+      if (prefix === "lc") {
+        action = parts[1];
+        callSid = parts[2];
+      } else if (prefix === "recap" || prefix === "retry") {
+        action = parts[1];
+        callSid = parts[2];
+      } else {
+        callSid = parts[1];
+      }
+      if (!prefix || !callSid || (prefix === "lc" && !action)) {
+        webhookService
+          .answerCallbackQuery(cb.id, "Unsupported action")
+          .catch(() => {});
+        return;
+      }
+
+      if (prefix === "retry") {
+        const retryAction = action;
+        try {
+          const callRecord = await db.getCall(callSid).catch(() => null);
+          const chatId = cb.message?.chat?.id;
+          if (!callRecord) {
+            webhookService
+              .answerCallbackQuery(cb.id, "Call not found")
+              .catch(() => {});
+            return;
+          }
+          if (
+            callRecord.user_chat_id &&
+            chatId &&
+            String(callRecord.user_chat_id) !== String(chatId)
+          ) {
+            webhookService
+              .answerCallbackQuery(cb.id, "Not authorized for this call")
+              .catch(() => {});
+            return;
+          }
+
+          if (retryAction === "sms") {
+            if (!callRecord?.phone_number) {
+              webhookService
+                .answerCallbackQuery(cb.id, "No phone number on record")
+                .catch(() => {});
+              return;
+            }
+            const callState = await db
+              .getLatestCallState(callSid, "call_created")
+              .catch(() => null);
+            const smsBody = buildRetrySmsBody(callRecord, callState);
+            try {
+              await smsService.sendSMS(callRecord.phone_number, smsBody);
+              webhookService
+                .answerCallbackQuery(cb.id, "SMS sent")
+                .catch(() => {});
+              await webhookService.sendTelegramMessage(
+                chatId,
+                "💬 Follow-up SMS sent to the victim.",
+              );
+            } catch (smsError) {
+              webhookService
+                .answerCallbackQuery(cb.id, "Failed to send SMS")
+                .catch(() => {});
+              await webhookService.sendTelegramMessage(
+                chatId,
+                `❌ Failed to send follow-up SMS: ${smsError.message || smsError}`,
+              );
+            }
+            return;
+          }
+
+          const payload = await buildRetryPayload(callSid);
+          const delayMs = retryAction === "15m" ? 15 * 60 * 1000 : 0;
+
+          if (delayMs > 0) {
+            const runAt = new Date(Date.now() + delayMs).toISOString();
+            await scheduleCallJob("outbound_call", payload, runAt);
+            await db
+              .updateCallState(callSid, "retry_scheduled", {
+                at: new Date().toISOString(),
+                run_at: runAt,
+              })
+              .catch(() => {});
+            webhookService
+              .answerCallbackQuery(cb.id, "Retry scheduled")
+              .catch(() => {});
+            await webhookService.sendTelegramMessage(
+              chatId,
+              `⏲ Retry scheduled in 15 minutes for ${formatContactLabel(payload)}.`,
+            );
+            return;
+          }
+
+          const retryResult = await placeOutboundCall(payload);
+          webhookService
+            .answerCallbackQuery(cb.id, "Retry started")
+            .catch(() => {});
+          await webhookService.sendTelegramMessage(
+            chatId,
+            `🔁 Retry started for ${formatContactLabel(payload)} (call ${retryResult.callId.slice(-6)}).`,
+          );
+        } catch (error) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Retry failed")
+            .catch(() => {});
+          await webhookService.sendTelegramMessage(
+            cb.message?.chat?.id,
+            `❌ Retry failed: ${error.message || error}`,
+          );
+        }
+        return;
+      }
+
+      if (prefix === "recap") {
+        try {
+          const callRecord = await db.getCall(callSid).catch(() => null);
+          const chatId = cb.message?.chat?.id;
+          if (
+            callRecord?.user_chat_id &&
+            chatId &&
+            String(callRecord.user_chat_id) !== String(chatId)
+          ) {
+            webhookService
+              .answerCallbackQuery(cb.id, "Not authorized for this call")
+              .catch(() => {});
+            return;
+          }
+
+          const recapAction = parts[1];
+          if (recapAction === "skip") {
+            webhookService.answerCallbackQuery(cb.id, "Skipped").catch(() => {});
+            return;
+          }
+
+          if (recapAction === "sms") {
+            if (!callRecord?.phone_number) {
+              webhookService
+                .answerCallbackQuery(cb.id, "No phone number on record")
+                .catch(() => {});
+              return;
+            }
+
+            const smsBody = buildRecapSmsBody(callRecord);
+            try {
+              await smsService.sendSMS(callRecord.phone_number, smsBody);
+              webhookService
+                .answerCallbackQuery(cb.id, "Recap sent via SMS")
+                .catch(() => {});
+              await webhookService.sendTelegramMessage(
+                chatId,
+                "📩 Recap sent via SMS to the victim.",
+              );
+            } catch (smsError) {
+              webhookService
+                .answerCallbackQuery(cb.id, "Failed to send SMS")
+                .catch(() => {});
+              await webhookService.sendTelegramMessage(
+                chatId,
+                `❌ Failed to send recap SMS: ${smsError.message || smsError}`,
+              );
+            }
+            return;
+          }
+        } catch (error) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Error handling recap")
+            .catch(() => {});
+        }
+        return;
+      }
+
+      const callRecord = await db.getCall(callSid).catch(() => null);
+      const chatId = cb.message?.chat?.id;
+      if (!callRecord) {
+        webhookService
+          .answerCallbackQuery(cb.id, "Call not found")
+          .catch(() => {});
+        return;
+      }
+      if (
+        callRecord?.user_chat_id &&
+        chatId &&
+        String(callRecord.user_chat_id) !== String(chatId)
+      ) {
+        webhookService
+          .answerCallbackQuery(cb.id, "Not authorized for this call")
+          .catch(() => {});
+        return;
+      }
+      const callState = await db
+        .getLatestCallState(callSid, "call_created")
+        .catch(() => null);
+
+      if (prefix === "tr") {
+        webhookService
+          .answerCallbackQuery(cb.id, "Sending transcript...")
+          .catch(() => {});
+        await webhookService.sendFullTranscript(
+          callSid,
+          chatId,
+          cb.message?.message_id,
+        );
+        return;
+      }
+
+      if (prefix === "rca") {
+        webhookService
+          .answerCallbackQuery(cb.id, "Fetching recording…")
+          .catch(() => {});
+        try {
+          await db.updateCallState(callSid, "recording_access_requested", {
+            at: new Date().toISOString(),
+          });
+        } catch (stateError) {
+          console.error("Failed to log recording access request:", stateError);
+        }
+
+        const callStates = await db.getCallStates(callSid, { limit: 40 }).catch(() => []);
+        let audioUrl = pickTranscriptAudioUrl(callRecord, callStates);
+        if (!audioUrl && typeof ctx.getTranscriptAudioUrl === "function") {
+          const transcripts = await db.getCallTranscripts(callSid).catch(() => []);
+          const narration = buildTranscriptAudioNarration(
+            transcripts,
+            callRecord,
+            ctx.transcriptAudioMaxChars,
+          );
+          if (narration) {
+            try {
+              audioUrl = await ctx.getTranscriptAudioUrl(narration, callRecord, {
+                timeoutMs: ctx.transcriptAudioTimeoutMs,
+              });
+              if (audioUrl) {
+                await db
+                  .updateCallState(callSid, "transcript_audio_ready", {
+                    audio_url: audioUrl,
+                    source: "transcript_tts",
+                    generated_at: new Date().toISOString(),
+                  })
+                  .catch(() => {});
+              }
+            } catch (audioError) {
+              console.error("Failed to generate transcript audio:", audioError);
+            }
+          }
+        }
+
+        if (!audioUrl) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Recording not ready yet")
+            .catch(() => {});
+          await webhookService.sendTelegramMessage(
+            chatId,
+            "🎧 Transcript audio is not available yet. Please try again in a moment.",
+          );
+          return;
+        }
+
+        try {
+          await webhookService.sendTelegramAudio(chatId, audioUrl, "🎧 Transcript audio");
+          webhookService.answerCallbackQuery(cb.id, "Recording sent").catch(() => {});
+        } catch (sendAudioError) {
+          console.error("Failed to send transcript audio to Telegram:", sendAudioError);
+          webhookService.answerCallbackQuery(cb.id, "Failed to send recording").catch(() => {});
+          await webhookService.sendTelegramMessage(
+            chatId,
+            `🎧 Transcript audio link: ${audioUrl}`,
+          );
+        }
+        return;
+      }
+
+      if (action === "answer" || action === "decline") {
+        webhookService
+          .answerCallbackQuery(cb.id, "Answer/decline is managed by admin controls")
+          .catch(() => {});
+        return;
+      }
+
+      if (action === "privacy") {
+        const redacted = webhookService.togglePreviewRedaction(callSid);
+        if (redacted === null) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Console not active")
+            .catch(() => {});
+          return;
+        }
+        const label = redacted ? "Preview hidden" : "Preview revealed";
+        await logConsoleAction(callSid, "privacy", { redacted });
+        webhookService.answerCallbackQuery(cb.id, label).catch(() => {});
+        return;
+      }
+
+      if (action === "actions") {
+        const expanded = webhookService.toggleConsoleActions(callSid);
+        if (expanded === null) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Console not active")
+            .catch(() => {});
+          return;
+        }
+        webhookService
+          .answerCallbackQuery(
+            cb.id,
+            expanded ? "Actions expanded" : "Actions hidden",
+          )
+          .catch(() => {});
+        return;
+      }
+
+      if (action === "sms") {
+        if (!callRecord?.phone_number) {
+          webhookService
+            .answerCallbackQuery(cb.id, "No phone number on record")
+            .catch(() => {});
+          return;
+        }
+        webhookService.lockConsoleButtons(callSid, "Sending SMS…");
+        try {
+          const inbound = callState?.inbound === true;
+          const smsBody = inbound
+            ? buildInboundSmsBody(callRecord, callState)
+            : buildRetrySmsBody(callRecord, callState);
+          await smsService.sendSMS(callRecord.phone_number, smsBody);
+          webhookService.addLiveEvent(callSid, "💬 Follow-up SMS sent", {
+            force: true,
+          });
+          await logConsoleAction(callSid, "sms", {
+            inbound,
+            to: callRecord.phone_number,
+          });
+          webhookService.answerCallbackQuery(cb.id, "SMS sent").catch(() => {});
+        } catch (smsError) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Failed to send SMS")
+            .catch(() => {});
+          await webhookService.sendTelegramMessage(
+            chatId,
+            `❌ Failed to send follow-up SMS: ${smsError.message || smsError}`,
+          );
+        } finally {
+          setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
+        }
+        return;
+      }
+
+      if (action === "callback") {
+        if (!callRecord?.phone_number) {
+          webhookService
+            .answerCallbackQuery(cb.id, "No phone number on record")
+            .catch(() => {});
+          return;
+        }
+        webhookService.lockConsoleButtons(callSid, "Scheduling…");
+        try {
+          const delayMin = Math.max(
+            1,
+            Number(config.inbound?.callbackDelayMinutes) || 15,
+          );
+          const runAt = new Date(Date.now() + delayMin * 60 * 1000).toISOString();
+          const payload = buildCallbackPayload(callRecord, callState);
+          await scheduleCallJob("callback_call", payload, runAt);
+          webhookService.addLiveEvent(
+            callSid,
+            `⏲ Callback scheduled in ${delayMin}m`,
+            { force: true },
+          );
+          await logConsoleAction(callSid, "callback_scheduled", {
+            run_at: runAt,
+          });
+          webhookService
+            .answerCallbackQuery(cb.id, "Callback scheduled")
+            .catch(() => {});
+        } catch (callbackError) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Failed to schedule callback")
+            .catch(() => {});
+        } finally {
+          setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
+        }
+        return;
+      }
+
+      if (action === "block" || action === "allow" || action === "spam") {
+        if (!callRecord?.phone_number) {
+          webhookService
+            .answerCallbackQuery(cb.id, "No phone number on record")
+            .catch(() => {});
+          return;
+        }
+        const status =
+          action === "block"
+            ? "blocked"
+            : action === "allow"
+              ? "allowed"
+              : "spam";
+        const flagPhone =
+          normalizePhoneForFlag(callRecord.phone_number) ||
+          callRecord.phone_number;
+        webhookService.lockConsoleButtons(callSid, "Saving…");
+        try {
+          await db.setCallerFlag(flagPhone, status, {
+            updated_by: chatId,
+            source: "telegram",
+          });
+          webhookService.setCallerFlag(callSid, status);
+          webhookService.addLiveEvent(callSid, `📛 Caller marked ${status}`, {
+            force: true,
+          });
+          await logConsoleAction(callSid, "caller_flag", {
+            status,
+            phone_number: flagPhone,
+          });
+          webhookService
+            .answerCallbackQuery(cb.id, `Caller ${status}`)
+            .catch(() => {});
+        } catch (flagError) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Failed to update caller flag")
+            .catch(() => {});
+        } finally {
+          setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
+        }
+        return;
+      }
+
+      if (action === "rec") {
+        webhookService.lockConsoleButtons(callSid, "Recording…");
+        try {
+          await db.updateCallState(callSid, "recording_requested", {
+            at: new Date().toISOString(),
+          });
+          webhookService.addLiveEvent(callSid, "⏺ Recording requested", {
+            force: true,
+          });
+          await logConsoleAction(callSid, "recording");
+          webhookService
+            .answerCallbackQuery(cb.id, "Recording toggled")
+            .catch(() => {});
+        } catch (e) {
+          webhookService
+            .answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180))
+            .catch(() => {});
+        }
+        setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1200);
+        return;
+      }
+
+      if (action === "compact") {
+        const isCompact = webhookService.toggleConsoleCompact(callSid);
+        if (isCompact === null) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Console not active")
+            .catch(() => {});
+          return;
+        }
+        await logConsoleAction(callSid, "compact", { compact: isCompact });
+        webhookService
+          .answerCallbackQuery(
+            cb.id,
+            isCompact ? "Compact view enabled" : "Full view enabled",
+          )
+          .catch(() => {});
+        return;
+      }
+
+      if (action === "end") {
+        webhookService.lockConsoleButtons(callSid, "Ending…");
+        try {
+          await endCallForProvider(callSid);
+          webhookService.setLiveCallPhase(callSid, "ended").catch(() => {});
+          await logConsoleAction(callSid, "end");
+          webhookService
+            .answerCallbackQuery(cb.id, "Ending call...")
+            .catch(() => {});
+        } catch (e) {
+          webhookService
+            .answerCallbackQuery(cb.id, `Failed: ${e.message}`.slice(0, 180))
+            .catch(() => {});
+          webhookService.unlockConsoleButtons(callSid);
+        }
+        setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1500);
+        return;
+      }
+
+      if (action === "xfer") {
+        if (!config.twilio.transferNumber) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Transfer not configured")
+            .catch(() => {});
+          return;
+        }
+        webhookService.lockConsoleButtons(callSid, "Transferring…");
+        try {
+          const transferCall =
+            typeof ctx.getTransferCall === "function"
+              ? ctx.getTransferCall()
+              : require("../functions/transferCall");
+          await transferCall({ callSid });
+          webhookService.markToolInvocation(callSid, "transferCall").catch(() => {});
+          await logConsoleAction(callSid, "transfer");
+          webhookService
+            .answerCallbackQuery(cb.id, "Transferring...")
+            .catch(() => {});
+        } catch (e) {
+          webhookService
+            .answerCallbackQuery(
+              cb.id,
+              `Transfer failed: ${e.message}`.slice(0, 180),
+            )
+            .catch(() => {});
+          webhookService.unlockConsoleButtons(callSid);
+        }
+        setTimeout(() => webhookService.unlockConsoleButtons(callSid), 2000);
+        return;
+      }
+    } catch (error) {
+      try {
+        res.status(200).send("OK");
+      } catch {}
+      console.error("Telegram webhook error:", error);
+    }
+  };
+}
+
+function createCallStatusWebhookHandler(ctx = {}) {
+  const { requireValidTwilioSignature, processCallStatusWebhookPayload } = ctx;
+  return async function handleCallStatusWebhook(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/call-status")) {
+        return;
+      }
+      await processCallStatusWebhookPayload(req.body, { source: "provider" });
+    } catch (error) {
+      console.error("Error processing fixed call status webhook:", error);
+      const db = getDb(ctx);
+      try {
+        await db?.logServiceHealth("webhook_system", "error", {
+          operation: "process_webhook",
+          error: error.message,
+          call_sid: req.body?.CallSid,
+        });
+      } catch (logError) {
+        console.error("Failed to log webhook error:", logError);
+      }
+    }
+    res.status(200).send("OK");
+  };
+}
+
+function createTwilioStreamWebhookHandler(ctx = {}) {
+  const { requireValidTwilioSignature, streamStatusDedupe, activeStreamConnections } =
+    ctx;
+  return function handleTwilioStreamWebhook(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/twilio-stream")) {
+        return;
+      }
+      const db = getDb(ctx);
+      const payload = req.body || {};
+      const callSid = payload.CallSid || payload.callSid || "unknown";
+      const streamSid = payload.StreamSid || payload.streamSid || "unknown";
+      const eventType =
+        payload.EventType || payload.eventType || payload.event || "unknown";
+      const dedupeKey = `${callSid}:${streamSid}:${eventType}`;
+      const now = Date.now();
+      const lastSeen = streamStatusDedupe.get(dedupeKey);
+      if (!lastSeen || now - lastSeen > 2000) {
+        streamStatusDedupe.set(dedupeKey, now);
+        console.log("Twilio stream status", {
+          callSid,
+          streamSid,
+          eventType,
+          status: payload.StreamStatus || payload.streamStatus || null,
+        });
+      }
+
+      if (eventType === "start") {
+        if (callSid !== "unknown" && streamSid !== "unknown") {
+          const existing = activeStreamConnections.get(callSid);
+          if (!existing) {
+            activeStreamConnections.set(callSid, {
+              ws: null,
+              streamSid,
+              connectedAt: new Date().toISOString(),
+            });
+          }
+          db
+            ?.updateCallState(callSid, "stream_status_start", {
+              stream_sid: streamSid,
+              at: new Date().toISOString(),
+            })
+            .catch(() => {});
+        }
+      } else if (eventType === "end") {
+        if (callSid !== "unknown") {
+          db
+            ?.updateCallState(callSid, "stream_status_end", {
+              stream_sid: streamSid,
+              at: new Date().toISOString(),
+            })
+            .catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error("Twilio stream status webhook error:", err);
+    }
+    res.status(200).send("OK");
+  };
+}
+
+function resolveWebhookHost(ctx = {}, req = null) {
+  const fromResolver =
+    typeof ctx.resolveHost === "function" ? ctx.resolveHost(req) : null;
+  const fromConfig = ctx.config?.server?.hostname || null;
+  const fromHeader =
+    req?.headers?.["x-forwarded-host"] || req?.headers?.host || null;
+  return String(fromResolver || fromConfig || fromHeader || "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+}
+
+function createTwilioPayStartHandler(ctx = {}) {
+  const { requireValidTwilioSignature } = ctx;
+  return async function handleTwilioPayStart(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/twilio-pay/start")) {
+        return;
+      }
+      const callSid = String(req.body?.CallSid || req.query?.callSid || "").trim();
+      const paymentId = String(
+        req.query?.paymentId || req.body?.paymentId || "",
+      ).trim();
+      if (!callSid) {
+        return res.status(400).send("Missing CallSid");
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.buildTwilioPaymentTwiml) {
+        return res.status(200).send("OK");
+      }
+      const host = resolveWebhookHost(ctx, req);
+      const result = await digitService.buildTwilioPaymentTwiml(callSid, {
+        paymentId,
+        hostname: host,
+      });
+      if (result?.twiml) {
+        res.type("text/xml");
+        res.end(result.twiml);
+        return;
+      }
+      res.status(200).send("OK");
+    } catch (error) {
+      console.error("Twilio pay start webhook error:", error);
+      res.status(200).send("OK");
+    }
+  };
+}
+
+function createTwilioPayCompleteHandler(ctx = {}) {
+  const { requireValidTwilioSignature } = ctx;
+  return async function handleTwilioPayComplete(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/twilio-pay/complete")) {
+        return;
+      }
+      const callSid = String(req.body?.CallSid || req.query?.callSid || "").trim();
+      const paymentId = String(
+        req.query?.paymentId || req.body?.paymentId || "",
+      ).trim();
+      if (!callSid) {
+        return res.status(400).send("Missing CallSid");
+      }
+      const digitService = getDigitService(ctx);
+      if (!digitService?.handleTwilioPaymentCompletion) {
+        return res.status(200).send("OK");
+      }
+      const host = resolveWebhookHost(ctx, req);
+      const result = await digitService.handleTwilioPaymentCompletion(
+        callSid,
+        req.body || {},
+        { paymentId, hostname: host },
+      );
+      if (result?.twiml) {
+        res.type("text/xml");
+        res.end(result.twiml);
+        return;
+      }
+      res.status(200).send("OK");
+    } catch (error) {
+      console.error("Twilio pay complete webhook error:", error);
+      res.status(200).send("OK");
+    }
+  };
+}
+
+function createTwilioPayStatusHandler(ctx = {}) {
+  const { requireValidTwilioSignature } = ctx;
+  return async function handleTwilioPayStatus(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/twilio-pay/status")) {
+        return;
+      }
+      const callSid = String(req.body?.CallSid || req.query?.callSid || "").trim();
+      if (!callSid) {
+        return res.status(200).send("OK");
+      }
+      const digitService = getDigitService(ctx);
+      if (digitService?.handleTwilioPaymentStatus) {
+        await digitService.handleTwilioPaymentStatus(callSid, req.body || {}, {
+          paymentId:
+            req.query?.paymentId || req.body?.paymentId || req.body?.PaymentSid || null,
+        });
+      }
+    } catch (error) {
+      console.error("Twilio pay status webhook error:", error);
+    }
+    res.status(200).send("OK");
+  };
+}
+
+function getVonageSmsPayload(req = {}) {
+  const queryPayload = req?.query && typeof req.query === "object" ? req.query : {};
+  const bodyPayload = req?.body && typeof req.body === "object" ? req.body : {};
+  return {
+    ...queryPayload,
+    ...bodyPayload,
+  };
+}
+
+function createSmsWebhookHandler(ctx = {}) {
+  const {
+    requireValidTwilioSignature,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    smsWebhookDedupeTtlMs,
+    maskPhoneForLog,
+    maskSmsBodyForLog,
+    smsService,
+  } = ctx;
+  return async function handleSmsWebhook(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/sms")) {
+        return;
+      }
+      const db = getDb(ctx);
+      const canonicalInbound = buildCanonicalSmsInboundEvent(
+        "twilio",
+        req.body || {},
+      );
+      const inboundSid = canonicalInbound.message_sid;
+      const from = String(canonicalInbound.from || "").trim();
+      const body = String(canonicalInbound.body || "");
+
+      if (!from || !body) {
+        console.warn("sms_webhook_invalid_payload", {
+          request_id: req.requestId || null,
+          message_sid: inboundSid,
+          has_from: Boolean(from),
+          has_body: Boolean(body),
+        });
+        return res.status(200).send("OK");
+      }
+
+      if (inboundSid) {
+        const dedupeDecision = await dedupeProviderEvent(
+          shouldProcessProviderEventAsync,
+          shouldProcessProviderEvent,
+          "twilio_sms_inbound",
+          {
+            messageSid: inboundSid,
+            from,
+            direction: req.body?.Direction || null,
+          },
+          {
+            ttlMs:
+              Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+              Number(smsWebhookDedupeTtlMs) > 0
+                ? Number(smsWebhookDedupeTtlMs)
+                : undefined,
+          },
+        );
+        if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+          logProviderDedupeFailure("sms_webhook_dedupe_unavailable", req, dedupeDecision);
+          logProviderDedupeSkip("sms_webhook_duplicate_ignored", req, dedupeDecision);
+          return;
+        }
+      }
+
+      console.log("sms_webhook_received", {
+        request_id: req.requestId || null,
+        from: maskPhoneForLog(from),
+        body: maskSmsBodyForLog(body),
+        message_sid: inboundSid,
+      });
+
+      const digitService =
+        typeof ctx.getDigitService === "function"
+          ? ctx.getDigitService()
+          : ctx.digitService;
+      if (digitService?.handleIncomingSms) {
+        const handled = await digitService.handleIncomingSms(from, body);
+        if (handled?.handled) {
+          res.status(200).send("OK");
+          return;
+        }
+      }
+
+      if (!smsService?.handleIncomingSMS) {
+        return res.status(503).send("SMS service unavailable");
+      }
+
+      const result = await smsService.handleIncomingSMS(from, body, inboundSid);
+
+      if (db) {
+        await db.saveSMSMessage({
+          message_sid: inboundSid,
+          from_number: from,
+          body,
+          status: canonicalInbound.status || canonicalInbound.raw_status || null,
+          direction: "inbound",
+          provider: "twilio",
+          ai_response: result.ai_response,
+          response_message_sid: result.message_sid,
+        });
+      }
+
+      res.status(200).send("OK");
+    } catch (error) {
+      console.error("SMS webhook error:", error);
+      res.status(500).send("Error");
+    }
+  };
+}
+
+function createVonageSmsWebhookHandler(ctx = {}) {
+  const {
+    requireValidVonageWebhook,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    smsWebhookDedupeTtlMs,
+    maskPhoneForLog,
+    maskSmsBodyForLog,
+    smsService,
+  } = ctx;
+  return async function handleVonageSmsWebhook(req, res) {
+    try {
+      if (
+        typeof requireValidVonageWebhook === "function" &&
+        !requireValidVonageWebhook(req, res, req.path || "/vs")
+      ) {
+        return;
+      }
+      const db = getDb(ctx);
+      const payload = getVonageSmsPayload(req);
+      const canonicalInbound = buildCanonicalSmsInboundEvent("vonage", payload);
+      const inboundSid = canonicalInbound.message_sid;
+      const from = String(canonicalInbound.from || "").trim();
+      const body = String(canonicalInbound.body || "").trim();
+      const status = String(
+        canonicalInbound.status || canonicalInbound.raw_status || "received",
+      ).trim();
+
+      if (!from || !body) {
+        console.warn("vonage_sms_webhook_invalid_payload", {
+          request_id: req.requestId || null,
+          message_sid: inboundSid,
+          has_from: Boolean(from),
+          has_body: Boolean(body),
+        });
+        return res.status(200).send("OK");
+      }
+
+      if (inboundSid) {
+        const dedupeDecision = await dedupeProviderEvent(
+          shouldProcessProviderEventAsync,
+          shouldProcessProviderEvent,
+          "vonage_sms_inbound",
+          {
+            messageSid: inboundSid,
+            from,
+            status: status || null,
+            type: payload.type || null,
+          },
+          {
+            ttlMs:
+              Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+              Number(smsWebhookDedupeTtlMs) > 0
+                ? Number(smsWebhookDedupeTtlMs)
+                : undefined,
+          },
+        );
+        if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+          logProviderDedupeFailure(
+            "vonage_sms_webhook_dedupe_unavailable",
+            req,
+            dedupeDecision,
+          );
+          logProviderDedupeSkip("vonage_sms_webhook_duplicate_ignored", req, dedupeDecision);
+          return;
+        }
+      }
+
+      const maskPhone = typeof maskPhoneForLog === "function"
+        ? maskPhoneForLog
+        : (value) => String(value || "");
+      const maskBody = typeof maskSmsBodyForLog === "function"
+        ? maskSmsBodyForLog
+        : (value) => String(value || "");
+      console.log("vonage_sms_webhook_received", {
+        request_id: req.requestId || null,
+        from: maskPhone(from),
+        body: maskBody(body),
+        message_sid: inboundSid,
+      });
+
+      const digitService =
+        typeof ctx.getDigitService === "function"
+          ? ctx.getDigitService()
+          : ctx.digitService;
+      if (digitService?.handleIncomingSms) {
+        const handled = await digitService.handleIncomingSms(from, body);
+        if (handled?.handled) {
+          res.status(200).send("OK");
+          return;
+        }
+      }
+
+      if (!smsService?.handleIncomingSMS) {
+        return res.status(503).send("SMS service unavailable");
+      }
+
+      const result = await smsService.handleIncomingSMS(from, body, inboundSid);
+
+      if (db) {
+        await db.saveSMSMessage({
+          message_sid: inboundSid,
+          from_number: from,
+          to_number: canonicalInbound.to || null,
+          body,
+          status: status || "received",
+          direction: "inbound",
+          provider: "vonage",
+          ai_response: result.ai_response,
+          response_message_sid: result.message_sid,
+        });
+      }
+
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("Vonage SMS webhook error:", error);
+      return res.status(200).send("OK");
+    }
+  };
+}
+
+function createSmsStatusWebhookHandler(ctx = {}) {
+  const {
+    requireValidTwilioSignature,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    smsWebhookDedupeTtlMs,
+  } = ctx;
+  return async function handleSmsStatusWebhook(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/sms-status")) {
+        return;
+      }
+      const db = getDb(ctx);
+      const canonicalDelivery = buildCanonicalSmsDeliveryEvent(
+        "twilio",
+        req.body || {},
+      );
+      const messageSid = String(canonicalDelivery.message_sid || "").trim();
+      if (!messageSid) {
+        console.warn("sms_status_webhook_missing_sid", {
+          request_id: req.requestId || null,
+          status: canonicalDelivery.raw_status || null,
+        });
+        return res.status(200).send("OK");
+      }
+      const dedupeDecision = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "twilio_sms_status",
+        {
+          messageSid,
+          status: canonicalDelivery.status || null,
+          errorCode: canonicalDelivery.error_code || null,
+        },
+        {
+          ttlMs:
+            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+            Number(smsWebhookDedupeTtlMs) > 0
+              ? Number(smsWebhookDedupeTtlMs)
+              : undefined,
+        },
+      );
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure("sms_status_dedupe_unavailable", req, dedupeDecision);
+        logProviderDedupeSkip("sms_status_duplicate_ignored", req, dedupeDecision);
+        return;
+      }
+
+      console.log(`SMS status update: ${messageSid} -> ${canonicalDelivery.status}`);
+
+      if (db) {
+        const changes = await db.updateSMSStatus(messageSid, {
+          status: canonicalDelivery.status || canonicalDelivery.raw_status,
+          error_code: canonicalDelivery.error_code,
+          error_message: canonicalDelivery.error_message,
+          updated_at: new Date(),
+        });
+        if (!changes) {
+          console.warn("sms_status_webhook_unknown_sid", {
+            request_id: req.requestId || null,
+            message_sid: messageSid,
+            status: canonicalDelivery.status || null,
+          });
+        }
+      }
+
+      res.status(200).send("OK");
+    } catch (error) {
+      console.error("SMS status webhook error:", error);
+      res.status(500).send("OK");
+    }
+  };
+}
+
+function createVonageSmsDeliveryWebhookHandler(ctx = {}) {
+  const {
+    requireValidVonageWebhook,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    smsWebhookDedupeTtlMs,
+  } = ctx;
+  return async function handleVonageSmsDeliveryWebhook(req, res) {
+    try {
+      if (
+        typeof requireValidVonageWebhook === "function" &&
+        !requireValidVonageWebhook(req, res, req.path || "/vd")
+      ) {
+        return;
+      }
+      const db = getDb(ctx);
+      const payload = getVonageSmsPayload(req);
+      const canonicalDelivery = buildCanonicalSmsDeliveryEvent("vonage", payload);
+      const messageSid = String(canonicalDelivery.message_sid || "").trim();
+      const errorCode = canonicalDelivery.error_code || null;
+      const errorMessage = canonicalDelivery.error_message || null;
+      const normalizedStatus =
+        canonicalDelivery.status || canonicalDelivery.raw_status || "queued";
+      if (!messageSid) {
+        console.warn("vonage_sms_delivery_missing_sid", {
+          request_id: req.requestId || null,
+          status: canonicalDelivery.raw_status || null,
+        });
+        return res.status(200).send("OK");
+      }
+      const dedupeDecision = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "vonage_sms_delivery",
+        {
+          messageSid,
+          status: normalizedStatus || null,
+          errorCode,
+          timestamp:
+            canonicalDelivery.timestamp ||
+            null,
+        },
+        {
+          ttlMs:
+            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+            Number(smsWebhookDedupeTtlMs) > 0
+              ? Number(smsWebhookDedupeTtlMs)
+              : undefined,
+        },
+      );
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure(
+          "vonage_sms_delivery_dedupe_unavailable",
+          req,
+          dedupeDecision,
+        );
+        logProviderDedupeSkip("vonage_sms_delivery_duplicate_ignored", req, dedupeDecision);
+        return;
+      }
+
+      console.log("Vonage SMS delivery update", {
+        message_sid: messageSid,
+        status: normalizedStatus,
+        error_code: errorCode,
+      });
+
+      if (db) {
+        const changes = await db.updateSMSStatus(messageSid, {
+          status: normalizedStatus,
+          error_code: errorCode,
+          error_message: errorMessage,
+        });
+        if (!changes) {
+          console.warn("vonage_sms_delivery_unknown_sid", {
+            request_id: req.requestId || null,
+            message_sid: messageSid,
+            status: normalizedStatus || null,
+          });
+        }
+
+        const message = await new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT * FROM sms_messages WHERE message_sid = ?`,
+            [messageSid],
+            (err, row) => {
+              if (err) reject(err);
+              else resolve(row);
+            },
+          );
+        });
+
+        if (message && message.user_chat_id) {
+          const notificationType =
+            normalizedStatus === "delivered"
+              ? "sms_delivered"
+              : normalizedStatus === "failed" || normalizedStatus === "rejected"
+                ? "sms_failed"
+                : `sms_${normalizedStatus}`;
+          await db.createEnhancedWebhookNotification(
+            messageSid,
+            notificationType,
+            message.user_chat_id,
+            normalizedStatus === "failed" ? "high" : "normal",
+          );
+        }
+      }
+
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("Vonage SMS delivery webhook error:", error);
+      return res.status(200).send("OK");
+    }
+  };
+}
+
+function createEmailWebhookHandler(ctx = {}) {
+  return async function handleEmailWebhook(req, res) {
+    try {
+      if (
+        typeof ctx.requireValidEmailWebhook === "function" &&
+        !ctx.requireValidEmailWebhook(req, res, "/webhook/email")
+      ) {
+        return;
+      }
+      const emailService =
+        typeof ctx.getEmailService === "function"
+          ? ctx.getEmailService()
+          : ctx.emailService;
+      if (!emailService) {
+        return res
+          .status(500)
+          .json({ success: false, error: "Email service not initialized" });
+      }
+      const result = await emailService.handleProviderEvent(req.body || {});
+      return res.json({ success: true, ...result });
+    } catch (error) {
+      console.error("❌ Email webhook error:", error);
+      return res.status(500).json({
+        success: false,
+        error: "Email webhook processing failed",
+        details: error.message,
+      });
+    }
+  };
+}
+
+function createEmailUnsubscribeWebhookHandler(ctx = {}) {
+  return async function handleEmailUnsubscribeWebhook(req, res) {
+    try {
+      const db = getDb(ctx);
+      if (!db) {
+        return res.status(500).send("Database not initialized");
+      }
+      const emailService =
+        typeof ctx.getEmailService === "function"
+          ? ctx.getEmailService()
+          : ctx.emailService;
+      const email = String(req.query?.email || "")
+        .trim()
+        .toLowerCase();
+      const messageId = String(req.query?.message_id || "").trim();
+      const signature = String(req.query?.sig || "").trim();
+      if (!email) {
+        return res.status(400).send("Missing email");
+      }
+      if (emailService?.hasUnsubscribeSignature?.()) {
+        const validSig = emailService.verifyUnsubscribeSignature(
+          email,
+          messageId,
+          signature,
+        );
+        if (!validSig) {
+          return res.status(403).send("Invalid signature");
+        }
+      }
+      await db.setEmailSuppression(email, "unsubscribe", "link");
+      if (messageId) {
+        await db.addEmailEvent(messageId, "complained", {
+          reason: "unsubscribe",
+        });
+        await db.updateEmailMessageStatus(messageId, {
+          status: "complained",
+          failure_reason: "unsubscribe",
+          failed_at: new Date().toISOString(),
+        });
+      }
+      return res.send("Unsubscribed");
+    } catch (error) {
+      console.error("❌ Email unsubscribe error:", error);
+      return res.status(500).send("Unsubscribe failed");
+    }
+  };
+}
+
+function createSmsDeliveryWebhookHandler(ctx = {}) {
+  const {
+    requireValidTwilioSignature,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    smsWebhookDedupeTtlMs,
+  } = ctx;
+  return async function handleSmsDeliveryWebhook(req, res) {
+    try {
+      if (!requireValidTwilioSignature(req, res, "/webhook/sms-delivery")) {
+        return;
+      }
+      const db = getDb(ctx);
+      const { MessageSid, SmsSid, MessageStatus, ErrorCode, ErrorMessage } =
+        req.body || {};
+      const messageSid = String(MessageSid || SmsSid || "").trim();
+      if (!messageSid) {
+        console.warn("sms_delivery_webhook_missing_sid", {
+          request_id: req.requestId || null,
+          status: MessageStatus || null,
+        });
+        return res.status(200).send("OK");
+      }
+      const dedupeDecision = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "twilio_sms_delivery",
+        {
+          messageSid,
+          status: MessageStatus || null,
+          errorCode: ErrorCode || null,
+        },
+        {
+          ttlMs:
+            Number.isFinite(Number(smsWebhookDedupeTtlMs)) &&
+            Number(smsWebhookDedupeTtlMs) > 0
+              ? Number(smsWebhookDedupeTtlMs)
+              : undefined,
+        },
+      );
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure(
+          "twilio_sms_delivery_dedupe_unavailable",
+          req,
+          dedupeDecision,
+        );
+        logProviderDedupeSkip("twilio_sms_delivery_duplicate_ignored", req, dedupeDecision);
+        return;
+      }
+
+      console.log(`📱 SMS Delivery Status: ${messageSid} -> ${MessageStatus}`);
+
+      if (db) {
+        const changes = await db.updateSMSStatus(messageSid, {
+          status: MessageStatus,
+          error_code: ErrorCode,
+          error_message: ErrorMessage,
+        });
+        if (!changes) {
+          console.warn("sms_delivery_webhook_unknown_sid", {
+            request_id: req.requestId || null,
+            message_sid: messageSid,
+            status: MessageStatus || null,
+          });
+        }
+
+        const message = await new Promise((resolve, reject) => {
+          db.db.get(
+            `SELECT * FROM sms_messages WHERE message_sid = ?`,
+            [messageSid],
+            (err, row) => {
+              if (err) reject(err);
+              else resolve(row);
+            },
+          );
+        });
+
+        if (message && message.user_chat_id) {
+          const notificationType =
+            MessageStatus === "delivered"
+              ? "sms_delivered"
+              : MessageStatus === "failed"
+                ? "sms_failed"
+                : `sms_${MessageStatus}`;
+
+          await db.createEnhancedWebhookNotification(
+            messageSid,
+            notificationType,
+            message.user_chat_id,
+            MessageStatus === "failed" ? "high" : "normal",
+          );
+
+          console.log(
+            `📨 Created ${notificationType} notification for user ${message.user_chat_id}`,
+          );
+        }
+      }
+
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("❌ SMS delivery webhook error:", error);
+      return res.status(200).send("OK");
+    }
+  };
+}
+
+function createAwsStatusWebhookHandler(ctx = {}) {
+  const {
+    requireValidAwsWebhook,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    recordCallStatus,
+  } = ctx;
+  return async function handleAwsStatusWebhook(req, res) {
+    try {
+      if (!requireValidAwsWebhook(req, res, "/webhook/aws/status")) {
+        return;
+      }
+      const { contactId, status, duration, callSid } = req.body || {};
+      const awsContactMap =
+        typeof ctx.getAwsContactMap === "function"
+          ? ctx.getAwsContactMap()
+          : ctx.awsContactMap;
+      const resolvedCallSid =
+        callSid || (contactId ? awsContactMap?.get(contactId) : null);
+      if (!resolvedCallSid) {
+        return res.status(200).send("OK");
+      }
+
+      const dedupePayload = {
+        callSid: resolvedCallSid,
+        contactId: contactId || null,
+        status: String(status || "").toLowerCase() || null,
+        duration: duration || null,
+        timestamp:
+          req.body?.timestamp ||
+          req.body?.eventTimestamp ||
+          req.body?.updatedAt ||
+          null,
+      };
+      const dedupeDecision = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "aws_status",
+        dedupePayload,
+      );
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure("aws_status_dedupe_unavailable", req, dedupeDecision);
+        logProviderDedupeSkip("aws_status_duplicate_ignored", req, dedupeDecision);
+        return;
+      }
+
+      const canonicalEvent = buildCanonicalCallStatusEvent(
+        "aws",
+        req.body || {},
+        { callSid: resolvedCallSid },
+      );
+      if (canonicalEvent.status) {
+        await recordCallStatus(
+          resolvedCallSid,
+          canonicalEvent.status,
+          canonicalEvent.notification_type,
+          {
+            duration: Number.isFinite(Number(canonicalEvent.duration))
+              ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+              : duration
+                ? parseInt(duration, 10)
+                : undefined,
+          },
+        );
+        if (canonicalEvent.status === "completed") {
+          const activeCalls =
+            typeof ctx.getActiveCalls === "function"
+              ? ctx.getActiveCalls()
+              : ctx.activeCalls;
+          const session = activeCalls?.get(resolvedCallSid);
+          if (session?.startTime) {
+            await ctx.handleCallEnd(resolvedCallSid, session.startTime);
+          }
+          activeCalls?.delete(resolvedCallSid);
+          const dbRef = getDb(ctx);
+          if (dbRef?.deleteCallRuntimeState) {
+            await dbRef.deleteCallRuntimeState(resolvedCallSid).catch(() => {});
+          }
+        }
+      }
+
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("AWS status webhook error:", error);
+      return res.status(200).send("OK");
+    }
+  };
+}
+
+function createVonageEventWebhookHandler(ctx = {}) {
+  const {
+    requireValidVonageWebhook,
+    getVonageCallPayload,
+    getVonageDtmfDigits,
+    shouldProcessProviderEvent,
+    shouldProcessProviderEventAsync,
+    resolveVonageCallSid,
+    isOutboundVonageDirection,
+    buildVonageInboundCallSid,
+    ensureCallSetup,
+    rememberVonageCallMapping,
+    handleExternalDtmfInput,
+    recordCallStatus,
+    handleCallEnd,
+    clearVonageCallMappings,
+  } = ctx;
+  return async function handleVonageEvent(req, res) {
+    if (!requireValidVonageWebhook(req, res, req.path || "/ve")) {
+      return;
+    }
+    try {
+      const payload = req.body || {};
+      const normalizedPayload = getVonageCallPayload(req, payload);
+      const { uuid, status } = payload;
+      const dtmfDigits = getVonageDtmfDigits(payload);
+      const hasSignal = Boolean(
+        uuid ||
+        status ||
+        dtmfDigits ||
+        req.query?.callSid ||
+        req.query?.call_sid ||
+        payload.callSid ||
+        payload.call_sid,
+      );
+      if (!hasSignal) {
+        console.warn("Vonage event callback missing status/dtmf identifiers", {
+          request_id: req.requestId || null,
+          path: req.path || null,
+        });
+        return res.status(200).send("OK");
+      }
+      const dedupePayload = {
+        uuid: uuid || normalizedPayload?.uuid || null,
+        status: String(status || "").toLowerCase() || null,
+        timestamp:
+          payload?.timestamp ||
+          payload?.event_time ||
+          payload?.time ||
+          payload?.created_at ||
+          null,
+        dtmf: dtmfDigits || null,
+        direction: normalizedPayload?.direction || null,
+      };
+      const dedupeDecision = await dedupeProviderEvent(
+        shouldProcessProviderEventAsync,
+        shouldProcessProviderEvent,
+        "vonage_event",
+        dedupePayload,
+      );
+      if (shouldShortCircuitProviderDedupe(res, dedupeDecision)) {
+        logProviderDedupeFailure("vonage_event_dedupe_unavailable", req, dedupeDecision);
+        logProviderDedupeSkip("vonage_event_duplicate_ignored", req, dedupeDecision);
+        return;
+      }
+      const durationRaw =
+        payload.duration ||
+        payload.conversation_duration ||
+        payload.usage_duration ||
+        payload.call_duration;
+
+      const callConfigurations =
+        typeof ctx.getCallConfigurations === "function"
+          ? ctx.getCallConfigurations()
+          : ctx.callConfigurations;
+      const callDirections =
+        typeof ctx.getCallDirections === "function"
+          ? ctx.getCallDirections()
+          : ctx.callDirections;
+
+      let callSid = await resolveVonageCallSid(req, payload);
+      if (
+        !callSid &&
+        uuid &&
+        !isOutboundVonageDirection(normalizedPayload.direction)
+      ) {
+        callSid = buildVonageInboundCallSid(uuid);
+        if (callSid) {
+          const existingConfig = callConfigurations.get(callSid);
+          if (!existingConfig) {
+            ensureCallSetup(callSid, normalizedPayload, {
+              provider: "vonage",
+              inbound: true,
+            });
+          }
+        }
+      }
+      if (callSid && uuid) {
+        rememberVonageCallMapping(callSid, uuid, "event");
+      }
+
+      if (callSid && dtmfDigits) {
+        const existingConfig = callConfigurations.get(callSid);
+        if (!existingConfig) {
+          ensureCallSetup(callSid, normalizedPayload, {
+            provider: "vonage",
+            inbound: callDirections.get(callSid) !== "outbound",
+          });
+        }
+        await handleExternalDtmfInput(callSid, dtmfDigits, {
+          source: "vonage_webhook_dtmf",
+          provider: "vonage",
+        });
+      } else if (dtmfDigits && !callSid) {
+        console.warn("Vonage DTMF event received without resolvable callSid", {
+          uuid: uuid || null,
+          digits_length: dtmfDigits.length,
+        });
+      }
+
+      const canonicalEvent = buildCanonicalCallStatusEvent(
+        "vonage",
+        payload || {},
+        { callSid },
+      );
+      if (status && !canonicalEvent.status) {
+        console.warn("Vonage event callback received unknown status", {
+          uuid: uuid || null,
+          status: String(status),
+        });
+      }
+      if (callSid && canonicalEvent.status) {
+        const parsedDuration = parseInt(durationRaw, 10);
+        await recordCallStatus(
+          callSid,
+          canonicalEvent.status,
+          canonicalEvent.notification_type,
+          {
+            duration: Number.isFinite(Number(canonicalEvent.duration))
+              ? Math.max(0, Math.floor(Number(canonicalEvent.duration)))
+              : Number.isFinite(parsedDuration)
+                ? parsedDuration
+                : undefined,
+            raw_status: canonicalEvent.raw_status || null,
+            event_timestamp: canonicalEvent.timestamp || null,
+          },
+        );
+        if (canonicalEvent.status === "completed") {
+          const activeCalls =
+            typeof ctx.getActiveCalls === "function"
+              ? ctx.getActiveCalls()
+              : ctx.activeCalls;
+          const session = activeCalls.get(callSid);
+          if (session?.startTime) {
+            await handleCallEnd(callSid, session.startTime);
+          }
+          activeCalls.delete(callSid);
+          const dbRef = getDb(ctx);
+          if (dbRef?.deleteCallRuntimeState) {
+            await dbRef.deleteCallRuntimeState(callSid).catch(() => {});
+          }
+          clearVonageCallMappings(callSid);
+        }
+      }
+
+      if (!callSid) {
+        console.warn("Vonage event callback could not resolve internal callSid", {
+          uuid: uuid || null,
+          status: status || null,
+        });
+      }
+
+      return res.status(200).send("OK");
+    } catch (error) {
+      console.error("Vonage webhook error:", error);
+      return res.status(200).send("OK");
+    }
+  };
+}
+
+function createVonageAnswerWebhookHandler(ctx = {}) {
+  const {
+    requireValidVonageWebhook,
+    getVonageCallPayload,
+    resolveVonageCallSid,
+    buildVonageInboundCallSid,
+    isOutboundVonageDirection,
+    rememberVonageCallMapping,
+    refreshInboundDefaultScript,
+    hydrateCallConfigFromDb,
+    ensureCallSetup,
+    ensureCallRecord,
+    normalizePhoneForFlag,
+    shouldRateLimitInbound,
+    buildVonageWebsocketUrl,
+    getVonageWebsocketContentType,
+    buildVonageEventWebhookUrl,
+    resolveHost,
+    config,
+    webhookService,
+  } = ctx;
+  const buildUnavailableNcco =
+    ctx.buildVonageUnavailableNcco ||
+    (() => [
+      {
+        action: "talk",
+        text: "We are unable to connect this call right now. Please try again shortly.",
+      },
+      { action: "hangup" },
+    ]);
+  const buildTalkHangupNcco =
+    ctx.buildVonageTalkHangupNcco ||
+    ((message) => [{ action: "talk", text: String(message || "") }, { action: "hangup" }]);
+
+  return async function handleVonageAnswer(req, res) {
+    if (!requireValidVonageWebhook(req, res, req.path || "/va")) {
+      return;
+    }
+    try {
+      const payload = getVonageCallPayload(req);
+      const resolvedCallSid = await resolveVonageCallSid(req, payload);
+      let callSid = resolvedCallSid;
+      const vonageUuid =
+        req.query?.uuid || req.query?.conversation_uuid || req.query?.vonage_uuid;
+      let synthesizedInbound = false;
+      if (!callSid && vonageUuid) {
+        callSid = buildVonageInboundCallSid(vonageUuid);
+        synthesizedInbound = true;
+      }
+      const callConfigurations =
+        typeof ctx.getCallConfigurations === "function"
+          ? ctx.getCallConfigurations()
+          : ctx.callConfigurations;
+      const callFunctionSystems =
+        typeof ctx.getCallFunctionSystems === "function"
+          ? ctx.getCallFunctionSystems()
+          : ctx.callFunctionSystems;
+      const callDirections =
+        typeof ctx.getCallDirections === "function"
+          ? ctx.getCallDirections()
+          : ctx.callDirections;
+      const db = getDb(ctx);
+      const existingCallConfig = callSid ? callConfigurations.get(callSid) : null;
+      let isInbound;
+      if (typeof existingCallConfig?.inbound === "boolean") {
+        isInbound = existingCallConfig.inbound;
+      } else if (synthesizedInbound || String(callSid || "").startsWith("vonage-in-")) {
+        isInbound = true;
+      } else if (payload.direction) {
+        isInbound = !isOutboundVonageDirection(payload.direction);
+      } else {
+        isInbound = false;
+      }
+
+      if (callSid && vonageUuid) {
+        rememberVonageCallMapping(callSid, vonageUuid, "answer");
+      }
+      if (callSid) {
+        if (isInbound) {
+          await refreshInboundDefaultScript();
+        }
+        let setup =
+          existingCallConfig && callFunctionSystems.get(callSid)
+            ? {
+                callConfig: existingCallConfig,
+                functionSystem: callFunctionSystems.get(callSid),
+              }
+            : null;
+        if (!setup && !isInbound) {
+          const hydrated = await hydrateCallConfigFromDb(callSid);
+          if (hydrated?.callConfig && hydrated?.functionSystem) {
+            setup = hydrated;
+          }
+        }
+        if (!setup) {
+          setup = ensureCallSetup(callSid, payload, {
+            provider: "vonage",
+            inbound: isInbound,
+          });
+        }
+        if (setup?.callConfig) {
+          if (!setup.callConfig.provider_metadata) {
+            setup.callConfig.provider_metadata = {};
+          }
+          setup.callConfig.provider = "vonage";
+          setup.callConfig.inbound = isInbound;
+          if (vonageUuid) {
+            setup.callConfig.provider_metadata.vonage_uuid = String(vonageUuid);
+          }
+          callConfigurations.set(callSid, setup.callConfig);
+        }
+        callDirections.set(callSid, isInbound ? "inbound" : "outbound");
+
+        if (isInbound) {
+          const callRecord = await ensureCallRecord(
+            callSid,
+            payload,
+            "vonage_answer",
+            {
+              provider: "vonage",
+              inbound: true,
+            },
+          );
+          const chatId = callRecord?.user_chat_id || config.telegram?.adminChatId;
+          const callerLookup = callRecord?.phone_number
+            ? normalizePhoneForFlag(callRecord.phone_number) || callRecord.phone_number
+            : null;
+          let callerFlag = null;
+          if (callerLookup && db?.getCallerFlag) {
+            callerFlag = await db.getCallerFlag(callerLookup).catch(() => null);
+          }
+          if (callerFlag?.status === "blocked") {
+            if (db?.updateCallState) {
+              await db
+                .updateCallState(callSid, "caller_blocked", {
+                  at: new Date().toISOString(),
+                  phone_number: callerLookup || callRecord?.phone_number || null,
+                  status: callerFlag.status,
+                  note: callerFlag.note || null,
+                  provider: "vonage",
+                })
+                .catch(() => {});
+            }
+            return res.json(
+              buildTalkHangupNcco("We cannot take your call at this time."),
+            );
+          }
+          if (callerFlag?.status !== "allowed") {
+            const rateLimit = shouldRateLimitInbound(req, payload || {});
+            if (rateLimit.limited) {
+              if (db?.updateCallState) {
+                await db
+                  .updateCallState(callSid, "inbound_rate_limited", {
+                    at: new Date().toISOString(),
+                    key: rateLimit.key,
+                    count: rateLimit.count,
+                    reset_at: rateLimit.resetAt,
+                    provider: "vonage",
+                  })
+                  .catch(() => {});
+              }
+              return res.json(
+                buildTalkHangupNcco(
+                  "We are experiencing high call volume. Please try again later.",
+                ),
+              );
+            }
+          }
+          if (chatId) {
+            webhookService
+              .sendCallStatusUpdate(callSid, "ringing", chatId, {
+                status_source: "vonage_inbound",
+              })
+              .catch(() => {});
+            webhookService.setInboundGate(callSid, "answered", { chatId });
+          }
+        }
+      }
+
+      const wsUrl = callSid
+        ? buildVonageWebsocketUrl(req, callSid, {
+            uuid: vonageUuid || undefined,
+            direction: isInbound ? "inbound" : "outbound",
+            from: payload.from || undefined,
+            to: payload.to || undefined,
+          })
+        : "";
+      if (!callSid || !wsUrl) {
+        console.warn("Vonage answer callback missing callSid/host", {
+          callSid: callSid || null,
+          uuid: vonageUuid || null,
+          host: resolveHost(req) || null,
+        });
+        return res.json(buildUnavailableNcco());
+      }
+
+      const connectAction = {
+        action: "connect",
+        endpoint: [
+          {
+            type: "websocket",
+            uri: wsUrl,
+            "content-type": getVonageWebsocketContentType(),
+          },
+        ],
+      };
+      const eventUrl = buildVonageEventWebhookUrl(req, callSid, {
+        uuid: vonageUuid || undefined,
+        direction: isInbound ? "inbound" : "outbound",
+      });
+      if (eventUrl) {
+        connectAction.eventUrl = [eventUrl];
+        connectAction.eventMethod = "POST";
+      }
+
+      return res.json([connectAction]);
+    } catch (error) {
+      console.error("Vonage answer callback error:", error);
+      return res.json(buildUnavailableNcco());
+    }
+  };
+}
+
+function registerWebhookRoutes(app, ctx = {}) {
+  const withWebhookAuth = createWebhookAuthGuard(ctx);
+  const handleSecureCaptureView =
+    ctx.handleSecureCaptureView || createSecureCaptureViewHandler(ctx);
+  const handleSecureCaptureSubmit =
+    ctx.handleSecureCaptureSubmit || createSecureCaptureSubmitHandler(ctx);
+  const handleTelegramWebhook =
+    ctx.handleTelegramWebhook || createTelegramWebhookHandler(ctx);
+  const handleCallStatusWebhook =
+    ctx.handleCallStatusWebhook || createCallStatusWebhookHandler(ctx);
+  const handleTwilioStreamWebhook =
+    ctx.handleTwilioStreamWebhook || createTwilioStreamWebhookHandler(ctx);
+  const handleTwilioPayStart =
+    ctx.handleTwilioPayStart || createTwilioPayStartHandler(ctx);
+  const handleTwilioPayComplete =
+    ctx.handleTwilioPayComplete || createTwilioPayCompleteHandler(ctx);
+  const handleTwilioPayStatus =
+    ctx.handleTwilioPayStatus || createTwilioPayStatusHandler(ctx);
+  const handleSmsWebhook = ctx.handleSmsWebhook || createSmsWebhookHandler(ctx);
+  const handleVonageSmsWebhook =
+    ctx.handleVonageSmsWebhook || createVonageSmsWebhookHandler(ctx);
+  const handleSmsStatusWebhook =
+    ctx.handleSmsStatusWebhook || createSmsStatusWebhookHandler(ctx);
+  const handleVonageSmsDeliveryWebhook =
+    ctx.handleVonageSmsDeliveryWebhook ||
+    createVonageSmsDeliveryWebhookHandler(ctx);
+  const handleEmailWebhook =
+    ctx.handleEmailWebhook || createEmailWebhookHandler(ctx);
+  const handleEmailUnsubscribeWebhook =
+    ctx.handleEmailUnsubscribeWebhook ||
+    createEmailUnsubscribeWebhookHandler(ctx);
+  const handleSmsDeliveryWebhook =
+    ctx.handleSmsDeliveryWebhook || createSmsDeliveryWebhookHandler(ctx);
+  const handleAwsStatusWebhook =
+    ctx.handleAwsStatusWebhook || createAwsStatusWebhookHandler(ctx);
+  const handleVonageAnswer =
+    ctx.handleVonageAnswer || createVonageAnswerWebhookHandler(ctx);
+  const handleVonageEvent =
+    ctx.handleVonageEvent || createVonageEventWebhookHandler(ctx);
+
+  app.get("/capture/secure", handleSecureCaptureView);
+  app.post("/capture/secure", handleSecureCaptureSubmit);
+  app.post("/webhook/telegram", withWebhookAuth("telegram", handleTelegramWebhook));
+  app.get("/va", withWebhookAuth("vonage_answer", handleVonageAnswer));
+  app.get("/answer", withWebhookAuth("vonage_answer", handleVonageAnswer));
+  app.post("/ve", withWebhookAuth("vonage_event", handleVonageEvent));
+  app.post("/event", withWebhookAuth("vonage_event", handleVonageEvent));
+  app.post("/webhook/aws/status", withWebhookAuth("aws_status", handleAwsStatusWebhook));
+  app.post(
+    "/webhook/call-status",
+    withWebhookAuth("twilio_call_status", handleCallStatusWebhook),
+  );
+  app.post(
+    "/webhook/twilio-stream",
+    withWebhookAuth("twilio_stream", handleTwilioStreamWebhook),
+  );
+  app.post(
+    "/webhook/twilio-pay/start",
+    withWebhookAuth("twilio_pay_start", handleTwilioPayStart),
+  );
+  app.post(
+    "/webhook/twilio-pay/complete",
+    withWebhookAuth("twilio_pay_complete", handleTwilioPayComplete),
+  );
+  app.post(
+    "/webhook/twilio-pay/status",
+    withWebhookAuth("twilio_pay_status", handleTwilioPayStatus),
+  );
+  app.post("/webhook/sms", withWebhookAuth("twilio_sms", handleSmsWebhook));
+  app.post(
+    "/webhook/sms-status",
+    withWebhookAuth("twilio_sms_status", handleSmsStatusWebhook),
+  );
+  app.get("/vs", withWebhookAuth("vonage_sms", handleVonageSmsWebhook));
+  app.post("/vs", withWebhookAuth("vonage_sms", handleVonageSmsWebhook));
+  app.get("/vd", withWebhookAuth("vonage_delivery", handleVonageSmsDeliveryWebhook));
+  app.post("/vd", withWebhookAuth("vonage_delivery", handleVonageSmsDeliveryWebhook));
+  app.post("/webhook/email", withWebhookAuth("email_events", handleEmailWebhook));
+  app.get("/webhook/email-unsubscribe", handleEmailUnsubscribeWebhook);
+  app.post(
+    "/webhook/twilio-gather",
+    withWebhookAuth("twilio_gather", ctx.handleTwilioGatherWebhook),
+  );
+  app.post(
+    "/webhook/sms-delivery",
+    withWebhookAuth("twilio_sms_delivery", handleSmsDeliveryWebhook),
+  );
+}
+
+module.exports = {
+  registerWebhookRoutes,
+  createVonageEventWebhookHandler,
+  __testables: {
+    WEBHOOK_AUTH_POLICIES,
+    createWebhookAuthGuard,
+  },
+};

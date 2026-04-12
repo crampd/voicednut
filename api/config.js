@@ -1,12 +1,12 @@
-require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
+require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 
-const isProduction = process.env.NODE_ENV === 'production';
+const isProduction = process.env.NODE_ENV === "production";
 
 function readEnv(name) {
   const value = process.env[name];
-  if (typeof value === 'string' && value.length > 0) {
+  if (typeof value === "string" && value.length > 0) {
     return value;
   }
   return undefined;
@@ -19,7 +19,9 @@ function ensure(name, fallback) {
   }
   if (fallback !== undefined) {
     if (!isProduction) {
-      console.warn(`Environment variable "${name}" is missing. Using fallback value in development.`);
+      console.warn(
+        `Environment variable "${name}" is missing. Using fallback value in development.`,
+      );
     }
     return fallback;
   }
@@ -28,33 +30,715 @@ function ensure(name, fallback) {
     throw new Error(message);
   }
   console.warn(`${message} Continuing because NODE_ENV !== 'production'.`);
-  return '';
+  return "";
 }
 
-const corsOriginsRaw = ensure('CORS_ORIGINS', process.env.WEB_APP_URL || '');
+function normalizeHostname(value) {
+  if (!value) return "";
+  const trimmed = String(value).trim();
+  if (!trimmed) return "";
+  try {
+    if (trimmed.includes("://")) {
+      const parsed = new URL(trimmed);
+      return parsed.host;
+    }
+  } catch {
+    // fall through to basic cleanup
+  }
+  return trimmed.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+}
+
+function parseList(rawValue) {
+  if (!rawValue) return [];
+  return String(rawValue)
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function parseNumericMap(rawValue, options = {}) {
+  const min = Number.isFinite(Number(options.min)) ? Number(options.min) : -Infinity;
+  const max = Number.isFinite(Number(options.max)) ? Number(options.max) : Infinity;
+  if (rawValue === undefined || rawValue === null || rawValue === "") return {};
+
+  const normalizeKey = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^\w-]+/g, "_");
+
+  const normalizeNumber = (value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(min, Math.min(max, parsed));
+  };
+
+  const map = {};
+  if (rawValue && typeof rawValue === "object" && !Array.isArray(rawValue)) {
+    for (const [key, value] of Object.entries(rawValue)) {
+      const normalizedKey = normalizeKey(key);
+      const normalizedValue = normalizeNumber(value);
+      if (!normalizedKey || normalizedValue === null) continue;
+      map[normalizedKey] = normalizedValue;
+    }
+    return map;
+  }
+
+  const text = String(rawValue || "").trim();
+  if (!text) return map;
+  if (text.startsWith("{") && text.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(text);
+      return parseNumericMap(parsed, options);
+    } catch {
+      return map;
+    }
+  }
+
+  for (const token of text.split(",")) {
+    const [rawKey, rawNumber] = String(token || "").split(":");
+    const normalizedKey = normalizeKey(rawKey);
+    const normalizedValue = normalizeNumber(rawNumber);
+    if (!normalizedKey || normalizedValue === null) continue;
+    map[normalizedKey] = normalizedValue;
+  }
+  return map;
+}
+
+function readBooleanEnv(name, fallback = false) {
+  const value = readEnv(name);
+  if (value === undefined) return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function normalizeVoiceAgentProfileVoiceMap(rawValue = {}, fallbackMap = {}) {
+  const normalized = {};
+  const merged = {
+    ...(fallbackMap && typeof fallbackMap === "object" ? fallbackMap : {}),
+    ...(rawValue && typeof rawValue === "object" ? rawValue : {}),
+  };
+  for (const [key, value] of Object.entries(merged)) {
+    const normalizedKey = String(key || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^\w-]+/g, "_");
+    const model = String(value || "").trim();
+    if (!normalizedKey || !model) continue;
+    normalized[normalizedKey] = model;
+  }
+  return normalized;
+}
+
+const corsOriginsRaw = ensure("CORS_ORIGINS", "");
 const corsOrigins = corsOriginsRaw
-  .split(',')
+  .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
-const callProvider = ensure('CALL_PROVIDER', 'twilio').toLowerCase();
-const awsRegion = ensure('AWS_REGION', 'us-east-1');
-const adminApiToken = readEnv('ADMIN_API_TOKEN');
-const complianceModeRaw = (readEnv('CONFIG_COMPLIANCE_MODE') || 'safe').toLowerCase();
-const allowedComplianceModes = new Set(['safe', 'dev_insecure']);
-const complianceMode = allowedComplianceModes.has(complianceModeRaw) ? complianceModeRaw : 'safe';
+const recordingEnabled =
+  String(readEnv("RECORDING_ENABLED") || "false").toLowerCase() === "true";
+const transferNumber = readEnv("TRANSFER_NUMBER");
+const defaultSmsBusinessId = readEnv("DEFAULT_SMS_BUSINESS_ID") || null;
+const deepgramModel = readEnv("DEEPGRAM_MODEL") || "nova-2";
+const voiceRuntimeModeRaw = (readEnv("VOICE_RUNTIME_MODE") || "legacy")
+  .toLowerCase()
+  .trim();
+const voiceRuntimeModes = new Set(["legacy", "hybrid", "voice_agent"]);
+const voiceRuntimeMode = voiceRuntimeModes.has(voiceRuntimeModeRaw)
+  ? voiceRuntimeModeRaw
+  : "legacy";
+const voiceAgentEnabled =
+  String(readEnv("VOICE_AGENT_SECONDARY_ENABLED") || "false").toLowerCase() ===
+  "true";
+const defaultVoiceAgentProfileVoiceMap = Object.freeze({
+  general: "aura-2-andromeda-en|aura-2-helena-en|aura-2-arcas-en",
+  sales: "aura-2-aries-en|aura-2-andromeda-en|aura-2-helena-en",
+  support: "aura-2-helena-en|aura-2-arcas-en|aura-2-thalia-en",
+  collections: "aura-2-arcas-en|aura-2-aries-en|aura-2-thalia-en",
+  verification: "aura-2-thalia-en|aura-2-arcas-en|aura-2-helena-en",
+  identity_verification: "aura-2-thalia-en|aura-2-arcas-en|aura-2-helena-en",
+  dating: "aura-2-helena-en|aura-2-arcas-en|aura-2-andromeda-en",
+  fan: "aura-2-helena-en|aura-2-andromeda-en|aura-2-arcas-en",
+  celebrity: "aura-2-thalia-en|aura-2-arcas-en|aura-2-helena-en",
+  creator: "aura-2-aries-en|aura-2-andromeda-en|aura-2-thalia-en",
+  friendship: "aura-2-helena-en|aura-2-andromeda-en|aura-2-arcas-en",
+  networking: "aura-2-arcas-en|aura-2-aries-en|aura-2-thalia-en",
+  community: "aura-2-helena-en|aura-2-andromeda-en|aura-2-thalia-en",
+  marketplace_seller: "aura-2-arcas-en|aura-2-andromeda-en|aura-2-aries-en",
+  real_estate_agent: "aura-2-arcas-en|aura-2-andromeda-en|aura-2-thalia-en",
+});
+const voiceAgentProfileVoiceMap = normalizeVoiceAgentProfileVoiceMap(
+  parseJsonObject(
+    readEnv("VOICE_AGENT_PROFILE_VOICE_MAP"),
+    "VOICE_AGENT_PROFILE_VOICE_MAP",
+  ),
+  defaultVoiceAgentProfileVoiceMap,
+);
+const voiceAgentCanaryPercentDefault =
+  voiceRuntimeMode === "hybrid" && voiceAgentEnabled ? 10 : 0;
+const voiceAgentDefaults = Object.freeze({
+  canaryPercent: Math.max(
+    0,
+    Math.min(
+      100,
+      Math.floor(
+        Number(readEnv("VOICE_AGENT_CANARY_PERCENT") || voiceAgentCanaryPercentDefault),
+      ),
+    ),
+  ),
+  canarySeed: String(readEnv("VOICE_AGENT_CANARY_SEED") || "voice_agent").trim() || "voice_agent",
+  failoverToLegacy: readBooleanEnv("VOICE_AGENT_FAILOVER_TO_LEGACY", true),
+  openTimeoutMs: Math.max(2000, Number(readEnv("VOICE_AGENT_OPEN_TIMEOUT_MS") || "8000")),
+  settingsTimeoutMs: Math.max(2000, Number(readEnv("VOICE_AGENT_SETTINGS_TIMEOUT_MS") || "8000")),
+  idleTimeoutMs: Math.max(3000, Number(readEnv("VOICE_AGENT_IDLE_TIMEOUT_MS") || "12000")),
+  keepAliveMs: Math.max(5000, Number(readEnv("VOICE_AGENT_KEEPALIVE_MS") || "8000")),
+  noAudioFallbackMs: Math.max(
+    5000,
+    Number(readEnv("VOICE_AGENT_NO_AUDIO_FALLBACK_MS") || "15000"),
+  ),
+  managedThinkOnly: readBooleanEnv("VOICE_AGENT_MANAGED_THINK_ONLY", true),
+  parityCloseOnGoodbye: readBooleanEnv("VOICE_AGENT_PARITY_CLOSE_ON_GOODBYE", true),
+  language: String(readEnv("VOICE_AGENT_LANGUAGE") || "en").trim() || "en",
+  listenModel:
+    String(readEnv("VOICE_AGENT_LISTEN_MODEL") || deepgramModel || "nova-2").trim() ||
+    "nova-2",
+  speakModel:
+    String(readEnv("VOICE_AGENT_SPEAK_MODEL") || readEnv("VOICE_MODEL") || "aura-2-andromeda-en")
+      .trim() || "aura-2-andromeda-en",
+  profileVoiceMap: voiceAgentProfileVoiceMap,
+  thinkProvider: String(readEnv("VOICE_AGENT_THINK_PROVIDER") || "open_ai").trim() || "open_ai",
+  thinkModel: String(readEnv("VOICE_AGENT_THINK_MODEL") || "gpt-4o-mini").trim() || "gpt-4o-mini",
+  thinkTemperature: Number.isFinite(Number(readEnv("VOICE_AGENT_THINK_TEMPERATURE")))
+    ? Number(readEnv("VOICE_AGENT_THINK_TEMPERATURE"))
+    : undefined,
+  listenSmartFormat: readBooleanEnv("VOICE_AGENT_LISTEN_SMART_FORMAT", true),
+  listenKeyterms: parseList(readEnv("VOICE_AGENT_LISTEN_KEYTERMS")),
+  startupTtsProbeEnabled: readBooleanEnv("VOICE_AGENT_STARTUP_TTS_PROBE_ENABLED", true),
+  startupTtsProbeTimeoutMs: Math.max(
+    1500,
+    Number(readEnv("VOICE_AGENT_STARTUP_TTS_PROBE_TIMEOUT_MS") || "5000"),
+  ),
+  syntheticProbeText:
+    String(readEnv("VOICE_AGENT_SYNTHETIC_PROBE_TEXT") || "Hello, this is a quick voice quality probe.")
+      .trim() || "Hello, this is a quick voice quality probe.",
+  circuitBreaker: {
+    enabled: readBooleanEnv("VOICE_AGENT_CIRCUIT_BREAKER_ENABLED", true),
+    failureThreshold: Math.max(
+      1,
+      Number(readEnv("VOICE_AGENT_CIRCUIT_BREAKER_FAILURE_THRESHOLD") || "3"),
+    ),
+    windowMs: Math.max(10000, Number(readEnv("VOICE_AGENT_CIRCUIT_BREAKER_WINDOW_MS") || "120000")),
+    cooldownMs: Math.max(
+      10000,
+      Number(readEnv("VOICE_AGENT_CIRCUIT_BREAKER_COOLDOWN_MS") || "180000"),
+    ),
+  },
+  autoCanary: {
+    enabled: readBooleanEnv(
+      "VOICE_AGENT_AUTO_CANARY_ENABLED",
+      voiceRuntimeMode === "hybrid" && voiceAgentEnabled,
+    ),
+    intervalMs: Math.max(5000, Number(readEnv("VOICE_AGENT_AUTO_CANARY_INTERVAL_MS") || "60000")),
+    windowMs: Math.max(10000, Number(readEnv("VOICE_AGENT_AUTO_CANARY_WINDOW_MS") || "300000")),
+    cooldownMs: Math.max(10000, Number(readEnv("VOICE_AGENT_AUTO_CANARY_COOLDOWN_MS") || "180000")),
+    minSamples: Math.max(1, Number(readEnv("VOICE_AGENT_AUTO_CANARY_MIN_SAMPLES") || "8")),
+    minPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_MIN_PERCENT") || "5"),
+      ),
+    ),
+    maxPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_PERCENT") || "50"),
+      ),
+    ),
+    stepUpPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_STEP_UP_PERCENT") || "5"),
+      ),
+    ),
+    stepDownPercent: Math.max(
+      1,
+      Math.min(
+        100,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_STEP_DOWN_PERCENT") || "10"),
+      ),
+    ),
+    maxErrorRate: Math.max(
+      0,
+      Math.min(1, Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_ERROR_RATE") || "0.2")),
+    ),
+    maxFallbackRate: Math.max(
+      0,
+      Math.min(1, Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_FALLBACK_RATE") || "0.25")),
+    ),
+    maxNoAudioFallbackRate: Math.max(
+      0,
+      Math.min(
+        1,
+        Number(readEnv("VOICE_AGENT_AUTO_CANARY_MAX_NO_AUDIO_FALLBACK_RATE") || "0.12"),
+      ),
+    ),
+    failClosedOnBreach: readBooleanEnv("VOICE_AGENT_AUTO_CANARY_FAIL_CLOSED_ON_BREACH", true),
+  },
+});
+const twilioGatherFallback =
+  String(readEnv("TWILIO_GATHER_FALLBACK") || "true").toLowerCase() === "true";
+const twilioMachineDetection = readEnv("TWILIO_MACHINE_DETECTION") || "Enable";
+const twilioMachineDetectionTimeoutRaw = readEnv(
+  "TWILIO_MACHINE_DETECTION_TIMEOUT",
+);
+const twilioMachineDetectionTimeout = Number.isFinite(
+  Number(twilioMachineDetectionTimeoutRaw),
+)
+  ? Number(twilioMachineDetectionTimeoutRaw)
+  : undefined;
+const twilioTtsMaxWaitMs = Number(readEnv("TWILIO_TTS_MAX_WAIT_MS") || "1200");
+const twilioFinalPromptTtsTimeoutMs = Number(
+  readEnv("TWILIO_FINAL_PROMPT_TTS_TIMEOUT_MS") || "6000",
+);
+const twilioTtsStrictPlay =
+  String(readEnv("TWILIO_TTS_STRICT_PLAY") || "true").toLowerCase() ===
+  "true";
+const twilioTtsPrewarmEnabled =
+  String(readEnv("TWILIO_TTS_PREWARM_ENABLED") || "true").toLowerCase() ===
+  "true";
+const twilioWebhookValidationRaw = (
+  readEnv("TWILIO_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const twilioWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const twilioWebhookValidation = twilioWebhookValidationModes.has(
+  twilioWebhookValidationRaw,
+)
+  ? twilioWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const vonageWebhookValidationRaw = (
+  readEnv("VONAGE_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const vonageWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const vonageWebhookValidation = vonageWebhookValidationModes.has(
+  vonageWebhookValidationRaw,
+)
+  ? vonageWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const vonageWebhookSignatureSecret =
+  readEnv("VONAGE_WEBHOOK_SIGNATURE_SECRET") || readEnv("VONAGE_SIGNATURE_SECRET");
+const vonageWebhookMaxSkewMs = Number(
+  readEnv("VONAGE_WEBHOOK_MAX_SKEW_MS") || "300000",
+);
+const vonageWebhookRequirePayloadHash =
+  String(readEnv("VONAGE_WEBHOOK_REQUIRE_PAYLOAD_HASH") || "false").toLowerCase() ===
+  "true";
+const vonageDtmfWebhookEnabled =
+  String(readEnv("VONAGE_DTMF_WEBHOOK_ENABLED") || "false").toLowerCase() ===
+  "true";
+const vonageVoiceRequestTimeoutMs = Number(
+  readEnv("VONAGE_VOICE_REQUEST_TIMEOUT_MS") || "15000",
+);
+const vonageVoiceRetryAttempts = Number(
+  readEnv("VONAGE_VOICE_RETRY_ATTEMPTS") || "1",
+);
+const vonageVoiceCreateRetryAttempts = Number(
+  readEnv("VONAGE_VOICE_CREATE_RETRY_ATTEMPTS") || "0",
+);
+const vonageVoiceRetryBaseMs = Number(
+  readEnv("VONAGE_VOICE_RETRY_BASE_MS") || "250",
+);
+const vonageVoiceRetryMaxDelayMs = Number(
+  readEnv("VONAGE_VOICE_RETRY_MAX_DELAY_MS") || "2000",
+);
+const vonageVoiceRetryJitterMs = Number(
+  readEnv("VONAGE_VOICE_RETRY_JITTER_MS") || "120",
+);
+const vonageUuidReconcileIntervalMs = Number(
+  readEnv("VONAGE_UUID_RECONCILE_INTERVAL_MS") || "120000",
+);
+const telegramWebhookValidationRaw = (
+  readEnv("TELEGRAM_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const telegramWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const telegramWebhookValidation = telegramWebhookValidationModes.has(
+  telegramWebhookValidationRaw,
+)
+  ? telegramWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const awsWebhookValidationRaw = (
+  readEnv("AWS_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const awsWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const awsWebhookValidation = awsWebhookValidationModes.has(
+  awsWebhookValidationRaw,
+)
+  ? awsWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const awsWebhookSecret = readEnv("AWS_WEBHOOK_SECRET");
+
+const callProvider = ensure("CALL_PROVIDER", "twilio").toLowerCase();
+const awsRegion = ensure("AWS_REGION", "us-east-1");
+const apiSecret = readEnv("API_SECRET");
+const adminApiToken = apiSecret || readEnv("ADMIN_API_TOKEN");
+const complianceModeRaw = (
+  readEnv("CONFIG_COMPLIANCE_MODE") || "safe"
+).toLowerCase();
+const allowedComplianceModes = new Set(["safe", "dev_insecure"]);
+const complianceMode = allowedComplianceModes.has(complianceModeRaw)
+  ? complianceModeRaw
+  : "safe";
 if (!allowedComplianceModes.has(complianceModeRaw) && !isProduction) {
-  console.warn(`Invalid CONFIG_COMPLIANCE_MODE "${complianceModeRaw}". Falling back to "safe".`);
+  console.warn(
+    `Invalid CONFIG_COMPLIANCE_MODE "${complianceModeRaw}". Falling back to "safe".`,
+  );
 }
-const dtmfEncryptionKey = readEnv('DTMF_ENCRYPTION_KEY');
+const dtmfEncryptionKey = readEnv("DTMF_ENCRYPTION_KEY");
+const apiHmacSecret = apiSecret || readEnv("API_HMAC_SECRET");
+const apiHmacMaxSkewMs = Number(readEnv("API_HMAC_MAX_SKEW_MS") || "300000");
+const apiHmacReplayWindowMs = Number(
+  readEnv("API_HMAC_REPLAY_WINDOW_MS") || apiHmacMaxSkewMs || "300000",
+);
+const apiHmacReplayValidationRaw = (
+  readEnv("API_HMAC_REPLAY_VALIDATION") || "warn"
+).toLowerCase();
+const apiHmacReplayValidationModes = new Set(["strict", "warn", "off"]);
+const apiHmacReplayValidation = apiHmacReplayValidationModes.has(
+  apiHmacReplayValidationRaw,
+)
+  ? apiHmacReplayValidationRaw
+  : "warn";
+if (!apiHmacSecret) {
+  const message =
+    'Missing required environment variable "API_SECRET" (or legacy API_HMAC_SECRET).';
+  if (isProduction) {
+    throw new Error(message);
+  }
+  console.warn(`${message} HMAC auth will be disabled.`);
+}
+const streamAuthSecret = readEnv("STREAM_AUTH_SECRET") || apiHmacSecret;
+const streamAuthMaxSkewMs = Number(
+  readEnv("STREAM_AUTH_MAX_SKEW_MS") || apiHmacMaxSkewMs || "300000",
+);
+const miniAppUrl = readEnv("MINI_APP_URL") || "";
+const miniAppSessionSecret =
+  readEnv("MINI_APP_SESSION_SECRET") || apiHmacSecret || adminApiToken || "";
+const miniAppAllowUnknownUsers = readBooleanEnv("MINI_APP_ALLOW_UNKNOWN_USERS", false);
+const miniAppSessionTtlSeconds = Number(
+  readEnv("MINI_APP_SESSION_TTL_SECONDS") || "900",
+);
+const miniAppInitDataMaxAgeRaw = String(
+  readEnv("MINI_APP_INITDATA_MAX_AGE_SECONDS") || "",
+).trim();
+const miniAppInitDataMaxAgeSeconds = Number(miniAppInitDataMaxAgeRaw || "86400");
+const miniAppInitDataMaxAgeSecondsResolved =
+  Number.isFinite(miniAppInitDataMaxAgeSeconds) &&
+  Math.floor(miniAppInitDataMaxAgeSeconds) === 300
+    ? 86400
+    : Number.isFinite(miniAppInitDataMaxAgeSeconds)
+      ? Math.max(30, Math.floor(miniAppInitDataMaxAgeSeconds))
+      : 86400;
+if (miniAppInitDataMaxAgeRaw === "300") {
+  console.warn(
+    'MINI_APP_INITDATA_MAX_AGE_SECONDS=300 detected (legacy default). Using 86400 seconds to reduce Telegram init-data expiry interruptions.',
+  );
+}
+const miniAppInitDataExpiryGraceSeconds = Number(
+  readEnv("MINI_APP_INITDATA_EXPIRY_GRACE_SECONDS") || "604800",
+);
+const miniAppInitDataExpiryGraceSecondsResolved = Number.isFinite(
+  miniAppInitDataExpiryGraceSeconds,
+)
+  ? Math.max(0, Math.min(30 * 24 * 60 * 60, Math.floor(miniAppInitDataExpiryGraceSeconds)))
+  : 604800;
+const miniAppReplayWindowSeconds = Number(
+  readEnv("MINI_APP_REPLAY_WINDOW_SECONDS") || "600",
+);
+const miniAppReplayValidationRaw = (
+  readEnv("MINI_APP_REPLAY_VALIDATION") || "warn"
+).toLowerCase();
+const miniAppReplayValidationModes = new Set(["strict", "warn", "off"]);
+const miniAppReplayValidation = miniAppReplayValidationModes.has(
+  miniAppReplayValidationRaw,
+)
+  ? miniAppReplayValidationRaw
+  : "warn";
+const miniAppRateWindowSeconds = Number(
+  readEnv("MINI_APP_RATE_WINDOW_SECONDS") || "60",
+);
+const miniAppSessionRatePerUser = Number(
+  readEnv("MINI_APP_SESSION_RATE_PER_USER") || "20",
+);
+const miniAppSessionRateGlobal = Number(
+  readEnv("MINI_APP_SESSION_RATE_GLOBAL") || "300",
+);
+const miniAppBootstrapRatePerUser = Number(
+  readEnv("MINI_APP_BOOTSTRAP_RATE_PER_USER") || "30",
+);
+const miniAppBootstrapRateGlobal = Number(
+  readEnv("MINI_APP_BOOTSTRAP_RATE_GLOBAL") || "300",
+);
+const miniAppPollRatePerUser = Number(
+  readEnv("MINI_APP_POLL_RATE_PER_USER") || "120",
+);
+const miniAppPollRateGlobal = Number(
+  readEnv("MINI_APP_POLL_RATE_GLOBAL") || "1200",
+);
+const miniAppActionRatePerUser = Number(
+  readEnv("MINI_APP_ACTION_RATE_PER_USER") || "60",
+);
+const miniAppActionRateGlobal = Number(
+  readEnv("MINI_APP_ACTION_RATE_GLOBAL") || "600",
+);
+const miniAppMaxInitDataBytes = Number(
+  readEnv("MINI_APP_MAX_INIT_DATA_BYTES") || "8192",
+);
+const miniAppMaxActionPayloadBytes = Number(
+  readEnv("MINI_APP_MAX_ACTION_PAYLOAD_BYTES") || "65536",
+);
+const miniAppAlertWindowSeconds = Number(
+  readEnv("MINI_APP_ALERT_WINDOW_SECONDS") || "300",
+);
+const miniAppAlertCooldownSeconds = Number(
+  readEnv("MINI_APP_ALERT_COOLDOWN_SECONDS") || "300",
+);
+const miniAppAlertInvalidSignatureThreshold = Number(
+  readEnv("MINI_APP_ALERT_INVALID_SIGNATURE_THRESHOLD") || "8",
+);
+const miniAppAlertAuthFailuresThreshold = Number(
+  readEnv("MINI_APP_ALERT_AUTH_FAILURE_THRESHOLD") || "12",
+);
+const miniAppAlertBridgeFailuresThreshold = Number(
+  readEnv("MINI_APP_ALERT_BRIDGE_FAILURE_THRESHOLD") || "10",
+);
+
+function parseJsonObject(rawValue, label) {
+  if (!rawValue) return {};
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("JSON must be an object");
+    }
+    return parsed;
+  } catch (error) {
+    const tag = label ? ` (${label})` : "";
+    console.warn(`Unable to parse JSON config${tag}: ${error.message}`);
+    return {};
+  }
+}
+
+const inboundDefaultPrompt = readEnv("INBOUND_PROMPT");
+const inboundDefaultFirstMessage = readEnv("INBOUND_FIRST_MESSAGE");
+const inboundRoutes = parseJsonObject(
+  readEnv("INBOUND_NUMBER_ROUTES"),
+  "INBOUND_NUMBER_ROUTES",
+);
+const inboundPreConnectMessage = readEnv("INBOUND_PRECONNECT_MESSAGE");
+const inboundPreConnectPauseSeconds = Number(
+  readEnv("INBOUND_PRECONNECT_PAUSE_S") || "1",
+);
+const inboundFirstMediaTimeoutMs = Number(
+  readEnv("INBOUND_STREAM_FIRST_MEDIA_TIMEOUT_MS") || "8000",
+);
+const inboundRateLimitWindowMs =
+  Number(readEnv("INBOUND_RATE_LIMIT_WINDOW_S") || "60") * 1000;
+const inboundRateLimitMax = Number(readEnv("INBOUND_RATE_LIMIT_MAX") || "0");
+const inboundRateLimitSmsEnabled =
+  String(readEnv("INBOUND_RATE_LIMIT_SMS") || "false").toLowerCase() === "true";
+const inboundRateLimitCallbackEnabled =
+  String(readEnv("INBOUND_RATE_LIMIT_CALLBACK") || "false").toLowerCase() ===
+  "true";
+const inboundCallbackDelayMinutes = Number(
+  readEnv("INBOUND_CALLBACK_DELAY_MIN") || "15",
+);
+
+const providerFailoverEnabled =
+  String(readEnv("PROVIDER_FAILOVER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const providerFailoverThreshold = Number(
+  readEnv("PROVIDER_ERROR_THRESHOLD") || "3",
+);
+const providerFailoverWindowMs =
+  Number(readEnv("PROVIDER_ERROR_WINDOW_S") || "120") * 1000;
+const providerFailoverCooldownMs =
+  Number(readEnv("PROVIDER_COOLDOWN_S") || "300") * 1000;
+const keypadGuardEnabled =
+  String(readEnv("KEYPAD_GUARD_ENABLED") || "true").toLowerCase() === "true";
+const keypadVonageDtmfTimeoutMs = Number(
+  readEnv("KEYPAD_VONAGE_DTMF_TIMEOUT_MS") || "12000",
+);
+const keypadProviderOverrideCooldownMs =
+  Number(readEnv("KEYPAD_PROVIDER_OVERRIDE_COOLDOWN_S") || "1800") * 1000;
+const callJobIntervalMs = Number(
+  readEnv("CALL_JOB_PROCESSOR_INTERVAL_MS") || "5000",
+);
+const callJobRetryBaseMs = Number(readEnv("CALL_JOB_RETRY_BASE_MS") || "5000");
+const callJobRetryMaxMs = Number(readEnv("CALL_JOB_RETRY_MAX_MS") || "60000");
+const callJobMaxAttempts = Number(readEnv("CALL_JOB_MAX_ATTEMPTS") || "3");
+const callJobTimeoutMs = Number(readEnv("CALL_JOB_TIMEOUT_MS") || "45000");
+const callJobDlqAlertThreshold = Number(
+  readEnv("CALL_JOB_DLQ_ALERT_THRESHOLD") || "20",
+);
+const callJobDlqMaxReplays = Number(
+  readEnv("CALL_JOB_DLQ_MAX_REPLAYS") || "2",
+);
+const callSloFirstMediaMs = Number(
+  readEnv("CALL_SLO_FIRST_MEDIA_MS") || "4000",
+);
+const callSloAnswerDelayMs = Number(
+  readEnv("CALL_SLO_ANSWER_DELAY_MS") || "12000",
+);
+const callSloSttFailures = Number(readEnv("CALL_SLO_STT_FAILURES") || "3");
+const callGreetingWatchdogEnabled = readBooleanEnv(
+  "CALL_GREETING_WATCHDOG_ENABLED",
+  true,
+);
+const callGreetingWatchdogTimeoutMs = Number(
+  readEnv("CALL_GREETING_WATCHDOG_TIMEOUT_MS") || "12000",
+);
+const callGreetingWatchdogMaxRetries = Number(
+  readEnv("CALL_GREETING_WATCHDOG_MAX_RETRIES") || "1",
+);
+const callGreetingWatchdogRecoveryPrompt = String(
+  readEnv("CALL_GREETING_WATCHDOG_RECOVERY_PROMPT") || "",
+).trim();
+const callGreetingWatchdogFallbackMessage = String(
+  readEnv("CALL_GREETING_WATCHDOG_FALLBACK_MESSAGE") || "",
+).trim();
+const callCanaryEnabled = readBooleanEnv("CALL_CANARY_ENABLED", false);
+const callCanaryIntervalMs = Number(
+  readEnv("CALL_CANARY_INTERVAL_MS") || "300000",
+);
+const callCanaryTimeoutMs = Number(
+  readEnv("CALL_CANARY_TIMEOUT_MS") || "60000",
+);
+const callCanaryDryRun = readBooleanEnv("CALL_CANARY_DRY_RUN", true);
+const callCanaryTargetNumber = String(readEnv("CALL_CANARY_TARGET_NUMBER") || "").trim();
+const callCanaryProfiles = parseList(readEnv("CALL_CANARY_PROFILES") || "creator,friendship");
+const callCanaryProviders = parseList(readEnv("CALL_CANARY_PROVIDERS") || "twilio,vonage");
+const callCanaryMaxCallsPerRun = Number(
+  readEnv("CALL_CANARY_MAX_CALLS_PER_RUN") || "2",
+);
+const callCanaryIdempotencyWindowMs = Number(
+  readEnv("CALL_CANARY_IDEMPOTENCY_WINDOW_MS") || "300000",
+);
+const callCanaryUserChatId = String(readEnv("CALL_CANARY_USER_CHAT_ID") || "").trim();
+const callCanarySloEnabled = readBooleanEnv("CALL_CANARY_SLO_ENABLED", true);
+const callCanarySloWindowMs = Number(
+  readEnv("CALL_CANARY_SLO_WINDOW_MS") || "900000",
+);
+const callCanarySloMinSamples = Number(
+  readEnv("CALL_CANARY_SLO_MIN_SAMPLES") || "3",
+);
+const callCanarySloMaxTimeoutEvents = Number(
+  readEnv("CALL_CANARY_SLO_MAX_TIMEOUT_EVENTS") || "2",
+);
+const callCanarySloMaxStallEvents = Number(
+  readEnv("CALL_CANARY_SLO_MAX_STALL_EVENTS") || "2",
+);
+const postCallQaEnabled = readBooleanEnv("POST_CALL_QA_ENABLED", false);
+const postCallQaShadowMode = readBooleanEnv("POST_CALL_QA_SHADOW_MODE", true);
+const postCallQaKillSwitch = readBooleanEnv("POST_CALL_QA_KILL_SWITCH", false);
+const postCallQaRolloutPercent = Number(
+  readEnv("POST_CALL_QA_ROLLOUT_PERCENT") || "0",
+);
+const postCallQaAllowlist = parseList(readEnv("POST_CALL_QA_ALLOWLIST") || "");
+const postCallQaMinTurns = Number(readEnv("POST_CALL_QA_MIN_TURNS") || "4");
+const postCallQaMinScore = Number(readEnv("POST_CALL_QA_MIN_SCORE") || "70");
+const postCallQaVersion = String(readEnv("POST_CALL_QA_VERSION") || "post_call_qa_v1").trim();
+const postCallQaProfileThresholds = parseNumericMap(
+  readEnv("POST_CALL_QA_PROFILE_THRESHOLDS"),
+  { min: 0, max: 100 },
+);
+const postCallQaRubricWeights = parseJsonObject(
+  readEnv("POST_CALL_QA_RUBRIC_WEIGHTS"),
+  "POST_CALL_QA_RUBRIC_WEIGHTS",
+);
+const webhookRetryBaseMs = Number(readEnv("WEBHOOK_RETRY_BASE_MS") || "5000");
+const webhookRetryMaxMs = Number(readEnv("WEBHOOK_RETRY_MAX_MS") || "60000");
+const webhookRetryMaxAttempts = Number(
+  readEnv("WEBHOOK_RETRY_MAX_ATTEMPTS") || "5",
+);
+const webhookTelegramTimeoutMs = Number(
+  readEnv("WEBHOOK_TELEGRAM_TIMEOUT_MS") || "15000",
+);
+const paymentFeatureEnabled =
+  String(readEnv("PAYMENT_FEATURE_ENABLED") || "true").toLowerCase() === "true";
+const paymentKillSwitch =
+  String(readEnv("PAYMENT_KILL_SWITCH") || "false").toLowerCase() === "true";
+const paymentAllowTwilio =
+  String(readEnv("PAYMENT_ALLOW_TWILIO") || "true").toLowerCase() === "true";
+const paymentRequireScriptOptIn =
+  String(readEnv("PAYMENT_REQUIRE_SCRIPT_OPT_IN") || "false").toLowerCase() ===
+  "true";
+const paymentDefaultCurrency =
+  String(readEnv("PAYMENT_DEFAULT_CURRENCY") || "USD")
+    .trim()
+    .toUpperCase()
+    .slice(0, 3) || "USD";
+const paymentMinAmount = Number(readEnv("PAYMENT_MIN_AMOUNT") || "0");
+const paymentMaxAmount = Number(readEnv("PAYMENT_MAX_AMOUNT") || "0");
+const paymentWebhookIdempotencyTtlMs = Number(
+  readEnv("PAYMENT_WEBHOOK_IDEMPOTENCY_TTL_MS") || "300000",
+);
+const paymentMaxAttemptsPerCall = Number(
+  readEnv("PAYMENT_MAX_ATTEMPTS_PER_CALL") || "3",
+);
+const paymentRetryCooldownMs = Number(
+  readEnv("PAYMENT_RETRY_COOLDOWN_MS") || "20000",
+);
+const paymentReconcileEnabled =
+  String(readEnv("PAYMENT_RECONCILE_ENABLED") || "true").toLowerCase() ===
+  "true";
+const paymentReconcileIntervalMs = Number(
+  readEnv("PAYMENT_RECONCILE_INTERVAL_MS") || "120000",
+);
+const paymentReconcileStaleSeconds = Number(
+  readEnv("PAYMENT_RECONCILE_STALE_SECONDS") || "240",
+);
+const paymentReconcileBatchSize = Number(
+  readEnv("PAYMENT_RECONCILE_BATCH_SIZE") || "20",
+);
+const paymentSmsFallbackEnabled =
+  String(readEnv("PAYMENT_SMS_FALLBACK_ENABLED") || "false").toLowerCase() ===
+  "true";
+const paymentSmsFallbackUrlTemplate =
+  readEnv("PAYMENT_SMS_FALLBACK_URL_TEMPLATE") || "";
+const paymentSmsFallbackMessageTemplate =
+  readEnv("PAYMENT_SMS_FALLBACK_MESSAGE_TEMPLATE") ||
+  "Complete your payment securely here: {payment_url}";
+const paymentSmsFallbackTtlSeconds = Number(
+  readEnv("PAYMENT_SMS_FALLBACK_TTL_SECONDS") || "900",
+);
+const paymentSmsFallbackSecret =
+  readEnv("PAYMENT_SMS_FALLBACK_SECRET") ||
+  readEnv("API_SECRET") ||
+  readEnv("ADMIN_API_TOKEN") ||
+  "";
+const paymentSmsFallbackMaxPerCall = Number(
+  readEnv("PAYMENT_SMS_FALLBACK_MAX_PER_CALL") || "1",
+);
 
 function loadPrivateKey(rawValue) {
   if (!rawValue) {
     return undefined;
   }
 
-  const normalized = rawValue.replace(/\\n/g, '\n');
-  if (normalized.includes('-----BEGIN')) {
+  const normalized = rawValue.replace(/\\n/g, "\n");
+  if (normalized.includes("-----BEGIN")) {
     return normalized;
   }
 
@@ -62,87 +746,508 @@ function loadPrivateKey(rawValue) {
     const filePath = path.isAbsolute(normalized)
       ? normalized
       : path.join(process.cwd(), normalized);
-    return fs.readFileSync(filePath, 'utf8');
+    return fs.readFileSync(filePath, "utf8");
   } catch (error) {
-    console.warn(`Unable to load Vonage private key from path "${normalized}": ${error.message}`);
+    console.warn(
+      `Unable to load Vonage private key from path "${normalized}": ${error.message}`,
+    );
     return undefined;
   }
 }
 
-const vonagePrivateKey = loadPrivateKey(readEnv('VONAGE_PRIVATE_KEY'));
+const vonagePrivateKey = loadPrivateKey(readEnv("VONAGE_PRIVATE_KEY"));
+const vonageVoiceWebsocketContentType =
+  readEnv("VONAGE_WEBSOCKET_CONTENT_TYPE") || "audio/l16;rate=16000";
+const serverHostname = normalizeHostname(ensure("SERVER", ""));
+const liveConsoleAudioTickMs = Number(
+  readEnv("LIVE_CONSOLE_AUDIO_TICK_MS") || "160",
+);
+const liveConsoleEditDebounceMs = Number(
+  readEnv("LIVE_CONSOLE_EDIT_DEBOUNCE_MS") || "700",
+);
+const liveConsoleUserLevelThreshold = Number(
+  readEnv("LIVE_CONSOLE_USER_LEVEL_THRESHOLD") || "0.08",
+);
+const liveConsoleUserHoldMs = Number(
+  readEnv("LIVE_CONSOLE_USER_HOLD_MS") || "450",
+);
+const liveConsoleCarrier = readEnv("LIVE_CONSOLE_CARRIER") || "VOICEDNUT";
+const liveConsoleNetworkLabel = readEnv("LIVE_CONSOLE_NETWORK_LABEL") || "LTE";
+const telegramAdminChatId =
+  readEnv("TELEGRAM_ADMIN_CHAT_ID") || readEnv("ADMIN_TELEGRAM_ID");
+const telegramAdminChatIds = parseList(readEnv("TELEGRAM_ADMIN_CHAT_IDS"));
+const telegramAdminUserIds = parseList(readEnv("TELEGRAM_ADMIN_USER_IDS"));
+const telegramPrimaryBotToken = ensure("TELEGRAM_BOT_TOKEN", process.env.BOT_TOKEN);
+const telegramBotTokenCandidates = Array.from(
+  new Set(
+    [
+      telegramPrimaryBotToken,
+      readEnv("BOT_TOKEN"),
+      readEnv("MINI_APP_BOT_TOKEN"),
+      ...parseList(readEnv("TELEGRAM_BOT_TOKENS")),
+    ]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  ),
+);
+const telegramOperatorChatIds = parseList(
+  readEnv("TELEGRAM_OPERATOR_CHAT_IDS"),
+);
+const telegramOperatorUserIds = parseList(
+  readEnv("TELEGRAM_OPERATOR_USER_IDS"),
+);
+const telegramViewerChatIds = parseList(readEnv("TELEGRAM_VIEWER_CHAT_IDS"));
+const telegramViewerUserIds = parseList(readEnv("TELEGRAM_VIEWER_USER_IDS"));
+if (!telegramAdminChatIds.length && telegramAdminChatId) {
+  telegramAdminChatIds.push(telegramAdminChatId);
+}
+const emailProvider = (readEnv("EMAIL_PROVIDER") || "sendgrid").toLowerCase();
+const emailDefaultFrom = readEnv("EMAIL_DEFAULT_FROM") || "";
+const emailVerifiedDomains = (readEnv("EMAIL_VERIFIED_DOMAINS") || "")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+const emailRateLimitProvider = Number(
+  readEnv("EMAIL_RATE_LIMIT_PROVIDER_PER_MIN") || "120",
+);
+const emailRateLimitTenant = Number(
+  readEnv("EMAIL_RATE_LIMIT_TENANT_PER_MIN") || "120",
+);
+const emailRateLimitDomain = Number(
+  readEnv("EMAIL_RATE_LIMIT_DOMAIN_PER_MIN") || "120",
+);
+const emailQueueIntervalMs = Number(
+  readEnv("EMAIL_QUEUE_INTERVAL_MS") || "5000",
+);
+const emailMaxRetries = Number(readEnv("EMAIL_MAX_RETRIES") || "5");
+const emailRequestTimeoutMs = Number(
+  readEnv("EMAIL_REQUEST_TIMEOUT_MS") || "15000",
+);
+const emailMaxSubjectChars = Number(
+  readEnv("EMAIL_MAX_SUBJECT_CHARS") || "200",
+);
+const emailMaxBodyChars = Number(readEnv("EMAIL_MAX_BODY_CHARS") || "200000");
+const emailMaxBulkRecipients = Number(
+  readEnv("EMAIL_MAX_BULK_RECIPIENTS") || "500",
+);
+const emailDlqAlertThreshold = Number(
+  readEnv("EMAIL_DLQ_ALERT_THRESHOLD") || "25",
+);
+const emailDlqMaxReplays = Number(readEnv("EMAIL_DLQ_MAX_REPLAYS") || "2");
+const emailQueueClaimLeaseMs = Number(
+  readEnv("EMAIL_QUEUE_CLAIM_LEASE_MS") || "60000",
+);
+const emailQueueStaleSendingMs = Number(
+  readEnv("EMAIL_QUEUE_STALE_SENDING_MS") || "180000",
+);
+const emailProviderEventsTtlDays = Number(
+  readEnv("EMAIL_PROVIDER_EVENTS_TTL_DAYS") || "14",
+);
+const emailCircuitBreakerEnabled =
+  String(readEnv("EMAIL_CIRCUIT_BREAKER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const emailCircuitBreakerFailureThreshold = Number(
+  readEnv("EMAIL_CIRCUIT_BREAKER_FAILURE_THRESHOLD") || "5",
+);
+const emailCircuitBreakerWindowMs = Number(
+  readEnv("EMAIL_CIRCUIT_BREAKER_WINDOW_MS") || "120000",
+);
+const emailCircuitBreakerCooldownMs = Number(
+  readEnv("EMAIL_CIRCUIT_BREAKER_COOLDOWN_MS") || "120000",
+);
+const smsProviderTimeoutMs = Number(
+  readEnv("SMS_PROVIDER_TIMEOUT_MS") || "15000",
+);
+const smsProvider = (readEnv("SMS_PROVIDER") || callProvider).toLowerCase();
+const smsAiTimeoutMs = Number(readEnv("SMS_AI_TIMEOUT_MS") || "12000");
+const smsMaxMessageChars = Number(readEnv("SMS_MAX_MESSAGE_CHARS") || "1600");
+const smsMaxBulkRecipients = Number(readEnv("SMS_MAX_BULK_RECIPIENTS") || "100");
+const smsProviderFailoverEnabled =
+  String(readEnv("SMS_PROVIDER_FAILOVER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const smsCircuitBreakerEnabled =
+  String(readEnv("SMS_CIRCUIT_BREAKER_ENABLED") || "true").toLowerCase() ===
+  "true";
+const smsCircuitBreakerFailureThreshold = Number(
+  readEnv("SMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD") || "3",
+);
+const smsCircuitBreakerWindowMs = Number(
+  readEnv("SMS_CIRCUIT_BREAKER_WINDOW_MS") || "120000",
+);
+const smsCircuitBreakerCooldownMs = Number(
+  readEnv("SMS_CIRCUIT_BREAKER_COOLDOWN_MS") || "120000",
+);
+const smsWebhookDedupeTtlMs = Number(
+  readEnv("SMS_WEBHOOK_DEDUPE_TTL_MS") || "300000",
+);
+const smsReconcileEnabled =
+  String(readEnv("SMS_RECONCILE_ENABLED") || "true").toLowerCase() === "true";
+const smsReconcileIntervalMs = Number(
+  readEnv("SMS_RECONCILE_INTERVAL_MS") || "120000",
+);
+const smsReconcileStaleMinutes = Number(
+  readEnv("SMS_RECONCILE_STALE_MINUTES") || "15",
+);
+const smsReconcileBatchSize = Number(
+  readEnv("SMS_RECONCILE_BATCH_SIZE") || "50",
+);
+const outboundRateWindowMs = Number(
+  readEnv("OUTBOUND_RATE_LIMIT_WINDOW_MS") || "60000",
+);
+const smsOutboundUserRateLimit = Number(
+  readEnv("SMS_OUTBOUND_USER_RATE_LIMIT_PER_WINDOW") || "15",
+);
+const smsOutboundGlobalRateLimit = Number(
+  readEnv("SMS_OUTBOUND_GLOBAL_RATE_LIMIT_PER_WINDOW") || "120",
+);
+const emailOutboundUserRateLimit = Number(
+  readEnv("EMAIL_OUTBOUND_USER_RATE_LIMIT_PER_WINDOW") || "20",
+);
+const emailOutboundGlobalRateLimit = Number(
+  readEnv("EMAIL_OUTBOUND_GLOBAL_RATE_LIMIT_PER_WINDOW") || "120",
+);
+const outboundHandlerTimeoutMs = Number(
+  readEnv("OUTBOUND_HANDLER_TIMEOUT_MS") || "30000",
+);
+const emailUnsubscribeUrl =
+  readEnv("EMAIL_UNSUBSCRIBE_URL") ||
+  (serverHostname ? `https://${serverHostname}/webhook/email-unsubscribe` : "");
+const emailWarmupMaxPerDay = Number(readEnv("EMAIL_WARMUP_MAX_PER_DAY") || "0");
+const emailDkimEnabled =
+  String(readEnv("EMAIL_DKIM_ENABLED") || "true").toLowerCase() === "true";
+const emailSpfEnabled =
+  String(readEnv("EMAIL_SPF_ENABLED") || "true").toLowerCase() === "true";
+const emailDmarcPolicy = readEnv("EMAIL_DMARC_POLICY") || "none";
+const emailWebhookSecret = readEnv("EMAIL_WEBHOOK_SECRET") || "";
+const emailWebhookValidationRaw = (
+  readEnv("EMAIL_WEBHOOK_VALIDATION") || (isProduction ? "strict" : "warn")
+).toLowerCase();
+const emailWebhookValidationModes = new Set(["strict", "warn", "off"]);
+const emailWebhookValidation = emailWebhookValidationModes.has(
+  emailWebhookValidationRaw,
+)
+  ? emailWebhookValidationRaw
+  : isProduction
+    ? "strict"
+    : "warn";
+const emailUnsubscribeSecret = readEnv("EMAIL_UNSUBSCRIBE_SECRET") || "";
+const sendgridApiKey = readEnv("SENDGRID_API_KEY");
+const sendgridBaseUrl = readEnv("SENDGRID_BASE_URL");
+const mailgunApiKey = readEnv("MAILGUN_API_KEY");
+const mailgunDomain = readEnv("MAILGUN_DOMAIN");
+const mailgunBaseUrl = readEnv("MAILGUN_BASE_URL");
+const sesRegion = readEnv("SES_REGION") || awsRegion;
+const sesAccessKeyId =
+  readEnv("SES_ACCESS_KEY_ID") || readEnv("AWS_ACCESS_KEY_ID");
+const sesSecretAccessKey =
+  readEnv("SES_SECRET_ACCESS_KEY") || readEnv("AWS_SECRET_ACCESS_KEY");
+const sesSessionToken =
+  readEnv("SES_SESSION_TOKEN") || readEnv("AWS_SESSION_TOKEN");
 
 module.exports = {
   platform: {
     provider: callProvider,
   },
   twilio: {
-    accountSid: ensure('TWILIO_ACCOUNT_SID'),
-    authToken: ensure('TWILIO_AUTH_TOKEN'),
-    fromNumber: ensure('FROM_NUMBER'),
+    accountSid: ensure("TWILIO_ACCOUNT_SID"),
+    authToken: ensure("TWILIO_AUTH_TOKEN"),
+    fromNumber: ensure("FROM_NUMBER"),
+    transferNumber,
+    gatherFallback: twilioGatherFallback,
+    machineDetection: twilioMachineDetection,
+    machineDetectionTimeout: twilioMachineDetectionTimeout,
+    ttsMaxWaitMs: Number.isFinite(twilioTtsMaxWaitMs)
+      ? twilioTtsMaxWaitMs
+      : 1200,
+    finalPromptTtsTimeoutMs: Number.isFinite(twilioFinalPromptTtsTimeoutMs)
+      ? twilioFinalPromptTtsTimeoutMs
+      : 6000,
+    strictTtsPlay: twilioTtsStrictPlay,
+    ttsPrewarmEnabled: twilioTtsPrewarmEnabled,
+    webhookValidation: twilioWebhookValidation,
   },
   aws: {
     region: awsRegion,
     connect: {
-      instanceId: ensure('AWS_CONNECT_INSTANCE_ID', ''),
-      contactFlowId: ensure('AWS_CONNECT_CONTACT_FLOW_ID', ''),
-      queueId: readEnv('AWS_CONNECT_QUEUE_ID'),
-      sourcePhoneNumber: readEnv('AWS_CONNECT_SOURCE_PHONE_NUMBER'),
-      transcriptsQueueUrl: readEnv('AWS_TRANSCRIPTS_QUEUE_URL'),
-      eventBusName: readEnv('AWS_EVENT_BUS_NAME'),
+      instanceId: ensure("AWS_CONNECT_INSTANCE_ID", ""),
+      contactFlowId: ensure("AWS_CONNECT_CONTACT_FLOW_ID", ""),
+      queueId: readEnv("AWS_CONNECT_QUEUE_ID"),
+      sourcePhoneNumber: readEnv("AWS_CONNECT_SOURCE_PHONE_NUMBER"),
+      transcriptsQueueUrl: readEnv("AWS_TRANSCRIPTS_QUEUE_URL"),
+      eventBusName: readEnv("AWS_EVENT_BUS_NAME"),
     },
     polly: {
-      voiceId: ensure('AWS_POLLY_VOICE_ID', 'Joanna'),
-      outputBucket: readEnv('AWS_POLLY_OUTPUT_BUCKET'),
-      outputPrefix: readEnv('AWS_POLLY_OUTPUT_PREFIX') || 'tts/',
+      voiceId: ensure("AWS_POLLY_VOICE_ID", "Joanna"),
+      outputBucket: readEnv("AWS_POLLY_OUTPUT_BUCKET"),
+      outputPrefix: readEnv("AWS_POLLY_OUTPUT_PREFIX") || "tts/",
     },
     s3: {
-      mediaBucket: readEnv('AWS_MEDIA_BUCKET') || readEnv('AWS_POLLY_OUTPUT_BUCKET'),
+      mediaBucket:
+        readEnv("AWS_MEDIA_BUCKET") || readEnv("AWS_POLLY_OUTPUT_BUCKET"),
     },
     pinpoint: {
-      applicationId: readEnv('AWS_PINPOINT_APPLICATION_ID'),
-      originationNumber: readEnv('AWS_PINPOINT_ORIGINATION_NUMBER') || readEnv('AWS_CONNECT_SOURCE_PHONE_NUMBER'),
-      region: readEnv('AWS_PINPOINT_REGION') || awsRegion,
+      applicationId: readEnv("AWS_PINPOINT_APPLICATION_ID"),
+      originationNumber:
+        readEnv("AWS_PINPOINT_ORIGINATION_NUMBER") ||
+        readEnv("AWS_CONNECT_SOURCE_PHONE_NUMBER"),
+      region: readEnv("AWS_PINPOINT_REGION") || awsRegion,
     },
     transcribe: {
-      languageCode: ensure('AWS_TRANSCRIBE_LANGUAGE_CODE', 'en-US'),
-      vocabularyFilterName: readEnv('AWS_TRANSCRIBE_VOCABULARY_FILTER_NAME'),
+      languageCode: ensure("AWS_TRANSCRIBE_LANGUAGE_CODE", "en-US"),
+      vocabularyFilterName: readEnv("AWS_TRANSCRIBE_VOCABULARY_FILTER_NAME"),
     },
+    webhookValidation: awsWebhookValidation,
+    webhookSecret: awsWebhookSecret,
   },
   vonage: {
-    apiKey: readEnv('VONAGE_API_KEY'),
-    apiSecret: readEnv('VONAGE_API_SECRET'),
-    applicationId: readEnv('VONAGE_APPLICATION_ID'),
+    apiKey: readEnv("VONAGE_API_KEY"),
+    apiSecret: readEnv("VONAGE_API_SECRET"),
+    applicationId: readEnv("VONAGE_APPLICATION_ID"),
     privateKey: vonagePrivateKey,
     voice: {
-      fromNumber: readEnv('VONAGE_VOICE_FROM_NUMBER'),
-      answerUrl: readEnv('VONAGE_ANSWER_URL'),
-      eventUrl: readEnv('VONAGE_EVENT_URL'),
+      fromNumber: readEnv("VONAGE_VOICE_FROM_NUMBER"),
+      answerUrl: readEnv("VONAGE_ANSWER_URL"),
+      eventUrl: readEnv("VONAGE_EVENT_URL"),
+      websocketContentType: vonageVoiceWebsocketContentType,
+      requestTimeoutMs:
+        Number.isFinite(vonageVoiceRequestTimeoutMs) && vonageVoiceRequestTimeoutMs > 0
+          ? Math.floor(vonageVoiceRequestTimeoutMs)
+          : 15000,
+      retryAttempts:
+        Number.isFinite(vonageVoiceRetryAttempts) && vonageVoiceRetryAttempts >= 0
+          ? Math.floor(vonageVoiceRetryAttempts)
+          : 1,
+      createRetryAttempts:
+        Number.isFinite(vonageVoiceCreateRetryAttempts) && vonageVoiceCreateRetryAttempts >= 0
+          ? Math.floor(vonageVoiceCreateRetryAttempts)
+          : 0,
+      retryBaseMs:
+        Number.isFinite(vonageVoiceRetryBaseMs) && vonageVoiceRetryBaseMs >= 0
+          ? Math.floor(vonageVoiceRetryBaseMs)
+          : 250,
+      retryMaxDelayMs:
+        Number.isFinite(vonageVoiceRetryMaxDelayMs) && vonageVoiceRetryMaxDelayMs >= 0
+          ? Math.floor(vonageVoiceRetryMaxDelayMs)
+          : 2000,
+      retryJitterMs:
+        Number.isFinite(vonageVoiceRetryJitterMs) && vonageVoiceRetryJitterMs >= 0
+          ? Math.floor(vonageVoiceRetryJitterMs)
+          : 120,
+      uuidReconcileIntervalMs:
+        Number.isFinite(vonageUuidReconcileIntervalMs) &&
+        vonageUuidReconcileIntervalMs >= 0
+          ? Math.floor(vonageUuidReconcileIntervalMs)
+          : 120000,
     },
+    webhookValidation: vonageWebhookValidation,
+    webhookSignatureSecret: vonageWebhookSignatureSecret,
+    webhookMaxSkewMs: Number.isFinite(vonageWebhookMaxSkewMs)
+      ? vonageWebhookMaxSkewMs
+      : 300000,
+    webhookRequirePayloadHash: vonageWebhookRequirePayloadHash,
+    dtmfWebhookEnabled: vonageDtmfWebhookEnabled,
     sms: {
-      fromNumber: readEnv('VONAGE_SMS_FROM_NUMBER'),
+      fromNumber: readEnv("VONAGE_SMS_FROM_NUMBER"),
     },
   },
   telegram: {
-    botToken: ensure('TELEGRAM_BOT_TOKEN', process.env.BOT_TOKEN),
+    botToken: telegramPrimaryBotToken,
+    botTokenCandidates: telegramBotTokenCandidates,
+    adminChatId: telegramAdminChatId,
+    adminChatIds: telegramAdminChatIds,
+    adminUserIds: telegramAdminUserIds,
+    operatorChatIds: telegramOperatorChatIds,
+    operatorUserIds: telegramOperatorUserIds,
+    viewerChatIds: telegramViewerChatIds,
+    viewerUserIds: telegramViewerUserIds,
+    webhookValidation: telegramWebhookValidation,
+  },
+  miniApp: {
+    url: miniAppUrl,
+    sessionSecret: miniAppSessionSecret,
+    allowUnknownUsers: miniAppAllowUnknownUsers,
+    sessionTtlSeconds: Number.isFinite(miniAppSessionTtlSeconds)
+      ? Math.max(60, Math.floor(miniAppSessionTtlSeconds))
+      : 900,
+    initDataMaxAgeSeconds: miniAppInitDataMaxAgeSecondsResolved,
+    initDataExpiryGraceSeconds: miniAppInitDataExpiryGraceSecondsResolved,
+    replayWindowSeconds: Number.isFinite(miniAppReplayWindowSeconds)
+      ? Math.max(60, Math.floor(miniAppReplayWindowSeconds))
+      : 600,
+    replayValidation: miniAppReplayValidation,
+    maxInitDataBytes: Number.isFinite(miniAppMaxInitDataBytes)
+      ? Math.max(1024, Math.floor(miniAppMaxInitDataBytes))
+      : 8192,
+    maxActionPayloadBytes: Number.isFinite(miniAppMaxActionPayloadBytes)
+      ? Math.max(4096, Math.floor(miniAppMaxActionPayloadBytes))
+      : 65536,
+    rateLimits: {
+      windowMs: Number.isFinite(miniAppRateWindowSeconds)
+        ? Math.max(1000, Math.floor(miniAppRateWindowSeconds * 1000))
+        : 60000,
+      session: {
+        perUser: Number.isFinite(miniAppSessionRatePerUser)
+          ? Math.max(0, Math.floor(miniAppSessionRatePerUser))
+          : 20,
+        global: Number.isFinite(miniAppSessionRateGlobal)
+          ? Math.max(0, Math.floor(miniAppSessionRateGlobal))
+          : 300,
+      },
+      bootstrap: {
+        perUser: Number.isFinite(miniAppBootstrapRatePerUser)
+          ? Math.max(0, Math.floor(miniAppBootstrapRatePerUser))
+          : 30,
+        global: Number.isFinite(miniAppBootstrapRateGlobal)
+          ? Math.max(0, Math.floor(miniAppBootstrapRateGlobal))
+          : 300,
+      },
+      poll: {
+        perUser: Number.isFinite(miniAppPollRatePerUser)
+          ? Math.max(0, Math.floor(miniAppPollRatePerUser))
+          : 120,
+        global: Number.isFinite(miniAppPollRateGlobal)
+          ? Math.max(0, Math.floor(miniAppPollRateGlobal))
+          : 1200,
+      },
+      action: {
+        perUser: Number.isFinite(miniAppActionRatePerUser)
+          ? Math.max(0, Math.floor(miniAppActionRatePerUser))
+          : 60,
+        global: Number.isFinite(miniAppActionRateGlobal)
+          ? Math.max(0, Math.floor(miniAppActionRateGlobal))
+          : 600,
+      },
+    },
+    alerting: {
+      windowMs: Number.isFinite(miniAppAlertWindowSeconds)
+        ? Math.max(1000, Math.floor(miniAppAlertWindowSeconds * 1000))
+        : 300000,
+      cooldownMs: Number.isFinite(miniAppAlertCooldownSeconds)
+        ? Math.max(1000, Math.floor(miniAppAlertCooldownSeconds * 1000))
+        : 300000,
+      thresholds: {
+        invalidSignature: Number.isFinite(miniAppAlertInvalidSignatureThreshold)
+          ? Math.max(0, Math.floor(miniAppAlertInvalidSignatureThreshold))
+          : 8,
+        authFailures: Number.isFinite(miniAppAlertAuthFailuresThreshold)
+          ? Math.max(0, Math.floor(miniAppAlertAuthFailuresThreshold))
+          : 12,
+        bridgeFailures: Number.isFinite(miniAppAlertBridgeFailuresThreshold)
+          ? Math.max(0, Math.floor(miniAppAlertBridgeFailuresThreshold))
+          : 10,
+      },
+    },
   },
   openRouter: {
-    apiKey: ensure('OPENROUTER_API_KEY'),
-    model: ensure('OPENROUTER_MODEL', 'meta-llama/llama-3.1-8b-instruct:free'),
-    siteUrl: ensure('YOUR_SITE_URL', 'http://localhost:3000'),
-    siteName: ensure('YOUR_SITE_NAME', 'Voice Call Bot'),
+    apiKey: ensure("OPENROUTER_API_KEY"),
+    model: ensure("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
+    backupModel: readEnv("OPENROUTER_BACKUP_MODEL"),
+    siteUrl: ensure("YOUR_SITE_URL", "http://localhost:3000"),
+    siteName: ensure("YOUR_SITE_NAME", "Voice Call Bot"),
+    maxTokens: Number(ensure("OPENROUTER_MAX_TOKENS", "160")),
+    responseTimeoutMs: Number(readEnv("OPENROUTER_RESPONSE_TIMEOUT_MS") || "25000"),
+    streamIdleTimeoutMs: Number(readEnv("OPENROUTER_STREAM_IDLE_TIMEOUT_MS") || "8000"),
+    contextTokenBudget: Number(readEnv("OPENROUTER_CONTEXT_TOKEN_BUDGET") || "3500"),
+    summaryMaxChars: Number(readEnv("OPENROUTER_SUMMARY_MAX_CHARS") || "1200"),
+    recentTurns: Number(readEnv("OPENROUTER_RECENT_TURNS") || "10"),
+    memoryFactLimit: Number(readEnv("OPENROUTER_MEMORY_FACT_LIMIT") || "12"),
+    memoryFactMaxAgeDays: Number(readEnv("OPENROUTER_MEMORY_FACT_MAX_AGE_DAYS") || "14"),
+    memorySummaryMinTurns: Number(readEnv("OPENROUTER_MEMORY_SUMMARY_MIN_TURNS") || "10"),
+    memorySummaryRollupBatch: Number(readEnv("OPENROUTER_MEMORY_SUMMARY_BATCH") || "6"),
+    maxToolLoops: Number(readEnv("OPENROUTER_MAX_TOOL_LOOPS") || "6"),
+    toolExecutionTimeoutMs: Number(readEnv("OPENROUTER_TOOL_EXEC_TIMEOUT_MS") || "12000"),
+    toolRetryLimit: Number(readEnv("OPENROUTER_TOOL_RETRY_LIMIT") || "1"),
+    toolBudgetPerInteraction: Number(readEnv("OPENROUTER_TOOL_BUDGET_PER_INTERACTION") || "4"),
+    toolIdempotencyTtlMs: Number(readEnv("OPENROUTER_TOOL_IDEMPOTENCY_TTL_MS") || "120000"),
+    strictToolSchemas: String(readEnv("OPENROUTER_STRICT_TOOL_SCHEMAS") || "true").toLowerCase() === "true",
+    toolCircuitBreaker: {
+      enabled: String(readEnv("OPENROUTER_TOOL_CIRCUIT_ENABLED") || "true").toLowerCase() === "true",
+      failureThreshold: Number(readEnv("OPENROUTER_TOOL_CIRCUIT_FAILURE_THRESHOLD") || "4"),
+      windowMs: Number(readEnv("OPENROUTER_TOOL_CIRCUIT_WINDOW_MS") || "120000"),
+      cooldownMs: Number(readEnv("OPENROUTER_TOOL_CIRCUIT_COOLDOWN_MS") || "90000"),
+    },
+    personaConsistencyThreshold: Number(readEnv("OPENROUTER_PERSONA_CONSISTENCY_THRESHOLD") || "0.55"),
+    slo: {
+      responseRttMs: Number(readEnv("OPENROUTER_SLO_RESPONSE_RTT_MS") || "7000"),
+      ttfbMs: Number(readEnv("OPENROUTER_SLO_TTFB_MS") || "2000"),
+      toolFailureRate: Number(readEnv("OPENROUTER_SLO_TOOL_FAILURE_RATE") || "0.3"),
+    },
+    alerting: {
+      windowMinutes: Number(readEnv("OPENROUTER_ALERT_WINDOW_MINUTES") || "15"),
+      toolFailureRate: Number(readEnv("OPENROUTER_ALERT_TOOL_FAILURE_RATE") || "0.35"),
+      circuitOpenCount: Number(readEnv("OPENROUTER_ALERT_CIRCUIT_OPEN_COUNT") || "2"),
+      sloDegradedCount: Number(readEnv("OPENROUTER_ALERT_SLO_DEGRADED_COUNT") || "1"),
+    },
   },
   deepgram: {
-    apiKey: ensure('DEEPGRAM_API_KEY'),
-    voiceModel: ensure('VOICE_MODEL', 'aura-asteria-en'),
+    apiKey: ensure("DEEPGRAM_API_KEY"),
+    voiceModel: ensure("VOICE_MODEL", "aura-2-andromeda-en"),
+    model: deepgramModel,
+    voiceAgent: {
+      enabled: voiceAgentEnabled,
+      mode: voiceRuntimeMode,
+      canaryPercent: voiceAgentDefaults.canaryPercent,
+      canarySeed: voiceAgentDefaults.canarySeed,
+      failoverToLegacy: voiceAgentDefaults.failoverToLegacy,
+      openTimeoutMs: voiceAgentDefaults.openTimeoutMs,
+      settingsTimeoutMs: voiceAgentDefaults.settingsTimeoutMs,
+      idleTimeoutMs: voiceAgentDefaults.idleTimeoutMs,
+      keepAliveMs: voiceAgentDefaults.keepAliveMs,
+      noAudioFallbackMs: voiceAgentDefaults.noAudioFallbackMs,
+      managedThinkOnly: voiceAgentDefaults.managedThinkOnly,
+      parityCloseOnGoodbye: voiceAgentDefaults.parityCloseOnGoodbye,
+      language: voiceAgentDefaults.language,
+      listenModel: voiceAgentDefaults.listenModel,
+      listenSmartFormat: voiceAgentDefaults.listenSmartFormat,
+      listenKeyterms: voiceAgentDefaults.listenKeyterms,
+      speakModel: voiceAgentDefaults.speakModel,
+      profileVoiceMap: voiceAgentDefaults.profileVoiceMap,
+      thinkProvider: voiceAgentDefaults.thinkProvider,
+      thinkModel: voiceAgentDefaults.thinkModel,
+      thinkTemperature: voiceAgentDefaults.thinkTemperature,
+      startupTtsProbeEnabled: voiceAgentDefaults.startupTtsProbeEnabled,
+      startupTtsProbeTimeoutMs: voiceAgentDefaults.startupTtsProbeTimeoutMs,
+      syntheticProbeText: voiceAgentDefaults.syntheticProbeText,
+      circuitBreaker: {
+        enabled: voiceAgentDefaults.circuitBreaker.enabled,
+        failureThreshold: voiceAgentDefaults.circuitBreaker.failureThreshold,
+        windowMs: voiceAgentDefaults.circuitBreaker.windowMs,
+        cooldownMs: voiceAgentDefaults.circuitBreaker.cooldownMs,
+      },
+      autoCanary: {
+        enabled: voiceAgentDefaults.autoCanary.enabled,
+        intervalMs: voiceAgentDefaults.autoCanary.intervalMs,
+        windowMs: voiceAgentDefaults.autoCanary.windowMs,
+        cooldownMs: voiceAgentDefaults.autoCanary.cooldownMs,
+        minSamples: voiceAgentDefaults.autoCanary.minSamples,
+        minPercent: voiceAgentDefaults.autoCanary.minPercent,
+        maxPercent: voiceAgentDefaults.autoCanary.maxPercent,
+        stepUpPercent: voiceAgentDefaults.autoCanary.stepUpPercent,
+        stepDownPercent: voiceAgentDefaults.autoCanary.stepDownPercent,
+        maxErrorRate: voiceAgentDefaults.autoCanary.maxErrorRate,
+        maxFallbackRate: voiceAgentDefaults.autoCanary.maxFallbackRate,
+        maxNoAudioFallbackRate:
+          voiceAgentDefaults.autoCanary.maxNoAudioFallbackRate,
+        failClosedOnBreach: voiceAgentDefaults.autoCanary.failClosedOnBreach,
+      },
+    },
   },
   server: {
-    port: Number(ensure('PORT', '3000')),
-    hostname: ensure('SERVER', ''),
+    port: Number(ensure("PORT", "3000")),
+    hostname: serverHostname,
     corsOrigins,
+    requestTimeoutMs: Number(readEnv("SERVER_REQUEST_TIMEOUT_MS") || "120000"),
+    headersTimeoutMs: Number(readEnv("SERVER_HEADERS_TIMEOUT_MS") || "65000"),
+    keepAliveTimeoutMs: Number(readEnv("SERVER_KEEPALIVE_TIMEOUT_MS") || "5000"),
+    maxRequestsPerSocket: Number(readEnv("SERVER_MAX_REQUESTS_PER_SOCKET") || "0"),
     rateLimit: {
-      windowMs: Number(ensure('RATE_LIMIT_WINDOW_MS', '60000')),
-      max: Number(ensure('RATE_LIMIT_MAX', '300')),
+      windowMs: Number(ensure("RATE_LIMIT_WINDOW_MS", "60000")),
+      max: Number(ensure("RATE_LIMIT_MAX", "300")),
     },
+  },
+  database: {
+    schemaVersion: Number(readEnv("DB_SCHEMA_VERSION") || "2"),
+    schemaStrict: String(readEnv("DB_SCHEMA_STRICT") || "true").toLowerCase() === "true",
   },
   admin: {
     apiToken: adminApiToken,
@@ -150,6 +1255,367 @@ module.exports = {
   compliance: {
     mode: complianceMode,
     encryptionKey: dtmfEncryptionKey,
-    isSafe: complianceMode !== 'dev_insecure',
+    isSafe: complianceMode !== "dev_insecure",
+  },
+  recording: {
+    enabled: recordingEnabled,
+  },
+  liveConsole: {
+    audioTickMs: Number.isFinite(liveConsoleAudioTickMs)
+      ? liveConsoleAudioTickMs
+      : 160,
+    editDebounceMs: Number.isFinite(liveConsoleEditDebounceMs)
+      ? liveConsoleEditDebounceMs
+      : 700,
+    userLevelThreshold: Number.isFinite(liveConsoleUserLevelThreshold)
+      ? liveConsoleUserLevelThreshold
+      : 0.08,
+    userHoldMs: Number.isFinite(liveConsoleUserHoldMs)
+      ? liveConsoleUserHoldMs
+      : 450,
+    carrier: liveConsoleCarrier,
+    networkLabel: liveConsoleNetworkLabel,
+  },
+  email: {
+    provider: emailProvider,
+    defaultFrom: emailDefaultFrom,
+    verifiedDomains: emailVerifiedDomains,
+    queueIntervalMs: Number.isFinite(emailQueueIntervalMs)
+      ? emailQueueIntervalMs
+      : 5000,
+    maxRetries: Number.isFinite(emailMaxRetries) ? emailMaxRetries : 5,
+    requestTimeoutMs: Number.isFinite(emailRequestTimeoutMs)
+      ? emailRequestTimeoutMs
+      : 15000,
+    maxSubjectChars: Number.isFinite(emailMaxSubjectChars)
+      ? emailMaxSubjectChars
+      : 200,
+    maxBodyChars: Number.isFinite(emailMaxBodyChars) ? emailMaxBodyChars : 200000,
+    maxBulkRecipients: Number.isFinite(emailMaxBulkRecipients)
+      ? emailMaxBulkRecipients
+      : 500,
+    dlqAlertThreshold: Number.isFinite(emailDlqAlertThreshold)
+      ? emailDlqAlertThreshold
+      : 25,
+    dlqMaxReplays: Number.isFinite(emailDlqMaxReplays)
+      ? emailDlqMaxReplays
+      : 2,
+    queueClaimLeaseMs: Number.isFinite(emailQueueClaimLeaseMs)
+      ? emailQueueClaimLeaseMs
+      : 60000,
+    queueStaleSendingMs: Number.isFinite(emailQueueStaleSendingMs)
+      ? emailQueueStaleSendingMs
+      : 180000,
+    providerEventsTtlDays: Number.isFinite(emailProviderEventsTtlDays)
+      ? emailProviderEventsTtlDays
+      : 14,
+    unsubscribeUrl: emailUnsubscribeUrl,
+    circuitBreaker: {
+      enabled: emailCircuitBreakerEnabled,
+      failureThreshold: Number.isFinite(emailCircuitBreakerFailureThreshold)
+        ? emailCircuitBreakerFailureThreshold
+        : 5,
+      windowMs: Number.isFinite(emailCircuitBreakerWindowMs)
+        ? emailCircuitBreakerWindowMs
+        : 120000,
+      cooldownMs: Number.isFinite(emailCircuitBreakerCooldownMs)
+        ? emailCircuitBreakerCooldownMs
+        : 120000,
+    },
+    rateLimits: {
+      perProviderPerMinute: Number.isFinite(emailRateLimitProvider)
+        ? emailRateLimitProvider
+        : 120,
+      perTenantPerMinute: Number.isFinite(emailRateLimitTenant)
+        ? emailRateLimitTenant
+        : 120,
+      perDomainPerMinute: Number.isFinite(emailRateLimitDomain)
+        ? emailRateLimitDomain
+        : 120,
+    },
+    warmup: {
+      enabled: emailWarmupMaxPerDay > 0,
+      maxPerDay: emailWarmupMaxPerDay,
+    },
+    deliverability: {
+      dkimEnabled: emailDkimEnabled,
+      spfEnabled: emailSpfEnabled,
+      dmarcPolicy: emailDmarcPolicy,
+    },
+    webhookSecret: emailWebhookSecret,
+    webhookValidation: emailWebhookValidation,
+    unsubscribeSecret: emailUnsubscribeSecret,
+    sendgrid: {
+      apiKey: sendgridApiKey,
+      baseUrl: sendgridBaseUrl,
+    },
+    mailgun: {
+      apiKey: mailgunApiKey,
+      domain: mailgunDomain,
+      baseUrl: mailgunBaseUrl,
+    },
+    ses: {
+      region: sesRegion,
+      accessKeyId: sesAccessKeyId,
+      secretAccessKey: sesSecretAccessKey,
+      sessionToken: sesSessionToken,
+    },
+  },
+  smsDefaults: {
+    businessId: defaultSmsBusinessId,
+  },
+  sms: {
+    provider: smsProvider,
+    providerTimeoutMs: Number.isFinite(smsProviderTimeoutMs)
+      ? smsProviderTimeoutMs
+      : 15000,
+    aiTimeoutMs: Number.isFinite(smsAiTimeoutMs) ? smsAiTimeoutMs : 12000,
+    maxMessageChars: Number.isFinite(smsMaxMessageChars)
+      ? smsMaxMessageChars
+      : 1600,
+    maxBulkRecipients: Number.isFinite(smsMaxBulkRecipients)
+      ? smsMaxBulkRecipients
+      : 100,
+    providerFailoverEnabled: smsProviderFailoverEnabled,
+    webhookDedupeTtlMs: Number.isFinite(smsWebhookDedupeTtlMs)
+      ? smsWebhookDedupeTtlMs
+      : 300000,
+    circuitBreaker: {
+      enabled: smsCircuitBreakerEnabled,
+      failureThreshold: Number.isFinite(smsCircuitBreakerFailureThreshold)
+        ? smsCircuitBreakerFailureThreshold
+        : 3,
+      windowMs: Number.isFinite(smsCircuitBreakerWindowMs)
+        ? smsCircuitBreakerWindowMs
+        : 120000,
+      cooldownMs: Number.isFinite(smsCircuitBreakerCooldownMs)
+        ? smsCircuitBreakerCooldownMs
+        : 120000,
+    },
+    reconcile: {
+      enabled: smsReconcileEnabled,
+      intervalMs: Number.isFinite(smsReconcileIntervalMs)
+        ? smsReconcileIntervalMs
+        : 120000,
+      staleMinutes: Number.isFinite(smsReconcileStaleMinutes)
+        ? smsReconcileStaleMinutes
+        : 15,
+      batchSize: Number.isFinite(smsReconcileBatchSize)
+        ? smsReconcileBatchSize
+        : 50,
+    },
+  },
+  outboundLimits: {
+    windowMs: Number.isFinite(outboundRateWindowMs)
+      ? outboundRateWindowMs
+      : 60000,
+    handlerTimeoutMs: Number.isFinite(outboundHandlerTimeoutMs)
+      ? outboundHandlerTimeoutMs
+      : 30000,
+    sms: {
+      perUser: Number.isFinite(smsOutboundUserRateLimit)
+        ? smsOutboundUserRateLimit
+        : 15,
+      global: Number.isFinite(smsOutboundGlobalRateLimit)
+        ? smsOutboundGlobalRateLimit
+        : 120,
+    },
+    email: {
+      perUser: Number.isFinite(emailOutboundUserRateLimit)
+        ? emailOutboundUserRateLimit
+        : 20,
+      global: Number.isFinite(emailOutboundGlobalRateLimit)
+        ? emailOutboundGlobalRateLimit
+        : 120,
+    },
+  },
+  apiAuth: {
+    hmacSecret: apiHmacSecret,
+    maxSkewMs: apiHmacMaxSkewMs,
+    replayWindowMs:
+      Number.isFinite(apiHmacReplayWindowMs) && apiHmacReplayWindowMs > 0
+        ? Math.max(1000, Math.floor(apiHmacReplayWindowMs))
+        : Math.max(1000, Math.floor(apiHmacMaxSkewMs || 300000)),
+    replayValidation: apiHmacReplayValidation,
+  },
+  streamAuth: {
+    secret: streamAuthSecret,
+    maxSkewMs: streamAuthMaxSkewMs,
+  },
+  inbound: {
+    defaultPrompt: inboundDefaultPrompt,
+    defaultFirstMessage: inboundDefaultFirstMessage,
+    routes: inboundRoutes,
+    preConnectMessage: inboundPreConnectMessage,
+    preConnectPauseSeconds: inboundPreConnectPauseSeconds,
+    firstMediaTimeoutMs: inboundFirstMediaTimeoutMs,
+    rateLimitWindowMs: inboundRateLimitWindowMs,
+    rateLimitMax: inboundRateLimitMax,
+    rateLimitSmsEnabled: inboundRateLimitSmsEnabled,
+    rateLimitCallbackEnabled: inboundRateLimitCallbackEnabled,
+    callbackDelayMinutes: inboundCallbackDelayMinutes,
+  },
+  providerFailover: {
+    enabled: providerFailoverEnabled,
+    errorThreshold: providerFailoverThreshold,
+    errorWindowMs: providerFailoverWindowMs,
+    cooldownMs: providerFailoverCooldownMs,
+  },
+  keypadGuard: {
+    enabled: keypadGuardEnabled,
+    vonageDtmfTimeoutMs: Number.isFinite(keypadVonageDtmfTimeoutMs)
+      ? keypadVonageDtmfTimeoutMs
+      : 12000,
+    providerOverrideCooldownMs: Number.isFinite(keypadProviderOverrideCooldownMs)
+      ? keypadProviderOverrideCooldownMs
+      : 1800000,
+  },
+  callJobs: {
+    intervalMs: callJobIntervalMs,
+    retryBaseMs: callJobRetryBaseMs,
+    retryMaxMs: callJobRetryMaxMs,
+    maxAttempts: callJobMaxAttempts,
+    timeoutMs: Number.isFinite(callJobTimeoutMs) ? callJobTimeoutMs : 45000,
+    dlqAlertThreshold: Number.isFinite(callJobDlqAlertThreshold)
+      ? callJobDlqAlertThreshold
+      : 20,
+    dlqMaxReplays: Number.isFinite(callJobDlqMaxReplays)
+      ? callJobDlqMaxReplays
+      : 2,
+  },
+  callSlo: {
+    firstMediaMs: callSloFirstMediaMs,
+    answerDelayMs: callSloAnswerDelayMs,
+    sttFailureThreshold: callSloSttFailures,
+  },
+  callWatchdog: {
+    greetingEnabled: callGreetingWatchdogEnabled,
+    greetingTimeoutMs: Number.isFinite(callGreetingWatchdogTimeoutMs)
+      ? Math.max(3000, Math.floor(callGreetingWatchdogTimeoutMs))
+      : 12000,
+    greetingMaxRetries: Number.isFinite(callGreetingWatchdogMaxRetries)
+      ? Math.max(0, Math.min(3, Math.floor(callGreetingWatchdogMaxRetries)))
+      : 1,
+    greetingRecoveryPrompt: callGreetingWatchdogRecoveryPrompt || null,
+    greetingFallbackMessage: callGreetingWatchdogFallbackMessage || null,
+  },
+  callCanary: {
+    enabled: callCanaryEnabled,
+    intervalMs: Number.isFinite(callCanaryIntervalMs)
+      ? Math.max(30000, Math.floor(callCanaryIntervalMs))
+      : 300000,
+    timeoutMs: Number.isFinite(callCanaryTimeoutMs)
+      ? Math.max(10000, Math.floor(callCanaryTimeoutMs))
+      : 60000,
+    dryRun: callCanaryDryRun,
+    targetNumber: callCanaryTargetNumber || null,
+    profiles: callCanaryProfiles
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean),
+    providers: callCanaryProviders
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean),
+    maxCallsPerRun: Number.isFinite(callCanaryMaxCallsPerRun)
+      ? Math.max(1, Math.min(12, Math.floor(callCanaryMaxCallsPerRun)))
+      : 2,
+    idempotencyWindowMs: Number.isFinite(callCanaryIdempotencyWindowMs)
+      ? Math.max(60000, Math.floor(callCanaryIdempotencyWindowMs))
+      : 300000,
+    userChatId: callCanaryUserChatId || null,
+    quality: {
+      enabled: true,
+      failClosed: false,
+      minScore: 70,
+      minFirstMessageChars: 18,
+      maxPromptChars: 1200,
+      maxSentenceWords: 30,
+    },
+    slo: {
+      enabled: callCanarySloEnabled,
+      windowMs: Number.isFinite(callCanarySloWindowMs)
+        ? Math.max(120000, Math.floor(callCanarySloWindowMs))
+        : 900000,
+      minSamples: Number.isFinite(callCanarySloMinSamples)
+        ? Math.max(1, Math.floor(callCanarySloMinSamples))
+        : 3,
+      maxTimeoutEvents: Number.isFinite(callCanarySloMaxTimeoutEvents)
+        ? Math.max(1, Math.floor(callCanarySloMaxTimeoutEvents))
+        : 2,
+      maxStallEvents: Number.isFinite(callCanarySloMaxStallEvents)
+        ? Math.max(1, Math.floor(callCanarySloMaxStallEvents))
+        : 2,
+    },
+  },
+  postCallQa: {
+    enabled: postCallQaEnabled,
+    shadowMode: postCallQaShadowMode,
+    killSwitch: postCallQaKillSwitch,
+    rolloutPercent: Number.isFinite(postCallQaRolloutPercent)
+      ? Math.max(0, Math.min(100, Math.floor(postCallQaRolloutPercent)))
+      : 0,
+    allowlist: postCallQaAllowlist
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean),
+    minTurns: Number.isFinite(postCallQaMinTurns)
+      ? Math.max(2, Math.floor(postCallQaMinTurns))
+      : 4,
+    minScore: Number.isFinite(postCallQaMinScore)
+      ? Math.max(0, Math.min(100, Math.floor(postCallQaMinScore)))
+      : 70,
+    version: postCallQaVersion || "post_call_qa_v1",
+    profileThresholds: postCallQaProfileThresholds,
+    rubricWeights: postCallQaRubricWeights,
+  },
+  payment: {
+    enabled: paymentFeatureEnabled,
+    killSwitch: paymentKillSwitch,
+    allowTwilio: paymentAllowTwilio,
+    requireScriptOptIn: paymentRequireScriptOptIn,
+    defaultCurrency: paymentDefaultCurrency,
+    minAmount: Number.isFinite(paymentMinAmount) ? paymentMinAmount : 0,
+    maxAmount: Number.isFinite(paymentMaxAmount) ? paymentMaxAmount : 0,
+    maxAttemptsPerCall: Number.isFinite(paymentMaxAttemptsPerCall)
+      ? Math.max(1, Math.floor(paymentMaxAttemptsPerCall))
+      : 3,
+    retryCooldownMs: Number.isFinite(paymentRetryCooldownMs)
+      ? Math.max(0, Math.floor(paymentRetryCooldownMs))
+      : 20000,
+    webhookIdempotencyTtlMs: Number.isFinite(paymentWebhookIdempotencyTtlMs)
+      ? paymentWebhookIdempotencyTtlMs
+      : 300000,
+    reconcile: {
+      enabled: paymentReconcileEnabled,
+      intervalMs: Number.isFinite(paymentReconcileIntervalMs)
+        ? Math.max(15000, Math.floor(paymentReconcileIntervalMs))
+        : 120000,
+      staleSeconds: Number.isFinite(paymentReconcileStaleSeconds)
+        ? Math.max(60, Math.floor(paymentReconcileStaleSeconds))
+        : 240,
+      batchSize: Number.isFinite(paymentReconcileBatchSize)
+        ? Math.max(1, Math.min(100, Math.floor(paymentReconcileBatchSize)))
+        : 20,
+    },
+    smsFallback: {
+      enabled: paymentSmsFallbackEnabled,
+      urlTemplate: String(paymentSmsFallbackUrlTemplate || "").trim(),
+      messageTemplate: String(paymentSmsFallbackMessageTemplate || "")
+        .trim()
+        .slice(0, 240),
+      ttlSeconds: Number.isFinite(paymentSmsFallbackTtlSeconds)
+        ? Math.max(60, Math.min(86400, Math.floor(paymentSmsFallbackTtlSeconds)))
+        : 900,
+      secret: String(paymentSmsFallbackSecret || "").trim(),
+      maxPerCall: Number.isFinite(paymentSmsFallbackMaxPerCall)
+        ? Math.max(1, Math.min(5, Math.floor(paymentSmsFallbackMaxPerCall)))
+        : 1,
+    },
+  },
+  webhook: {
+    retryBaseMs: webhookRetryBaseMs,
+    retryMaxMs: webhookRetryMaxMs,
+    retryMaxAttempts: webhookRetryMaxAttempts,
+    telegramRequestTimeoutMs: Number.isFinite(webhookTelegramTimeoutMs)
+      ? webhookTelegramTimeoutMs
+      : 15000,
   },
 };

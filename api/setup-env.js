@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./utils/bootstrapLogger');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
@@ -11,12 +12,17 @@ const SECTIONS = [
     ],
     fields: [
       { key: 'CALL_PROVIDER', prompt: 'Primary call provider', defaultValue: 'twilio' },
+      { key: 'SMS_PROVIDER', prompt: 'Primary SMS provider', defaultValue: 'twilio' },
+      { key: 'EMAIL_PROVIDER', prompt: 'Primary email provider', defaultValue: 'sendgrid' },
     ],
   },
   {
-    comments: ['# Admin API token for secure provider switching'],
+    comments: ['# API secret (shared for admin + HMAC signing)'],
     fields: [
-      { key: 'ADMIN_API_TOKEN', prompt: 'Admin API token (used by bot for provider switching)', defaultValue: 'change-me' },
+      { key: 'API_SECRET', prompt: 'API Secret', defaultValue: 'change-me' },
+      { key: 'API_HMAC_MAX_SKEW_MS', prompt: 'API HMAC max skew (ms)', defaultValue: '300000' },
+      { key: 'API_HMAC_REPLAY_VALIDATION', prompt: 'API HMAC replay validation mode (warn|strict|off)', defaultValue: 'warn' },
+      { key: 'API_HMAC_REPLAY_WINDOW_MS', prompt: 'API HMAC replay window (ms)', defaultValue: '300000' },
     ],
   },
   {
@@ -87,13 +93,25 @@ const SECTIONS = [
     comments: ['# Deepgram configuration'],
     fields: [
       { key: 'DEEPGRAM_API_KEY', prompt: 'Deepgram API Key' },
-      { key: 'VOICE_MODEL', prompt: 'Deepgram Voice Model', defaultValue: 'aura-asteria-en' },
+      { key: 'VOICE_MODEL', prompt: 'Deepgram Voice Model', defaultValue: 'aura-2-andromeda-en' },
     ],
   },
   {
     comments: ['# Telegram webhook fallback'],
     fields: [
       { key: 'TELEGRAM_BOT_TOKEN', prompt: 'Telegram Bot Token (optional fallback)' },
+    ],
+  },
+  {
+    comments: ['# Telegram Mini App security (required when Mini App admin dashboard is enabled)'],
+    fields: [
+      { key: 'MINI_APP_URL', prompt: 'Mini App URL (optional)' },
+      { key: 'MINI_APP_SESSION_SECRET', prompt: 'Mini App Session Secret' },
+      { key: 'MINI_APP_SESSION_TTL_SECONDS', prompt: 'Mini App Session TTL (seconds)', defaultValue: '900' },
+      { key: 'MINI_APP_INITDATA_MAX_AGE_SECONDS', prompt: 'Mini App Init Data max age (seconds)', defaultValue: '86400' },
+      { key: 'MINI_APP_INITDATA_EXPIRY_GRACE_SECONDS', prompt: 'Mini App Init Data expiry grace (seconds)', defaultValue: '604800' },
+      { key: 'MINI_APP_REPLAY_WINDOW_SECONDS', prompt: 'Mini App replay window (seconds)', defaultValue: '600' },
+      { key: 'MINI_APP_REPLAY_VALIDATION', prompt: 'Mini App replay validation mode (warn|strict|off)', defaultValue: 'warn' },
     ],
   },
   {
@@ -177,6 +195,7 @@ async function main() {
   await fs.promises.writeFile(targetPath, content, 'utf8');
   console.log(`✅ Created ${targetPath}`);
   console.log('   Update any remaining blanks before starting the API.');
+  console.log('   Optional advanced settings reference: api/.env.advanced.example');
 }
 
 main().catch((error) => {

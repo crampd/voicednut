@@ -124,7 +124,7 @@ class DynamicFunctionEngine {
     const analysis = this.analyzeBusinessContext(prompt, firstMessage);
     this.businessContext = analysis;
     
-    console.log(`🔍 Detected business context: ${analysis.industry} - ${analysis.businessType}`.cyan);
+    console.log(`Detected business context: ${analysis.industry} - ${analysis.businessType}`.cyan);
     console.log(`📋 Suggested functions: ${analysis.suggestedFunctions.join(', ')}`.blue);
 
     const functions = [];
@@ -261,7 +261,7 @@ class DynamicFunctionEngine {
       type: 'function',
       function: {
         name: adaptedFunction.name,
-        say: this.generateSayMessage(adaptedFunction.name, context),
+        say: this.generateSayMessage(adaptedFunction.name),
         description: adaptedFunction.description,
         parameters: adaptedFunction.parameters,
         returns: this.generateReturnSchema(adaptedFunction.name)
@@ -276,7 +276,7 @@ class DynamicFunctionEngine {
   }
 
   // Generate appropriate "say" messages based on context
-  generateSayMessage(functionName, context) {
+  generateSayMessage(functionName) {
     const messages = {
       'checkInventory': 'Let me check what we have available for you.',
       'checkPrice': 'Let me get you the current pricing information.',
@@ -416,7 +416,7 @@ class DynamicFunctionEngine {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'placeOrder'} function`);
       
-      const { items, customerInfo, paymentMethod = 'card' } = functionArgs;
+      const { items, paymentMethod = 'card' } = functionArgs;
       
       const orderId = `ORD-${Date.now().toString().slice(-8).toUpperCase()}`;
       const total = Math.floor(Math.random() * 1000) + 100; // Mock total
@@ -437,7 +437,7 @@ class DynamicFunctionEngine {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'lookupInformation'} function`);
       
-      const { topic, category, details } = functionArgs;
+      const { topic, category } = functionArgs;
       
       // Context-specific information responses
       const responses = {
@@ -458,7 +458,7 @@ class DynamicFunctionEngine {
     };
   }
 
-  createSupportFunction(context) {
+  createSupportFunction() {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'handleSupport'} function`);
       
@@ -480,7 +480,7 @@ class DynamicFunctionEngine {
     };
   }
 
-  createLeadQualificationFunction(context) {
+  createLeadQualificationFunction() {
     return async function(functionArgs) {
       console.log(`GPT -> called ${this.name || 'qualifyLead'} function`);
       
@@ -589,6 +589,35 @@ module.exports = ${name};`;
       availableTemplates: Array.from(this.functionTemplates.keys()),
       generatedFunctions: Array.from(this.functionRegistry.keys())
     };
+  }
+
+  getSecureInputHints(context = null) {
+    const resolvedContext = context || this.businessContext || {};
+    const industry = resolvedContext.industry || 'general';
+    const businessLabel =
+      resolvedContext.businessDisplayName ||
+      resolvedContext.companyName ||
+      resolvedContext.brand ||
+      'our team';
+
+    const hints = {};
+
+    if (industry === 'finance' || resolvedContext.businessType === 'banking') {
+      hints.OTP = `It is the 6-digit security code sent to protect the ${businessLabel} account.`;
+      hints.PIN = `Use the PIN you set when opening your ${businessLabel} profile.`;
+      hints.CARD_LAST4 = `Only the last four digits of the ${businessLabel} card are required.`;
+    } else if (industry === 'healthcare') {
+      hints.OTP = `This code confirms access to your ${businessLabel} health portal.`;
+      hints.PIN = `Use the clinic PIN associated with your ${businessLabel} file.`;
+    } else if (industry === 'real_estate' || industry === 'automotive') {
+      hints.OTP = `It verifies your ${businessLabel} inquiry; check the text we just sent.`;
+      hints.PIN = `This is the application PIN tied to your ${businessLabel} request.`;
+    } else {
+      hints.OTP = `This keeps your ${businessLabel} experience secure; enter the code we texted.`;
+      hints.PIN = `Use the short PIN you chose with ${businessLabel}.`;
+    }
+
+    return hints;
   }
 }
 

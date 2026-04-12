@@ -35,10 +35,88 @@ A comprehensive Telegram bot system for making AI-powered voice calls using Twil
 ## 🔁 Provider Modes (Twilio, AWS Connect, Vonage)
 
 - Set the default voice backbone with `CALL_PROVIDER` in `api/.env` (`twilio`, `aws`, or `vonage`).
-- Admins can switch live traffic at any time via `/provider [twilio|aws|vonage|status]` in Telegram (requires `ADMIN_API_TOKEN`).
+- Admins can switch live traffic at any time via `/provider <name>|status` in Telegram (requires `ADMIN_API_TOKEN`).
 - Twilio mode keeps the original Media Streams flow; AWS mode routes through Connect/Kinesis per `aws-migration.md`; Vonage mode uses the Vonage Voice API and WebSocket streaming.
 - Each provider has matching SMS adapters (Twilio SMS, AWS Pinpoint, Vonage SMS) so outbound texts follow the active backbone.
 - When Twilio is selected but credentials are missing, the API now fails fast with a targeted message pointing to the relevant `.env` entries and the `npm run setup --prefix api` helper.
+- Deepgram Voice Agent is now the default path (`USE_DEEPGRAM_VOICE_AGENT=true`) for Twilio and Vonage streams, and automatically falls back to the legacy STT+GPT+TTS pipeline when Voice Agent is unavailable, bypassed, or when keypad-required capture flows need the legacy digit path.
+- Voice Agent runtime guardrails (recommended):
+  - `DEEPGRAM_VOICE_AGENT_TURN_TIMEOUT_MS=12000`
+  - `DEEPGRAM_VOICE_AGENT_TOOL_TIMEOUT_MS=8000`
+  - `DEEPGRAM_VOICE_AGENT_MAX_TOOL_RESPONSE_CHARS=4000`
+  - `DEEPGRAM_VOICE_AGENT_MAX_CONSECUTIVE_TOOL_FAILURES=3`
+  - `DEEPGRAM_VOICE_AGENT_TIMEOUT_FALLBACK_THRESHOLD=2` (Twilio path; set `0` to disable)
+
+### Vonage Signed Callbacks (Recommended for production)
+
+- Enable signed callback verification with:
+  - `VONAGE_WEBHOOK_VALIDATION=strict`
+  - `VONAGE_WEBHOOK_SIGNATURE_SECRET=<your_vonage_signature_secret>`
+- Optional hardening:
+  - `VONAGE_WEBHOOK_REQUIRE_PAYLOAD_HASH=true`
+  - `VONAGE_WEBHOOK_MAX_SKEW_MS=300000`
+- Vonage websocket audio should use official Linear16:
+  - `VONAGE_WEBSOCKET_CONTENT_TYPE=audio/l16;rate=16000` (recommended)
+  - `VONAGE_WEBSOCKET_CONTENT_TYPE=audio/l16;rate=8000` (fallback for narrowband)
+- For keypad digit capture over Vonage, enable webhook DTMF ingestion:
+  - `VONAGE_DTMF_WEBHOOK_ENABLED=true`
+  - Configure your Vonage Voice app callbacks to:
+    - Answer URL: `GET /answer`
+    - Event URL: `POST /event`
+- If `VONAGE_DTMF_WEBHOOK_ENABLED=false`, keypad-critical flows (OTP/PIN verification profiles) are automatically routed away from Vonage to prevent silent digit-capture failures.
+- Provider guard tuning for production:
+  - `KEYPAD_GUARD_ENABLED=true`
+  - `KEYPAD_VONAGE_DTMF_TIMEOUT_MS=12000`
+  - `KEYPAD_PROVIDER_OVERRIDE_COOLDOWN_S=1800`
+- When a Vonage keypad timeout is detected, the API auto-overrides future keypad flows for the affected script/profile to Twilio for the configured cooldown and emits a Telegram+health-log alert.
+- Admin override controls:
+  - `GET /admin/provider/keypad-overrides`
+  - `POST /admin/provider/keypad-overrides/clear` with one of:
+    - `{ "all": true }`
+    - `{ "scope_key": "script:12" }`
+    - `{ "scope": "profile", "value": "otp" }`
+- If callback verification fails in strict mode, the API returns `503` so Vonage can retry delivery.
+- Run a local control-plane parity smoke check with:
+  - `npm run parity:providers --prefix api`
+
+### Telegram + AWS Callback Auth (Recommended for production)
+
+- Telegram callback endpoint (`POST /webhook/telegram`) now enforces auth in `strict` mode by default in production.
+  - Sign requests with API HMAC headers (`x-api-timestamp`, `x-api-signature`).
+- AWS callback endpoints (`POST /webhook/aws/status`, `POST /aws/transcripts`) now enforce auth in `strict` mode by default in production.
+  - Preferred: sign requests with API HMAC headers.
+  - Fallback for forwarders: set `AWS_WEBHOOK_SECRET` and send it in `x-aws-webhook-secret`.
+- AWS websocket ingress (`WS /aws/stream`) now requires stream auth token (`token` + `ts`) or `AWS_WEBHOOK_SECRET` as query/header secret.
+
+### Queue/Worker Hardening (Recommended for production)
+
+- `CALL_JOB_TIMEOUT_MS` bounds each outbound job execution to avoid stalled workers.
+- `CALL_JOB_DLQ_ALERT_THRESHOLD` raises service-health alerts when open call-job DLQ entries exceed a threshold.
+- `CALL_JOB_DLQ_MAX_REPLAYS` caps manual replay attempts per call-job DLQ entry.
+- `WEBHOOK_TELEGRAM_TIMEOUT_MS` bounds Telegram notification API calls.
+- `EMAIL_REQUEST_TIMEOUT_MS` bounds outbound provider requests for SendGrid/Mailgun/SES adapters.
+- `EMAIL_DLQ_ALERT_THRESHOLD` raises service-health alerts when open email DLQ entries exceed a threshold.
+- `EMAIL_DLQ_MAX_REPLAYS` caps manual replay attempts per email DLQ entry.
+
+Admin replay endpoints:
+- `GET /admin/call-jobs/dlq`, `POST /admin/call-jobs/dlq/:id/replay`
+- `GET /admin/email/dlq`, `POST /admin/email/dlq/:id/replay`
+
+### Post-Call QA Scoring (Safe Rollout Scaffold)
+
+- Post-call QA is now gated behind default-off feature flags:
+  - `POST_CALL_QA_ENABLED=false`
+  - `POST_CALL_QA_SHADOW_MODE=true`
+  - `POST_CALL_QA_ROLLOUT_PERCENT=0`
+  - `POST_CALL_QA_ALLOWLIST=`
+  - `POST_CALL_QA_KILL_SWITCH=false`
+  - `POST_CALL_QA_PROFILE_THRESHOLDS=` (optional, example: `collections:78,support:72,sales:74,verification:80`)
+  - `POST_CALL_QA_RUBRIC_WEIGHTS=` (optional JSON weights for `compliance`, `resolution`, `empathy`, `clarity`)
+- When enabled for selected traffic, call-end processing stores QA scorecards in `call_quality_reports` and writes call-state audit events (`post_call_qa_scored`, `post_call_qa_skipped`, `post_call_qa_error`).
+- API endpoints:
+  - `GET /api/qa/summary` (aggregate QA trends by status/profile + top findings)
+  - `GET /api/calls/:callSid/qa` (fetch latest QA report for a call)
+  - `POST /api/calls/:callSid/qa/evaluate?force=1` (manual on-demand evaluation, bypasses rollout gate by default)
 
 ## 🏗️ System Architecture
 
@@ -103,6 +181,17 @@ npm run setup --prefix bot
 - Use `/start` to begin
 - Use `/call` to make your first AI call
 
+## 🔐 Access gating & verification
+
+- Guests can open `/start`, `/menu`, `/help`, and `/guide` to see what the bot offers; actions such as `/call`, `/sms`, `/email`, and `/calllog` remain locked until an admin approves them.
+- Request access by contacting the admin (the bot provides a "Request Access" button wherever commands are locked), then reopen `/start` to see the granted menus.
+- Admins can monitor access-denied activity in `bot/logs/access-denied.log` and via `/status`, which reports the last few blocked attempts and rate-limited users.
+- **Manual verification checklist:**
+  1. Guest account: open `/start`, `/menu`, `/help`, and `/guide`; confirm only navigational UI renders and action buttons show lock/CTA.
+  2. Authorized user: run `/call`, `/sms`, `/email`, and `/calllog` to confirm flows still operate.
+  3. Admin: verify provider/users/bulk menus still appear and `/status` shows denial metrics after triggering a denied action.
+  4. Tail the log with `tail -f bot/logs/access-denied.log` to watch automatic audit entries.
+
 ## ⚙️ Configuration
 
 ### API Server Configuration (`api/.env`)
@@ -139,9 +228,6 @@ BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
 ADMIN_TELEGRAM_ID=123456789
 ADMIN_TELEGRAM_USERNAME=your_username
 API_URL=http://localhost:3000
-MINI_APP_URL=https://voicednut-mini.vercel.app
-WEB_APP_SECRET=super-secret-shared-key
-WEB_APP_PORT=8080
 ```
 
 ## 📖 API Documentation
@@ -227,8 +313,9 @@ CREATE TABLE transcripts (
 
 - `/start` - Start or restart the bot
 - `/call` - Start a new voice call
-- `/transcript <call_sid>` - Get call transcript
-- `/calls [limit]` - List recent calls
+- `/calllog` - Browse call history, search, and events
+- `/sms` - Open SMS center
+- `/email` - Open Email center
 - `/health` - Check bot and API health
 - `/guide` - Show detailed usage guide
 - `/help` - Show available commands
@@ -241,7 +328,11 @@ CREATE TABLE transcripts (
 - `/removeuser` - Remove user access
 - `/users` - List all authorized users
 - `/status` - Full system status check
-- `/test_api` - Test API connection
+- `/smssender` - Bulk SMS center
+- `/mailer` - Bulk email center
+- `/scripts` - Script designer (call/SMS/email)
+- `/persona` - Manage personas
+- `/provider` - Voice provider controls
 
 ## 📁 Project Structure
 
@@ -267,7 +358,6 @@ voice-call-bot/
 │   │   └── ...
 │   ├── db/               # Bot database
 │   └── utils/            # Utility functions
-│
 └── README.md             # This documentation
 ```
 
@@ -390,7 +480,7 @@ Available TTS voices:
 - API: `GET /health`
 - Bot: `/health` command
 - Admin: `/status` command
-- Admin: `/provider [twilio|aws|vonage|status]` to inspect or switch the active call backbone
+- Admin: `/provider <name>|status` to inspect or switch the active call backbone
 
 ### Logging
 
@@ -425,6 +515,10 @@ This project is licensed under the MIT License - see the <LICENSE> file for deta
 - [Deepgram](https://deepgram.com/) for speech services
 - [Grammy](https://grammy.dev/) for Telegram bot framework
 - All contributors who helped build this project
+
+## 📮 Voicemail QA
+
+See `docs/voicemail-qa.md` for a quick checklist and sample webhook payloads to validate voicemail detection behavior.
 
 ## 📊 Project Status
 
