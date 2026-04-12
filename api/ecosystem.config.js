@@ -44,7 +44,7 @@ module.exports = {
       user: 'ubuntu',
       host: '3.135.63.195',
       ref: 'origin/main',
-      repo: 'git@github.com:cashlyp/voxly.git',
+      repo: 'git@github.com:crampd/voicednut.git',
       path: '/home/ubuntu/voxly',
       'pre-setup': 'apt-get install git -y',
       'post-setup': 'ls -la',
