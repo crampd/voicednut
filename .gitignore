@@ -77,3 +77,4 @@ prettier.config.ts
 
 # documentation files/folders
 docs/
+**/docs/
