@@ -76,5 +76,5 @@ prettier.config.ts
 .editorconfig
 
 # documentation files/folders
-docs/
-**/docs/
+docs/*
+**/docs/*
