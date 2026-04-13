@@ -64,6 +64,7 @@ jobs:
           timeout: 30m
           command_timeout: 30m
           script: |
+            bash <<'EOF'
             set -euo pipefail
 
             export NVM_DIR="/home/ubuntu/.nvm"
@@ -72,10 +73,12 @@ jobs:
               nvm use 20 >/dev/null 2>&1 || nvm use default >/dev/null 2>&1 || true
             fi
 
-            command -v git >/dev/null
-            command -v node >/dev/null
-            command -v npm >/dev/null
-            command -v pm2 >/dev/null
+            for required_command in git node npm pm2; do
+              if ! command -v "$required_command" >/dev/null 2>&1; then
+                echo "Missing required command: $required_command" >&2
+                exit 1
+              fi
+            done
 
             DEPLOY_ROOT=/home/ubuntu/voxly
             REPO_URL=https://github.com/crampd/voicednut.git
@@ -85,14 +88,11 @@ jobs:
 
             if [ ! -d "$DEPLOY_ROOT/.git" ]; then
               git clone --filter=blob:none --no-checkout "$REPO_URL" "$DEPLOY_ROOT"
-              cd "$DEPLOY_ROOT"
-              git sparse-checkout init --cone
-              git sparse-checkout set api bot
-            else
-              cd "$DEPLOY_ROOT"
-              git sparse-checkout init --cone
-              git sparse-checkout set api bot
             fi
+
+            cd "$DEPLOY_ROOT"
+            git sparse-checkout init --cone
+            git sparse-checkout set api bot
 
             git fetch --depth=1 origin "${{ github.sha }}"
             git checkout --force "${{ github.sha }}"
@@ -118,3 +118,4 @@ jobs:
             # Save PM2 process list
             pm2 status
             pm2 save --force
+            EOF
