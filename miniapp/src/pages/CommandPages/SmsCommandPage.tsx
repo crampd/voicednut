@@ -761,7 +761,6 @@ function SmsCommandPageContent() {
             note={contract.notes}
             accessLevel={accessLevel}
             requiredAccess="authorized"
-            stateDescription="Request access from an admin or continue with Help Center, Quick Actions, or the admin console while SMS execution remains locked."
           />
         ) : (
           <Section

@@ -23,6 +23,7 @@ import {
   describeAccessLevel,
   describeRequiredAccess,
 } from '@/contracts/commandPageCatalog';
+import { resolveRestrictedSupportLinks } from '@/contracts/miniappAccessExperience';
 
 type CommandPageBadgeVariant = 'meta' | 'info' | 'success' | 'warning' | 'error';
 
@@ -122,6 +123,7 @@ export function CommandPageRestrictedState({
   badgeLabel,
   badgeVariant = 'warning',
 }: CommandPageRestrictedStateProps) {
+  const supportLinks = resolveRestrictedSupportLinks(accessLevel);
   const resolvedStateTitle = stateTitle ?? (
     accessLevel === 'guest'
       ? (requiredAccess === 'admin' ? 'Admin page preview only' : 'Approval required')
@@ -129,12 +131,15 @@ export function CommandPageRestrictedState({
   );
   const resolvedStateDescription = stateDescription ?? (
     accessLevel === 'guest'
-      ? 'This workspace stays visible so you can understand the workflow before access is granted. Use Help Center, Quick Actions, or the home screen for routes that are open now.'
+      ? 'This workspace stays visible so you can understand the workflow before access is granted. Continue with the browse-safe routes below while execution remains locked.'
       : (requiredAccess === 'admin'
-          ? 'This route is reserved for admin oversight. Continue with your open workspaces or ask an admin to complete this step.'
-          : 'Request access from an admin or continue with Help Center, Quick Actions, or the admin console for available workflows.')
+          ? 'This route is reserved for admin oversight. Continue with your open workspaces below or ask an admin to complete this step.'
+          : 'Request access from an admin or continue with the open workspaces below for the routes available to this session.')
   );
   const resolvedBadgeLabel = badgeLabel ?? (accessLevel === 'guest' ? 'Preview only' : 'Restricted');
+  const fallbackSummary = accessLevel === 'guest'
+    ? 'Browse-safe routes'
+    : 'Open workspaces';
 
   return (
     <CommandPageLayout
@@ -154,7 +159,7 @@ export function CommandPageRestrictedState({
           items={[
             { label: 'Session access', value: describeAccessLevel(accessLevel) },
             { label: 'Required here', value: describeRequiredAccess(requiredAccess) },
-            { label: 'Fallback', value: 'Help or admin console' },
+            { label: 'Fallback', value: fallbackSummary },
           ]}
         />
       )}
@@ -169,22 +174,28 @@ export function CommandPageRestrictedState({
         statusVariant="warning"
       />
       <List>
-        <Section header="Continue with guidance">
-          <Link to={MINIAPP_COMMAND_ROUTE_CONTRACTS.HELP}>
-            <Cell subtitle="Open Help Center for role-aware guidance.">
-              Help Center
-            </Cell>
-          </Link>
-          <Link to={MINIAPP_COMMAND_ROUTE_CONTRACTS.MENU}>
-            <Cell subtitle="Open Quick Actions for currently accessible workflows.">
-              Quick Actions
-            </Cell>
-          </Link>
-          <Link to={DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT}>
-            <Cell subtitle="Open the admin console home.">
-              Admin console
-            </Cell>
-          </Link>
+        <Section header={accessLevel === 'guest' ? 'Browse-safe routes' : 'Continue with open workspaces'}>
+          {supportLinks.map((link) => (
+            <Link key={link.to} to={link.to}>
+              <Cell subtitle={link.description}>
+                {link.title}
+              </Cell>
+            </Link>
+          ))}
+          {accessLevel !== 'guest' ? (
+            <Link to={DASHBOARD_STATIC_ROUTE_CONTRACTS.ROOT}>
+              <Cell subtitle="Return to the main console and continue with a ready workspace.">
+                Admin console
+              </Cell>
+            </Link>
+          ) : null}
+          {accessLevel === 'guest' ? (
+            <Link to={MINIAPP_COMMAND_ROUTE_CONTRACTS.MENU}>
+              <Cell subtitle="Open Quick Actions for the routes that stay available right now.">
+                Quick Actions
+              </Cell>
+            </Link>
+          ) : null}
         </Section>
       </List>
     </CommandPageLayout>

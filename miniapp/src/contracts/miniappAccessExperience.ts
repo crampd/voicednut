@@ -2,6 +2,7 @@ import {
   DASHBOARD_MODULE_ROUTE_CONTRACTS,
   DASHBOARD_STATIC_ROUTE_CONTRACTS,
   MINIAPP_COMMAND_ROUTE_CONTRACTS,
+  type MiniAppCommandAccessLevel,
 } from './miniappParityContracts.js';
 
 import {
@@ -144,6 +145,20 @@ export const SUPPORT_LINKS_BY_ROLE: Record<MiniAppSessionRoleKey, MiniAppSupport
     },
   ],
 };
+
+export function resolveSupportRoleKeyForAccessLevel(
+  accessLevel: MiniAppCommandAccessLevel,
+): MiniAppSessionRoleKey {
+  if (accessLevel === 'admin') return 'admin';
+  if (accessLevel === 'authorized') return 'operator';
+  return 'viewer';
+}
+
+export function resolveRestrictedSupportLinks(
+  accessLevel: MiniAppCommandAccessLevel,
+): MiniAppSupportLink[] {
+  return SUPPORT_LINKS_BY_ROLE[resolveSupportRoleKeyForAccessLevel(accessLevel)];
+}
 
 export function normalizeSessionRoleKey(sessionRole: string): MiniAppSessionRoleKey {
   const normalizedRole = sessionRole.trim().toLowerCase();

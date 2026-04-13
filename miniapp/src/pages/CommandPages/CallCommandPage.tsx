@@ -1804,7 +1804,6 @@ function CallCommandPageContent() {
             note={contract.notes}
             accessLevel={accessLevel}
             requiredAccess="authorized"
-            stateDescription="Request access from an admin or continue with Help Center, Quick Actions, or the admin console while call execution remains locked."
           />
         ) : (
           <>
