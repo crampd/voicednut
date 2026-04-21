@@ -1030,8 +1030,43 @@ function createDigitCollectionService(options = {}) {
     const value = String(source || '').toLowerCase();
     if (value === 'sms' || value === 'secure_sms_link' || value === 'link') return 'secure_sms_link';
     if (value === 'spoken' || value === 'speech' || value === 'voice') return 'spoken';
-    if (value === 'agent' || value === 'handoff') return 'human_agent_handoff';
+    if (value === 'agent' || value === 'handoff' || value === 'human_agent_handoff' || value === 'review_case') {
+      return 'review_case';
+    }
     return 'dtmf';
+  };
+
+  const normalizeRiskEscalationOutcome = (value = '') => {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) return '';
+    if (raw === 'callback' || raw === 'call_back') return 'callback';
+    if (
+      raw === 'secure_follow_up'
+      || raw === 'follow_up'
+      || raw === 'followup'
+      || raw === 'followup_sms'
+      || raw === 'sms'
+      || raw === 'email'
+    ) {
+      return 'secure_follow_up';
+    }
+    if (
+      raw === 'review_case'
+      || raw === 'review'
+      || raw === 'case_review'
+      || raw === 'route_to_agent'
+      || raw === 'route-agent'
+      || raw === 'transfer'
+      || raw === 'transfer_call'
+      || raw === 'transfercall'
+      || raw === 'handoff'
+      || raw === 'agent'
+      || raw === 'specialist'
+      || raw === 'human_agent_handoff'
+    ) {
+      return 'review_case';
+    }
+    return raw;
   };
 
   const ensureCaptureSession = (callSid, expectation = {}, meta = {}) => {
@@ -2249,7 +2284,7 @@ function createDigitCollectionService(options = {}) {
       applied = true;
     }
     if (signal.score >= thresholds.route_agent) {
-      expectation.risk_action = 'route_to_agent';
+      expectation.risk_action = 'review_case';
       expectation.risk_score = signal.score;
       expectation.risk_reason = signal.reason || 'risk_threshold';
       applied = true;
@@ -2309,7 +2344,7 @@ function createDigitCollectionService(options = {}) {
       next.storage_class = 'restricted';
       next.persist_raw_digits = false;
       next.allow_sensitive_raw_persistence = false;
-      next.escalation_policy = 'route_to_agent';
+      next.escalation_policy = 'review_case';
       if (allowSensitiveRawPersistence) {
         next.persist_raw_digits = true;
         next.allow_sensitive_raw_persistence = true;
@@ -2528,26 +2563,58 @@ function createDigitCollectionService(options = {}) {
     return false;
   };
 
-  const routeToAgentOnRisk = async (callSid, expectation, collection, allowCallEnd, deferCallEnd) => {
+  const requestReviewCaseOnRisk = async (callSid, expectation, collection, allowCallEnd, deferCallEnd) => {
     const score = expectation?.risk_score ?? null;
     const reason = expectation?.risk_reason || 'risk_threshold';
-    const message = callEndMessages.risk
-      || 'For security reasons, we need to route this request to an agent. Goodbye.';
-    updateCaptureSessionChannel(callSid, 'human_agent_handoff', { reason });
-    transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'risk_route_to_agent' });
-    logDigitMetric('risk_route_agent', { callSid, score, reason });
-    void emitAuditEvent(callSid, 'RoutedToAgent', {
+    const configuredRiskMessage = String(callEndMessages.risk || '').trim();
+    const safeRiskMessage = /\b(agent|transfer|specialist|handoff)\b/i.test(configuredRiskMessage)
+      ? ''
+      : configuredRiskMessage;
+    const message = safeRiskMessage
+      || 'For security reasons, we need to review this request and follow up securely. Goodbye.';
+    const phoneNumber = await resolveCallPhone(callSid);
+    let reviewCaseId = null;
+    if (db?.createReviewCase) {
+      try {
+        reviewCaseId = await db.createReviewCase({
+          call_sid: callSid,
+          phone_number: phoneNumber,
+          requested_action: 'review_case',
+          reason: 'digit_risk_escalation',
+          notes: reason,
+          source: 'digit_capture',
+          status: 'open',
+          metadata: {
+            score,
+            reason,
+            profile: expectation?.profile || collection?.profile || 'generic',
+            source: collection?.source || 'system',
+            confidence: collection?.confidence || null,
+            signals: collection?.confidence_signals || null,
+          },
+        });
+      } catch (err) {
+        logger.warn('digit risk review case create error:', err);
+      }
+    }
+    webhookService?.addLiveEvent?.(callSid, '📝 Review case requested for digit capture risk', { force: true });
+    updateCaptureSessionChannel(callSid, 'review_case', { reason });
+    transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'risk_review_case' });
+    logDigitMetric('risk_review_case', { callSid, score, reason, review_case_id: reviewCaseId || null });
+    void emitAuditEvent(callSid, 'ReviewCaseRequested', {
       profile: expectation?.profile || collection?.profile || 'generic',
       source: collection?.source || 'system',
       reason,
+      review_case_id: reviewCaseId || null,
       confidence: collection?.confidence || null,
       signals: collection?.confidence_signals || null
     });
-    await db.updateCallState(callSid, 'digit_risk_escalation', {
+    await db.updateCallState(callSid, 'review_case_requested', {
       score,
       reason,
       profile: expectation?.profile || collection?.profile || null,
-      fallback_reason_code: buildFallbackReasonCode('human_agent', reason)
+      review_case_id: reviewCaseId || null,
+      fallback_reason_code: buildFallbackReasonCode('review_case', reason)
     }).catch(() => {});
     if (allowCallEnd) {
       if (deferCallEnd) {
@@ -7284,7 +7351,7 @@ function createDigitCollectionService(options = {}) {
         confidence: collection.confidence
       });
       recordIntentHistory(callSid, collection.profile);
-      const riskAction = expectation?.risk_action === 'route_to_agent';
+      const riskAction = normalizeRiskEscalationOutcome(expectation?.risk_action) === 'review_case';
       transitionCaptureState(callSid, CAPTURE_EVENTS.COMPLETE, { reason: 'digits_accepted' });
       clearDigitTimeout(callSid);
       clearDigitFallbackState(callSid);
@@ -7526,9 +7593,9 @@ function createDigitCollectionService(options = {}) {
         transitionCaptureState(callSid, CAPTURE_EVENTS.ABORT, { reason: 'risk_escalation' });
         await completeCaptureSession(callSid, 'aborted', {
           reason: 'risk_escalation',
-          channel: 'human_agent_handoff'
+          channel: 'review_case'
         });
-        await routeToAgentOnRisk(callSid, expectation, collection, allowCallEnd, deferCallEnd);
+        await requestReviewCaseOnRisk(callSid, expectation, collection, allowCallEnd, deferCallEnd);
         return;
       }
       if (shouldEndCall) {
@@ -7604,12 +7671,12 @@ function createDigitCollectionService(options = {}) {
             return;
           }
         }
-        if (expectation?.escalation_policy === 'route_to_agent') {
+        if (normalizeRiskEscalationOutcome(expectation?.escalation_policy) === 'review_case') {
           await completeCaptureSession(callSid, 'aborted', {
             reason: 'high_risk_policy',
-            channel: 'human_agent_handoff'
+            channel: 'review_case'
           });
-          await routeToAgentOnRisk(
+          await requestReviewCaseOnRisk(
             callSid,
             { ...expectation, risk_reason: 'high_risk_policy' },
             collection,

@@ -32,21 +32,43 @@ const DEFAULT_RUBRIC_WEIGHTS = Object.freeze({
 
 const DEFAULT_PROFILE_THRESHOLDS = Object.freeze({
   collections: 78,
+  collections_servicing: 78,
   support: 72,
+  tax_support: 74,
+  tax_resolution: 78,
+  bank_servicing: 76,
+  fraud_review: 84,
   sales: 74,
   verification: 80,
+  identity_verification_plus: 82,
   general: 70,
 });
 
 const PROFILE_ALIAS_MAP = Object.freeze({
   collection: "collections",
   payment_collection: "collections",
+  collections_servicing_support: "collections_servicing",
+  "collections-servicing": "collections_servicing",
+  "collections-servicing-support": "collections_servicing",
   customer_support: "support",
   customer_service: "support",
   helpdesk: "support",
+  tax_support_service: "tax_support",
+  "tax-support": "tax_support",
+  "tax-support-service": "tax_support",
+  tax_resolution_service: "tax_resolution",
+  "tax-resolution": "tax_resolution",
+  "tax-resolution-service": "tax_resolution",
+  bank_servicing_support: "bank_servicing",
+  "bank-servicing": "bank_servicing",
+  "bank-servicing-support": "bank_servicing",
+  fraud_review_support: "fraud_review",
+  "fraud-review": "fraud_review",
+  "fraud-review-support": "fraud_review",
   lead_gen: "sales",
   lead_generation: "sales",
   identity_verification: "verification",
+  "identity-verification-plus": "identity_verification_plus",
   otp: "verification",
 });
 
@@ -186,10 +208,14 @@ function buildEligibilityTokens(callSid, call = {}) {
     const normalized = normalizeText(value).toLowerCase();
     if (normalized) tokens.add(normalized);
   };
+  const profile = resolveCallProfile(call);
   add(callSid);
   add(call?.phone_number);
   add(call?.user_chat_id);
   add(call?.script_id);
+  add(profile);
+  add(`profile:${profile}`);
+  add(`domain:${profile}`);
   return tokens;
 }
 

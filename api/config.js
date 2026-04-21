@@ -105,6 +105,56 @@ function parseNumericMap(rawValue, options = {}) {
   return map;
 }
 
+function parseBooleanMap(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === "") return {};
+
+  const normalizeKey = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^\w-]+/g, "_")
+      .replace(/-/g, "_");
+
+  const normalizeBoolean = (value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    if (!normalized) return null;
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+    return null;
+  };
+
+  const map = {};
+  if (rawValue && typeof rawValue === "object" && !Array.isArray(rawValue)) {
+    for (const [key, value] of Object.entries(rawValue)) {
+      const normalizedKey = normalizeKey(key);
+      const normalizedValue = normalizeBoolean(value);
+      if (!normalizedKey || normalizedValue === null) continue;
+      map[normalizedKey] = normalizedValue;
+    }
+    return map;
+  }
+
+  const text = String(rawValue || "").trim();
+  if (!text) return map;
+  if (text.startsWith("{") && text.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(text);
+      return parseBooleanMap(parsed);
+    } catch {
+      return map;
+    }
+  }
+
+  for (const token of text.split(",")) {
+    const [rawKey, rawBoolean] = String(token || "").split(":");
+    const normalizedKey = normalizeKey(rawKey);
+    const normalizedValue = normalizeBoolean(rawBoolean);
+    if (!normalizedKey || normalizedValue === null) continue;
+    map[normalizedKey] = normalizedValue;
+  }
+  return map;
+}
+
 function readBooleanEnv(name, fallback = false) {
   const value = readEnv(name);
   if (value === undefined) return fallback;
@@ -140,7 +190,6 @@ const corsOrigins = corsOriginsRaw
 
 const recordingEnabled =
   String(readEnv("RECORDING_ENABLED") || "false").toLowerCase() === "true";
-const transferNumber = readEnv("TRANSFER_NUMBER");
 const defaultSmsBusinessId = readEnv("DEFAULT_SMS_BUSINESS_ID") || null;
 const deepgramModel = readEnv("DEEPGRAM_MODEL") || "nova-2";
 const voiceRuntimeModeRaw = (readEnv("VOICE_RUNTIME_MODE") || "legacy")
@@ -667,6 +716,31 @@ const postCallQaRubricWeights = parseJsonObject(
   readEnv("POST_CALL_QA_RUBRIC_WEIGHTS"),
   "POST_CALL_QA_RUBRIC_WEIGHTS",
 );
+const domainFlowsEnabled = readBooleanEnv("FEATURE_DOMAIN_FLOWS_ENABLED", false);
+const domainFlowsShadowMode = readBooleanEnv(
+  "FEATURE_DOMAIN_FLOWS_SHADOW_MODE",
+  false,
+);
+const domainFlowsKillSwitch = readBooleanEnv(
+  "FEATURE_DOMAIN_FLOWS_KILL_SWITCH",
+  false,
+);
+const domainFlowsRolloutPercent = Number(
+  readEnv("FEATURE_DOMAIN_FLOWS_ROLLOUT_PERCENT") || "0",
+);
+const domainFlowsAllowlist = parseList(
+  readEnv("FEATURE_DOMAIN_FLOWS_ALLOWLIST") || "",
+);
+const domainFlowsEnabledByProfile = parseBooleanMap(
+  readEnv("FEATURE_DOMAIN_FLOWS_ENABLED_BY_PROFILE"),
+);
+const domainFlowsShadowModeByProfile = parseBooleanMap(
+  readEnv("FEATURE_DOMAIN_FLOWS_SHADOW_MODE_BY_PROFILE"),
+);
+const domainFlowsRolloutPercentByProfile = parseNumericMap(
+  readEnv("FEATURE_DOMAIN_FLOWS_ROLLOUT_PERCENT_BY_PROFILE"),
+  { min: 0, max: 100 },
+);
 const webhookRetryBaseMs = Number(readEnv("WEBHOOK_RETRY_BASE_MS") || "5000");
 const webhookRetryMaxMs = Number(readEnv("WEBHOOK_RETRY_MAX_MS") || "60000");
 const webhookRetryMaxAttempts = Number(
@@ -952,7 +1026,6 @@ module.exports = {
     accountSid: ensure("TWILIO_ACCOUNT_SID"),
     authToken: ensure("TWILIO_AUTH_TOKEN"),
     fromNumber: ensure("FROM_NUMBER"),
-    transferNumber,
     gatherFallback: twilioGatherFallback,
     machineDetection: twilioMachineDetection,
     machineDetectionTimeout: twilioMachineDetectionTimeout,
@@ -1565,6 +1638,20 @@ module.exports = {
     version: postCallQaVersion || "post_call_qa_v1",
     profileThresholds: postCallQaProfileThresholds,
     rubricWeights: postCallQaRubricWeights,
+  },
+  domainFlows: {
+    enabled: domainFlowsEnabled,
+    shadowMode: domainFlowsShadowMode,
+    killSwitch: domainFlowsKillSwitch,
+    rolloutPercent: Number.isFinite(domainFlowsRolloutPercent)
+      ? Math.max(0, Math.min(100, Math.floor(domainFlowsRolloutPercent)))
+      : 0,
+    allowlist: domainFlowsAllowlist
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean),
+    enabledByProfile: domainFlowsEnabledByProfile,
+    shadowModeByProfile: domainFlowsShadowModeByProfile,
+    rolloutPercentByProfile: domainFlowsRolloutPercentByProfile,
   },
   payment: {
     enabled: paymentFeatureEnabled,

@@ -30,6 +30,8 @@ tests/
 **/test/
 **/tests/
 **/__tests__/
+!api/__tests__/
+!api/__tests__/**/*.js
 
 # Local overrides/secrets
 *.local
@@ -78,3 +80,4 @@ prettier.config.ts
 # documentation files/folders
 docs/*
 **/docs/*
+.vscode

@@ -3,11 +3,13 @@ import { useMemo, useState } from 'react';
 import { buildModuleRequestState } from './moduleRequestState';
 import type {
   ActivityEntry,
+  CallbackTaskRow,
   CallLogRow,
   DashboardVm,
   DlqCallRow,
   DlqEmailRow,
   EmailJob,
+  ReviewCaseRow,
 } from './types';
 import { useInvestigationAction } from './useInvestigationAction';
 import { selectOpsPageVm } from './vmSelectors';
@@ -128,6 +130,8 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
   const [callExplorerQuery, setCallExplorerQuery] = useState<string>('');
   const [callExplorerCallSid, setCallExplorerCallSid] = useState<string>('');
   const [callExplorerRows, setCallExplorerRows] = useState<CallLogRow[]>([]);
+  const [callbackTaskRows, setCallbackTaskRows] = useState<CallbackTaskRow[]>([]);
+  const [reviewCaseRows, setReviewCaseRows] = useState<ReviewCaseRow[]>([]);
   const [callExplorerDetails, setCallExplorerDetails] = useState<Record<string, unknown> | null>(null);
   const [callExplorerEvents, setCallExplorerEvents] = useState<Array<Record<string, unknown>>>([]);
   const [callExplorerValidationError, setCallExplorerValidationError] = useState<string>('');
@@ -224,6 +228,32 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
         ? payload.recent_states as Array<Record<string, unknown>>
         : [];
       setCallExplorerEvents(states);
+    });
+  };
+
+  const loadCallbackTaskRows = async (): Promise<void> => {
+    setCallExplorerValidationError('');
+    await runInvestigationAction(DASHBOARD_ACTION_CONTRACTS.CALLBACK_TASKS_LIST, { limit: 10 }, (data) => {
+      const payload = asRecord(data);
+      const rows = Array.isArray(payload.callback_tasks)
+        ? payload.callback_tasks as CallbackTaskRow[]
+        : Array.isArray(payload.rows)
+          ? payload.rows as CallbackTaskRow[]
+          : [];
+      setCallbackTaskRows(rows);
+    });
+  };
+
+  const loadReviewCaseRows = async (): Promise<void> => {
+    setCallExplorerValidationError('');
+    await runInvestigationAction(DASHBOARD_ACTION_CONTRACTS.REVIEW_CASES_LIST, { limit: 10 }, (data) => {
+      const payload = asRecord(data);
+      const rows = Array.isArray(payload.review_cases)
+        ? payload.review_cases as ReviewCaseRow[]
+        : Array.isArray(payload.rows)
+          ? payload.rows as ReviewCaseRow[]
+          : [];
+      setReviewCaseRows(rows);
     });
   };
 
@@ -721,6 +751,22 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
             >
               Events
             </UiButton>
+            <UiButton
+              type="button"
+              variant="secondary"
+              disabled={controlsBusy}
+              onClick={() => { void loadCallbackTaskRows(); }}
+            >
+              Callbacks
+            </UiButton>
+            <UiButton
+              type="button"
+              variant="secondary"
+              disabled={controlsBusy}
+              onClick={() => { void loadReviewCaseRows(); }}
+            >
+              Review Cases
+            </UiButton>
           </div>
           {controlsBusy || callExplorerError ? (
             <div className="va-status-state-stack">
@@ -770,6 +816,7 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
                         </button>
                         <span>{toText(row.phone_number, 'n/a')}</span>
                         <span>{toText(row.status_normalized, toText(row.status, 'unknown'))}</span>
+                        <span>{toText(row.call_disposition_label, toText(row.call_disposition, 'n/a'))}</span>
                       </li>
                     );
                   })}
@@ -785,6 +832,10 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
                   <li><strong>Phone:</strong> {toText(callExplorerDetails.phone_number, 'n/a')}</li>
                   <li><strong>Duration:</strong> {toInt(callExplorerDetails.duration)}s</li>
                   <li><strong>Started:</strong> {formatTime(callExplorerDetails.created_at)}</li>
+                  <li><strong>Disposition:</strong> {toText(callExplorerDetails.call_disposition_label, toText(callExplorerDetails.call_disposition, 'n/a'))}</li>
+                  <li><strong>Disposition reason:</strong> {toText(callExplorerDetails.call_disposition_reason, 'n/a')}</li>
+                  <li><strong>Disposition source:</strong> {toText(callExplorerDetails.call_disposition_source, 'n/a')}</li>
+                  <li><strong>Disposition updated:</strong> {formatTime(callExplorerDetails.call_disposition_updated_at)}</li>
                   <li><strong>Summary:</strong> {toText(callExplorerDetails.call_summary, 'n/a')}</li>
                 </ul>
               ) : (
@@ -801,6 +852,45 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
                     <li key={`call-explorer-state-${index}`}>
                       <span>{toText(state.state, 'event')}</span>
                       <span>{formatTime(state.timestamp)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </UiCard>
+          </div>
+          <div className="va-inline-tools">
+            <UiCard tone="subcard">
+              <h4>Callback Queue</h4>
+              {callbackTaskRows.length === 0 ? (
+                <p className="va-muted">No callback tasks loaded.</p>
+              ) : (
+                <ul className="va-list">
+                  {callbackTaskRows.map((row, index) => (
+                    <li key={`callback-task-${String(row.id ?? index)}`}>
+                      <strong>{toText(row.id, `task-${index + 1}`)}</strong>
+                      <span>{toText(row.status, 'unknown')}</span>
+                      <span>{toText(row.phone_number, 'n/a')}</span>
+                      <span>{toText(row.source_call_sid, 'n/a')}</span>
+                      <span>{formatTime(row.run_at)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </UiCard>
+            <UiCard tone="subcard">
+              <h4>Review Cases</h4>
+              {reviewCaseRows.length === 0 ? (
+                <p className="va-muted">No review cases loaded.</p>
+              ) : (
+                <ul className="va-list">
+                  {reviewCaseRows.map((row, index) => (
+                    <li key={`review-case-${String(row.id ?? index)}`}>
+                      <strong>{toText(row.id, `case-${index + 1}`)}</strong>
+                      <span>{toText(row.status, 'unknown')}</span>
+                      <span>{toText(row.requested_action, 'review_case')}</span>
+                      <span>{toText(row.phone_number, 'n/a')}</span>
+                      <span>{toText(row.reason, 'n/a')}</span>
+                      <span>{formatTime(row.updated_at)}</span>
                     </li>
                   ))}
                 </ul>
@@ -836,6 +926,10 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
                     Runtime: {toText(row.voice_runtime, 'unknown')}
                     {' '}| Duration: {toInt(row.duration)}s
                     {' '}| Transcripts: {toInt(row.transcript_count)}
+                  </span>
+                  <span>
+                    Disposition: {toText(row.call_disposition_label, toText(row.call_disposition, 'n/a'))}
+                    {' '}| Reason: {toText(row.call_disposition_reason, 'n/a')}
                   </span>
                   <span>
                     Number: {toText(row.phone_number, 'n/a')}

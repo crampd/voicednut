@@ -58,7 +58,11 @@ const {
   CALL_SCRIPT_FLOW_TYPES,
   normalizeCallScriptFlowType: normalizeCallScriptFlowTypeShared,
   normalizeObjectiveTag: normalizeObjectiveTagShared,
-} = require("./functions/relationshipFlowMetadata");
+} = require("./functions/FlowMetadata");
+const {
+  getDomainFlowPolicyDecision,
+  applyDomainFlowPolicyDecision,
+} = require("./functions/domainFlowPolicy");
 const config = require("./config");
 const {
   PROVIDER_CHANNELS,
@@ -415,6 +419,83 @@ function normalizeBooleanFlag(value, fallback = false) {
   if (value === true || value === 1) return true;
   const normalized = String(value).trim().toLowerCase();
   return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+const ESCALATION_TOOL_ALIASES = Object.freeze({
+  route_to_agent: "route_to_agent",
+  routetoagent: "route_to_agent",
+  route_agent: "route_to_agent",
+  transfer: "route_to_agent",
+  transfercall: "route_to_agent",
+  transfer_call: "route_to_agent",
+  handoff: "route_to_agent",
+  specialist: "route_to_agent",
+  route_to_specialist: "route_to_agent",
+  live_agent: "route_to_agent",
+  liveagent: "route_to_agent",
+  human_agent: "route_to_agent",
+  humanagent: "route_to_agent",
+});
+
+const ESCALATION_OUTCOME_ALIASES = Object.freeze({
+  callback: "callback",
+  call_back: "callback",
+  review_case: "review_case",
+  review: "review_case",
+  reviewcase: "review_case",
+  case_review: "review_case",
+  route_to_agent: "review_case",
+  routetoagent: "review_case",
+  route_agent: "review_case",
+  transfer: "review_case",
+  transfercall: "review_case",
+  transfer_call: "review_case",
+  handoff: "review_case",
+  specialist: "review_case",
+  route_to_specialist: "review_case",
+  live_agent: "review_case",
+  liveagent: "review_case",
+  human_agent: "review_case",
+  humanagent: "review_case",
+  secure_follow_up: "secure_follow_up",
+  securefollowup: "secure_follow_up",
+  follow_up: "secure_follow_up",
+  followup: "secure_follow_up",
+  followup_sms: "secure_follow_up",
+  sms: "secure_follow_up",
+  email: "secure_follow_up",
+});
+
+function normalizeEscalationKey(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function normalizeEscalationToolName(value) {
+  const normalized = normalizeEscalationKey(value);
+  if (!normalized) return "";
+  return ESCALATION_TOOL_ALIASES[normalized] || normalized;
+}
+
+function normalizeEscalationOutcome(value, fallback = "review_case") {
+  const normalized = normalizeEscalationKey(value);
+  if (!normalized) return fallback;
+  return ESCALATION_OUTCOME_ALIASES[normalized] || fallback;
+}
+
+function getEscalationRequestedState(value, fallback = "review_case") {
+  return `${normalizeEscalationOutcome(value, fallback)}_requested`;
+}
+
+function formatEscalationOutcomeLabel(value, fallback = "review_case") {
+  const normalized = normalizeEscalationOutcome(value, fallback);
+  if (normalized === "callback") return "Callback";
+  if (normalized === "secure_follow_up") return "Secure follow-up";
+  return "Review case";
 }
 
 function clampCanaryPercent(value, fallback = 0) {
@@ -2269,9 +2350,6 @@ function buildCallToolPolicyGate(callSid, seedConfig = null) {
       "confirm_identity",
       "play_disclosure",
       "route_to_agent",
-      "routetoagent",
-      "transfercall",
-      "transfer_call",
     ]);
     const paymentFlowAllowList = new Set([
       ...captureFlowAllowList,
@@ -2284,8 +2362,9 @@ function buildCallToolPolicyGate(callSid, seedConfig = null) {
     const activeFlowAllowList = digitFlowGuard.paymentActive
       ? paymentFlowAllowList
       : captureFlowAllowList;
+    const normalizedToolName = normalizeEscalationToolName(toolName);
     if (toolName && digitFlowGuard.active) {
-      if (!activeFlowAllowList.has(toolName)) {
+      if (!activeFlowAllowList.has(normalizedToolName)) {
         const blockedResult = {
           allowed: false,
           action: "deny",
@@ -2297,7 +2376,7 @@ function buildCallToolPolicyGate(callSid, seedConfig = null) {
           blocked: ["digit_flow_lock"],
           metadata: {
             source: "digit_flow_guard",
-            tool: toolName,
+            tool: normalizedToolName || toolName,
             flow_state: digitFlowGuard.flowState,
             flow_reason: digitFlowGuard.reason,
           },
@@ -2310,15 +2389,12 @@ function buildCallToolPolicyGate(callSid, seedConfig = null) {
         return blockedResult;
       }
       if (
-        toolName === "collect_digits" ||
-        toolName === "collect_multiple_digits" ||
-        toolName === "confirm_identity" ||
-        toolName === "play_disclosure" ||
-        toolName === "route_to_agent" ||
-        toolName === "routetoagent" ||
-        toolName === "transfercall" ||
-        toolName === "transfer_call" ||
-        toolName === "start_payment"
+        normalizedToolName === "collect_digits" ||
+        normalizedToolName === "collect_multiple_digits" ||
+        normalizedToolName === "confirm_identity" ||
+        normalizedToolName === "play_disclosure" ||
+        normalizedToolName === "route_to_agent" ||
+        normalizedToolName === "start_payment"
       ) {
         const allowResult = {
           allowed: true,
@@ -9603,18 +9679,24 @@ const telephonyTools = [
     function: {
       name: "route_to_agent",
       description:
-        "End the call politely (no transfer) when escalation is requested.",
+        "End the call politely and queue a non-transfer follow-up outcome when escalation is requested.",
       parameters: {
         type: "object",
         properties: {
+          action: {
+            type: "string",
+            enum: ["callback", "review_case", "secure_follow_up"],
+            description:
+              "Requested non-transfer escalation outcome. Use review_case when unsure.",
+          },
           reason: {
             type: "string",
-            description: "Short reason for the transfer.",
+            description: "Short reason for the escalation or follow-up.",
           },
           priority: {
             type: "string",
             enum: ["low", "normal", "high"],
-            description: "Transfer priority if applicable.",
+            description: "Escalation priority when applicable.",
           },
         },
         required: ["reason"],
@@ -10001,6 +10083,447 @@ function buildTelephonyImplementations(callSid, gptService = null) {
     }
   };
 
+  const readCallContext = async () => {
+    const callRecord = await db.getCall(callSid).catch(() => null);
+    const callState = await db
+      .getLatestCallState(callSid, "call_created")
+      .catch(() => null);
+    return { callRecord, callState };
+  };
+
+  const normalizeTaxInquiryCategory = (args = {}) => {
+    const rawCategory = String(args.category || "").trim().toLowerCase();
+    if (rawCategory) {
+      if (rawCategory.includes("refund")) return "refund_status";
+      if (rawCategory.includes("notice")) return "notice_help";
+      if (rawCategory.includes("document") || rawCategory.includes("missing"))
+        return "missing_information";
+      if (rawCategory.includes("consult")) return "consultation";
+    }
+    if (args.mentionsNotice === true) return "notice_help";
+    const inquirySummary = String(args.inquirySummary || "").toLowerCase();
+    if (inquirySummary.includes("refund")) return "refund_status";
+    if (
+      inquirySummary.includes("document") ||
+      inquirySummary.includes("missing")
+    ) {
+      return "missing_information";
+    }
+    if (inquirySummary.includes("consult")) return "consultation";
+    return "general_support";
+  };
+
+  const mapTaxDispositionFromCategory = (category) => {
+    switch (category) {
+      case "refund_status":
+        return "tax_refund_status_answered";
+      case "notice_help":
+        return "tax_notice_help_requested";
+      case "missing_information":
+        return "tax_missing_docs_followup";
+      case "consultation":
+        return "tax_consultation_booked";
+      default:
+        return null;
+    }
+  };
+
+  const normalizeStringList = (value) => {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
+  };
+
+  const normalizeOperationalDomain = (args = {}, fallback = "tax_support") => {
+    const activeCallConfig = callConfigurations.get(callSid) || {};
+    const activeDomainHints = [
+      activeCallConfig.collection_profile,
+      activeCallConfig.conversation_profile,
+      activeCallConfig.call_profile,
+      activeCallConfig.script_policy?.default_profile,
+      activeCallConfig.script?.flow_type,
+      ...(Array.isArray(activeCallConfig.script?.flow_types)
+        ? activeCallConfig.script.flow_types
+        : []),
+      ...(Array.isArray(activeCallConfig.business_context?.detectedDomains)
+        ? activeCallConfig.business_context.detectedDomains
+        : []),
+      activeCallConfig.business_context?.industry,
+      activeCallConfig.business_context?.businessType,
+    ];
+    const signalText = [
+      args.domain,
+      args.flowType,
+      args.profile,
+      args.category,
+      args.reason,
+      args.purpose,
+      args.artifactType,
+      args.topic,
+      args.disputeReason,
+      args.arrangementType,
+      ...activeDomainHints,
+    ]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+    if (
+      signalText.includes("fraud") ||
+      signalText.includes("suspicious transaction") ||
+      signalText.includes("unauthorized") ||
+      signalText.includes("not mine") ||
+      signalText.includes("not authorized") ||
+      signalText.includes("unrecognized charge")
+    ) {
+      return "fraud_review";
+    }
+    if (
+      signalText.includes("collection") ||
+      signalText.includes("payment link") ||
+      signalText.includes("payment_link") ||
+      signalText.includes("promise to pay") ||
+      signalText.includes("promise_to_pay") ||
+      signalText.includes("hardship") ||
+      signalText.includes("dispute")
+    ) {
+      return "collections_servicing";
+    }
+    if (
+      signalText.includes("tax") ||
+      signalText.includes("refund") ||
+      signalText.includes("notice") ||
+      signalText.includes("document") ||
+      signalText.includes("consult")
+    ) {
+      return "tax_support";
+    }
+    if (
+      signalText.includes("bank") ||
+      signalText.includes("bank servicing") ||
+      signalText.includes("account support") ||
+      signalText.includes("account maintenance") ||
+      signalText.includes("card issue") ||
+      signalText.includes("debit card") ||
+      signalText.includes("statement") ||
+      signalText.includes("routing number")
+    ) {
+      return "bank_servicing";
+    }
+    return fallback;
+  };
+
+  const ensureDomainFlowAllowed = async (
+    domain,
+    source,
+    callRecord = {},
+    callState = {},
+  ) => {
+    const decision = getDomainFlowPolicyDecision({
+      domain,
+      source,
+      callSid,
+      callRecord,
+      callState,
+      domainFlowsConfig: config.domainFlows,
+    });
+
+    return applyDomainFlowPolicyDecision({
+      decision,
+      callSid,
+      db,
+      webhookService,
+    });
+  };
+
+  const normalizeOperationalConfidence = (value) => {
+    const raw = String(value || "").trim().toLowerCase();
+    if (!raw) return "";
+    if (["high", "medium", "low"].includes(raw)) return raw;
+    const numeric = Number(raw);
+    if (Number.isFinite(numeric)) {
+      if (numeric >= 0.8) return "high";
+      if (numeric >= 0.5) return "medium";
+      return "low";
+    }
+    if (raw.includes("strong") || raw.includes("certain")) return "high";
+    if (raw.includes("medium") || raw.includes("partial")) return "medium";
+    if (raw.includes("low") || raw.includes("uncertain") || raw.includes("weak")) {
+      return "low";
+    }
+    return raw;
+  };
+
+  const buildBankServicingSmsBody = (callRecord, callState, args = {}) => {
+    const artifactType = String(args.artifactType || "account_support")
+      .trim()
+      .toLowerCase();
+    const purpose = String(args.purpose || "bank_servicing").trim();
+    const baseBody = buildInboundSmsBody(callRecord, callState);
+    const artifactLine =
+      artifactType.includes("card")
+        ? "We will send a secure card-support follow-up with the next steps."
+        : artifactType.includes("payment")
+          ? "We will send a secure payment-support follow-up with the next steps."
+          : "We will send a secure account-support follow-up with the next steps.";
+    return `${baseBody}\n\n${artifactLine}\nReference: ${purpose || "bank_servicing"}`;
+  };
+
+  const buildFraudReviewSmsBody = (callRecord, callState, args = {}) => {
+    const purpose = String(args.purpose || "fraud_review").trim();
+    const signalText = [
+      args.artifactType,
+      args.purpose,
+      args.reason,
+      args.category,
+      args.outcome,
+      args.decision,
+    ]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+    const baseBody = buildInboundSmsBody(callRecord, callState);
+    const artifactLine =
+      signalText.includes("legitimate") || signalText.includes("recognized")
+        ? "We will send a secure account-activity summary with the next steps."
+        : "We will send a secure fraud-review follow-up with the next steps.";
+    return `${baseBody}\n\n${artifactLine}\nReference: ${purpose || "fraud_review"}`;
+  };
+
+  const buildTaxSupportSmsBody = (callRecord, callState, args = {}) => {
+    const artifactType = String(args.artifactType || "checklist").trim().toLowerCase();
+    const purpose = String(args.purpose || "tax_support").trim();
+    const baseBody = buildInboundSmsBody(callRecord, callState);
+    const artifactLine =
+      artifactType === "notice"
+        ? "We will send a secure notice-help follow-up with the next steps."
+        : artifactType === "consultation"
+          ? "We will send a secure consultation follow-up with the next steps."
+        : "We will send a secure checklist follow-up with the next steps.";
+    return `${baseBody}\n\n${artifactLine}\nReference: ${purpose || "tax_support"}`;
+  };
+
+  const buildCollectionsServicingSmsBody = (
+    callRecord,
+    callState,
+    args = {},
+  ) => {
+    const artifactType = String(args.artifactType || "payment_link")
+      .trim()
+      .toLowerCase();
+    const purpose = String(args.purpose || "collections_servicing").trim();
+    const signalText = [
+      artifactType,
+      purpose,
+      args.reason,
+      args.category,
+      args.disputeReason,
+    ]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+    const baseBody = buildInboundSmsBody(callRecord, callState);
+    const artifactLine = signalText.includes("hardship")
+      ? "We will send a secure hardship review follow-up with the next steps."
+      : signalText.includes("dispute")
+        ? "We will send a secure dispute follow-up with the next steps."
+        : "We will send a secure payment follow-up with the next steps.";
+    return `${baseBody}\n\n${artifactLine}\nReference: ${purpose || "collections_servicing"}`;
+  };
+
+  const getCollectionsDispositionForFollowup = (args = {}) => {
+    const signalText = [
+      args.artifactType,
+      args.purpose,
+      args.reason,
+      args.category,
+      args.disputeReason,
+    ]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+    if (signalText.includes("hardship")) return "collections_hardship_flagged";
+    if (signalText.includes("dispute")) return "collections_dispute_created";
+    return "collections_payment_link_sent";
+  };
+
+  const getCollectionsDispositionForReviewCase = (args = {}) => {
+    const signalText = [
+      args.category,
+      args.reason,
+      args.disputeReason,
+      args.notes,
+      args.summary,
+    ]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+    if (signalText.includes("hardship")) return "collections_hardship_flagged";
+    if (signalText.includes("dispute")) return "collections_dispute_created";
+    return null;
+  };
+
+  const getFraudDispositionForArgs = (args = {}, fallback = null) => {
+    const confidence = normalizeOperationalConfidence(
+      args.confidence || args.reviewConfidence || args.classificationConfidence,
+    );
+    if (confidence === "low") return "low_confidence_safe_stop";
+    const signalText = [
+      args.classification,
+      args.status,
+      args.outcome,
+      args.decision,
+      args.reason,
+      args.purpose,
+      args.category,
+      args.incidentSummary,
+      args.summary,
+      args.response,
+    ]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+    if (
+      normalizeBooleanFlag(args.confirmedLegitimate, false) ||
+      normalizeBooleanFlag(args.legitimate, false) ||
+      normalizeBooleanFlag(args.authorized, false) ||
+      normalizeBooleanFlag(args.recognizedTransaction, false) ||
+      signalText.includes("legitimate") ||
+      signalText.includes("recognized") ||
+      signalText.includes("authorized")
+    ) {
+      return "fraud_confirmed_legitimate";
+    }
+    if (
+      normalizeBooleanFlag(args.deniedTransaction, false) ||
+      normalizeBooleanFlag(args.unauthorized, false) ||
+      normalizeBooleanFlag(args.notMine, false) ||
+      signalText.includes("denied") ||
+      signalText.includes("not mine") ||
+      signalText.includes("unauthorized") ||
+      signalText.includes("not authorized") ||
+      signalText.includes("unrecognized")
+    ) {
+      return "fraud_denied_transaction";
+    }
+    if (
+      normalizeBooleanFlag(args.uncertain, false) ||
+      normalizeBooleanFlag(args.reviewRequired, false) ||
+      signalText.includes("uncertain") ||
+      signalText.includes("unsure") ||
+      signalText.includes("review") ||
+      signalText.includes("suspicious")
+    ) {
+      return "fraud_uncertain_review_required";
+    }
+    return fallback;
+  };
+
+  const getVerificationStatus = (args = {}) => {
+    const statusText = String(args.status || args.result || "")
+      .trim()
+      .toLowerCase();
+    const confidence = normalizeOperationalConfidence(
+      args.confidence || args.verificationConfidence,
+    );
+    const verified =
+      normalizeBooleanFlag(args.verified, false) ||
+      normalizeBooleanFlag(args.verificationPassed, false) ||
+      normalizeBooleanFlag(args.verificationConfirmed, false) ||
+      normalizeBooleanFlag(args.identityVerified, false) ||
+      statusText === "verified" ||
+      statusText === "passed" ||
+      statusText === "confirmed" ||
+      statusText === "success";
+    const failed =
+      normalizeBooleanFlag(args.failed, false) ||
+      normalizeBooleanFlag(args.mismatch, false) ||
+      normalizeBooleanFlag(args.verificationFailed, false) ||
+      statusText === "failed" ||
+      statusText === "mismatch" ||
+      statusText === "unable_to_verify" ||
+      statusText === "not_verified";
+    if (confidence === "low" || statusText === "low_confidence") {
+      return { status: "low_confidence", verified: false, confidence };
+    }
+    if (failed) return { status: "failed", verified: false, confidence };
+    if (verified) return { status: "verified", verified: true, confidence };
+    return { status: "incomplete", verified: false, confidence };
+  };
+
+  const getVerifiedIdentityState = async () => {
+    const completed = await db
+      .getLatestCallState(callSid, "identity_verification_completed")
+      .catch(() => null);
+    if (completed?.verified === true || completed?.status === "verified") {
+      return {
+        verified: true,
+        status: "verified",
+        source: "identity_verification_completed",
+      };
+    }
+    const confirmed = await db
+      .getLatestCallState(callSid, "identity_confirmed")
+      .catch(() => null);
+    if (confirmed) {
+      return { verified: true, status: "verified", source: "identity_confirmed" };
+    }
+    if (completed?.status) {
+      return {
+        verified: false,
+        status: String(completed.status || "incomplete").trim().toLowerCase(),
+        source: "identity_verification_completed",
+      };
+    }
+    return { verified: false, status: "", source: null };
+  };
+
+  const ensureProtectedDomainVerification = async (domain, source) => {
+    if (!["bank_servicing", "fraud_review"].includes(domain)) {
+      return { allowed: true, verification: null };
+    }
+    const verification = await getVerifiedIdentityState();
+    if (verification.verified) {
+      return { allowed: true, verification };
+    }
+    const disposition =
+      verification.status === "low_confidence"
+        ? "low_confidence_safe_stop"
+        : verification.status
+          ? "verification_incomplete"
+          : "policy_blocked";
+    const payload = {
+      status: "blocked",
+      reason:
+        disposition === "low_confidence_safe_stop"
+          ? "Verification confidence was too low to continue safely."
+          : "Verification is required before continuing with protected account details.",
+      domain,
+      verificationStatus: verification.status || "missing",
+    };
+    try {
+      await db.updateCallState(callSid, "policy_blocked", {
+        source,
+        domain,
+        verification_status: verification.status || "missing",
+        disposition,
+      });
+      await db.setCallDisposition(callSid, disposition, {
+        source,
+        domain,
+        verification_status: verification.status || "missing",
+      });
+      webhookService.addLiveEvent(
+        callSid,
+        `${domain === "fraud_review" ? "🛑 Fraud" : "🛑 Bank"} flow blocked pending verification`,
+        { force: true },
+      );
+    } catch (err) {
+      console.error("ensureProtectedDomainVerification handler error:", err);
+    }
+    return { allowed: false, payload, verification };
+  };
+
   const implementations = {
     confirm_identity: async (args = {}) => {
       const payload = {
@@ -10020,25 +10543,926 @@ function buildTelephonyImplementations(callSid, gptService = null) {
       }
       return payload;
     },
+    verifyIdentity: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "bank_servicing");
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "verifyIdentity",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      const verificationType =
+        String(args.verificationType || "basic").trim().toLowerCase() || "basic";
+      const verification = getVerificationStatus(args);
+      const payload = {
+        status: verification.status,
+        verified: verification.verified,
+        verificationType,
+        confidence: verification.confidence || null,
+        domain,
+        nextStep:
+          verification.status === "verified"
+            ? "Continue with the protected support flow."
+            : verification.status === "low_confidence"
+              ? "Stop detailed discussion and use a safe non-transfer follow-up."
+              : "Stop protected discussion and use callback, review case, or secure follow-up.",
+      };
+      try {
+        await db.updateCallState(callSid, "identity_verification_completed", {
+          source: "verifyIdentity",
+          verification_type: verificationType,
+          confidence: verification.confidence || null,
+          customer_name_present: Boolean(String(args.customerName || "").trim()),
+          known_last4_present: Boolean(String(args.knownLast4 || "").trim()),
+          ...payload,
+        });
+        if (verification.verified) {
+          await db.updateCallState(callSid, "identity_confirmed", {
+            source: "verifyIdentity",
+            method: verificationType,
+            note: "identity_verification_completed",
+          });
+          webhookService.addLiveEvent(
+            callSid,
+            `✅ Identity verified (${verificationType})`,
+            { force: true },
+          );
+        } else {
+          const disposition =
+            verification.status === "low_confidence"
+              ? "low_confidence_safe_stop"
+              : "verification_incomplete";
+          await db.setCallDisposition(callSid, disposition, {
+            source: "verifyIdentity",
+            verification_type: verificationType,
+            domain,
+            confidence: verification.confidence || null,
+          });
+          webhookService.addLiveEvent(
+            callSid,
+            verification.status === "low_confidence"
+              ? "🛑 Verification stopped for low confidence"
+              : "⚠️ Identity verification incomplete",
+            { force: true },
+          );
+        }
+      } catch (err) {
+        console.error("verifyIdentity handler error:", err);
+        payload.status = "failed";
+        payload.message = err?.message || "identity_verification_failed";
+      }
+      return payload;
+    },
     route_to_agent: async (args = {}) => {
+      const requestedAction =
+        args.action ||
+        args.outcome ||
+        args.escalation ||
+        args.intent ||
+        args.type ||
+        "";
       const payload = {
         status: "queued",
+        action: normalizeEscalationOutcome(requestedAction, "review_case"),
         reason: args.reason || "unspecified",
         priority: args.priority || "normal",
       };
+      const requestedActionKey = normalizeEscalationKey(requestedAction);
+      if (requestedActionKey && requestedActionKey !== payload.action) {
+        payload.normalized_from = requestedActionKey;
+      }
       try {
+        const state = getEscalationRequestedState(payload.action);
+        const stateData = {
+          source: "route_to_agent",
+          requested_action: requestedActionKey || null,
+          ...payload,
+        };
+        const callRecord = await db.getCall(callSid).catch(() => null);
+
+        if (payload.action === "callback") {
+          if (callRecord?.phone_number) {
+            try {
+              const callState = await db
+                .getLatestCallState(callSid, "call_created")
+                .catch(() => null);
+              const delayMin = Math.max(
+                1,
+                Number(config.inbound?.callbackDelayMinutes) || 15,
+              );
+              const runAt = new Date(
+                Date.now() + delayMin * 60 * 1000,
+              ).toISOString();
+              const callbackPayload = buildCallbackPayload(callRecord, callState);
+              const callbackTaskId = await scheduleCallJob(
+                "callback_call",
+                callbackPayload,
+                runAt,
+              );
+              stateData.run_at = runAt;
+              stateData.callback_task_id = callbackTaskId;
+            } catch (scheduleError) {
+              stateData.schedule_error =
+                scheduleError?.message || String(scheduleError || "callback_schedule_failed");
+            }
+          } else {
+            stateData.schedule_error = "missing_phone_number";
+          }
+        }
+
+        if (payload.action === "review_case") {
+          try {
+            const reviewCaseId = await db.createReviewCase({
+              call_sid: callSid,
+              phone_number: callRecord?.phone_number || null,
+              requested_action: payload.action,
+              reason: payload.reason,
+              notes: null,
+              source: "route_to_agent",
+              metadata: {
+                priority: payload.priority,
+                normalized_from: payload.normalized_from || null,
+                requested_action: requestedActionKey || null,
+              },
+            });
+            stateData.review_case_id = reviewCaseId;
+          } catch (reviewCaseError) {
+            stateData.review_case_error =
+              reviewCaseError?.message || String(reviewCaseError || "review_case_create_failed");
+          }
+        }
+
+        await db.updateCallState(callSid, state, stateData);
         webhookService.addLiveEvent(
           callSid,
-          `📞 Transfer requested (${payload.reason}) • ending call`,
+          `${payload.action === "callback" ? "⏲" : payload.action === "secure_follow_up" ? "🔐" : "🗂"} ${formatEscalationOutcomeLabel(payload.action)} requested (${payload.reason}) • ending call`,
           { force: true },
         );
         await speakAndEndCall(
           callSid,
           CALL_END_MESSAGES.failure,
-          "transfer_requested",
+          state,
         );
       } catch (err) {
         console.error("route_to_agent handler error:", err);
+      }
+      return payload;
+    },
+    classifyTaxInquiry: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "tax_support");
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "classifyTaxInquiry",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      const category = normalizeTaxInquiryCategory(args);
+      const requiresReview = category === "notice_help";
+      const recommendedNextStep =
+        category === "refund_status"
+          ? "Provide policy-safe refund status guidance and next steps."
+          : category === "missing_information"
+            ? "Offer secure checklist follow-up or callback."
+            : category === "consultation"
+              ? "Schedule a consultation follow-up."
+              : requiresReview
+                ? "Create a review case for notice help."
+                : "Continue tax support guidance and confirm the next step.";
+      const payload = {
+        domain,
+        category,
+        requiresReview,
+        recommendedNextStep,
+      };
+      try {
+        await db.updateCallState(callSid, "tax_inquiry_classified", {
+          source: "classifyTaxInquiry",
+          inquiry_summary: args.inquirySummary || "",
+          mentions_notice: args.mentionsNotice === true,
+          domain,
+          ...payload,
+        });
+        const disposition = mapTaxDispositionFromCategory(category);
+        if (disposition) {
+          await db.setCallDisposition(callSid, disposition, {
+            source: "classifyTaxInquiry",
+            domain,
+            category,
+          });
+        }
+        webhookService.addLiveEvent(
+          callSid,
+          `🧾 Tax support classified as ${category}`,
+          { force: false },
+        );
+      } catch (err) {
+        console.error("classifyTaxInquiry handler error:", err);
+      }
+      return payload;
+    },
+    collectDocumentChecklistStatus: async (args = {}) => {
+      const completedItems = normalizeStringList(args.completedItems);
+      const missingItems = normalizeStringList(args.missingItems);
+      const checklistType = String(args.checklistType || "tax_document")
+        .trim()
+        .toLowerCase();
+      const payload = {
+        checklistType,
+        completedCount: completedItems.length,
+        missingCount: missingItems.length,
+        status: missingItems.length > 0 ? "pending_items" : "complete",
+      };
+      try {
+        await db.updateCallState(callSid, "tax_document_checklist_status", {
+          source: "collectDocumentChecklistStatus",
+          completed_items: completedItems,
+          missing_items: missingItems,
+          ...payload,
+        });
+        if (missingItems.length > 0) {
+          await db.setCallDisposition(callSid, "tax_missing_docs_followup", {
+            source: "collectDocumentChecklistStatus",
+            checklist_type: checklistType,
+            missing_items: missingItems,
+          });
+        }
+        webhookService.addLiveEvent(
+          callSid,
+          `📄 Checklist ${payload.status.replace("_", " ")}`,
+          { force: false },
+        );
+      } catch (err) {
+        console.error("collectDocumentChecklistStatus handler error:", err);
+      }
+      return payload;
+    },
+    lookupPolicyAnswer: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "tax_support");
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "lookupPolicyAnswer",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      if (domain === "bank_servicing") {
+        const verificationGate = await ensureProtectedDomainVerification(
+          domain,
+          "lookupPolicyAnswer",
+        );
+        if (!verificationGate.allowed) return verificationGate.payload;
+      }
+      const topic = String(
+        args.topic || (domain === "bank_servicing" ? "bank_servicing" : "tax_support"),
+      ).trim();
+      const policyType = String(args.policyType || "general_guidance").trim();
+      const lowerTopic = topic.toLowerCase();
+      const answer =
+        domain === "bank_servicing"
+          ? lowerTopic.includes("card")
+            ? "Provide policy-safe card support guidance, confirm the next servicing step, and keep secrets such as full card numbers or one-time codes out of voice."
+            : lowerTopic.includes("payment")
+              ? "Explain payment-support steps in plain language, confirm the next documented action, and use secure follow-up for detailed instructions."
+              : "Provide policy-safe account servicing guidance, confirm the next required step, and use secure follow-up or review when the request needs off-call handling."
+          : lowerTopic.includes("refund")
+            ? "Provide status guidance based on the current file and explain the next documented step without promising an outcome."
+            : lowerTopic.includes("notice")
+              ? "Explain the notice category in plain language, confirm deadlines, and collect the next manual review item if needed."
+              : "Provide policy-safe administrative guidance, confirm the next required document or action, and avoid legal or filing promises.";
+      const safeNextStep =
+        domain === "bank_servicing"
+          ? lowerTopic.includes("card")
+            ? "Offer secure follow-up or a review case if the issue needs protected handling."
+            : "Confirm whether secure follow-up, callback, or review case handling is needed."
+          : lowerTopic.includes("refund")
+            ? "Confirm whether a callback or secure follow-up is needed."
+            : lowerTopic.includes("notice")
+              ? "Offer a review case if manual notice review is required."
+              : "Offer a checklist follow-up or callback if the caller still needs help.";
+      const payload = {
+        topic,
+        policyType,
+        answer,
+        safeNextStep,
+        domain,
+      };
+      try {
+        await db.updateCallState(
+          callSid,
+          domain === "bank_servicing"
+            ? "bank_policy_answer_lookup"
+            : "tax_policy_answer_lookup",
+          {
+          source: "lookupPolicyAnswer",
+          ...payload,
+          },
+        );
+        if (domain === "bank_servicing") {
+          await db.setCallDisposition(callSid, "bank_servicing_resolved", {
+            source: "lookupPolicyAnswer",
+            topic,
+            policy_type: policyType,
+            domain,
+          });
+        } else if (lowerTopic.includes("refund")) {
+          await db.setCallDisposition(callSid, "tax_refund_status_answered", {
+            source: "lookupPolicyAnswer",
+            topic,
+            domain,
+          });
+        }
+      } catch (err) {
+        console.error("lookupPolicyAnswer handler error:", err);
+      }
+      return payload;
+    },
+    scheduleConsultation: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "tax_support");
+      const consultationType = String(args.consultationType || "tax_support")
+        .trim()
+        .toLowerCase();
+      const preferredDate = String(args.preferredDate || "").trim() || null;
+      const preferredWindow =
+        String(args.preferredWindow || "").trim() || "next_available";
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "scheduleConsultation",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      const payload = {
+        scheduled: true,
+        consultationId: null,
+        consultationType,
+        preferredDate,
+        preferredWindow,
+        domain,
+      };
+      try {
+        const reviewCaseId = await db.createReviewCase({
+          call_sid: callSid,
+          phone_number: callRecord?.phone_number || null,
+          requested_action: "review_case",
+          reason: `consultation:${consultationType}`,
+          notes: null,
+          source: "scheduleConsultation",
+          metadata: {
+            preferred_date: preferredDate,
+            preferred_window: preferredWindow,
+            domain,
+          },
+        });
+        payload.consultationId = reviewCaseId;
+        await db.updateCallState(callSid, "tax_consultation_scheduled", {
+          source: "scheduleConsultation",
+          review_case_id: reviewCaseId,
+          ...payload,
+        });
+        await db.setCallDisposition(callSid, "tax_consultation_booked", {
+          source: "scheduleConsultation",
+          consultation_type: consultationType,
+          preferred_date: preferredDate,
+          preferred_window: preferredWindow,
+          review_case_id: reviewCaseId,
+          domain,
+        });
+        webhookService.addLiveEvent(callSid, "📅 Tax consultation queued", {
+          force: true,
+        });
+      } catch (err) {
+        console.error("scheduleConsultation handler error:", err);
+        payload.scheduled = false;
+      }
+      return payload;
+    },
+    capturePromiseToPay: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "collections_servicing");
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "capturePromiseToPay",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      const amount =
+        String(args.amount || args.promiseAmount || "").trim() || null;
+      const promisedDate =
+        String(
+          args.promisedDate || args.promiseDate || args.paymentDate || "",
+        ).trim() || null;
+      const notes = String(args.notes || args.note || "").trim() || null;
+      const payload = {
+        status: "captured",
+        amount,
+        promisedDate,
+        notes,
+        domain,
+      };
+      try {
+        await db.updateCallState(callSid, "collections_promise_to_pay", {
+          source: "capturePromiseToPay",
+          amount,
+          promised_date: promisedDate,
+          domain,
+          notes,
+        });
+        await db.setCallDisposition(callSid, "collections_promise_to_pay", {
+          source: "capturePromiseToPay",
+          amount,
+          promised_date: promisedDate,
+          domain,
+        });
+        webhookService.addLiveEvent(callSid, "💳 Promise to pay captured", {
+          force: true,
+        });
+      } catch (err) {
+        console.error("capturePromiseToPay handler error:", err);
+        payload.status = "failed";
+        payload.message = err?.message || "promise_to_pay_capture_failed";
+      }
+      return payload;
+    },
+    offerPaymentArrangement: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "collections_servicing");
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "offerPaymentArrangement",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      const arrangementType =
+        String(args.arrangementType || "payment_options").trim().toLowerCase() ||
+        "payment_options";
+      const notes = String(args.notes || args.note || "").trim() || null;
+      const hardshipRequested =
+        args.hardship === true ||
+        args.hardshipFlag === true ||
+        arrangementType.includes("hardship") ||
+        String(args.reason || "").trim().toLowerCase().includes("hardship");
+      const payload = {
+        status: hardshipRequested ? "review_flagged" : "options_shared",
+        arrangementType,
+        hardshipRequested,
+        notes,
+        domain,
+      };
+      try {
+        const stateName = hardshipRequested
+          ? "collections_hardship_flagged"
+          : "collections_payment_arrangement_offered";
+        await db.updateCallState(callSid, stateName, {
+          source: "offerPaymentArrangement",
+          arrangement_type: arrangementType,
+          hardship_requested: hardshipRequested,
+          domain,
+          notes,
+        });
+        if (hardshipRequested) {
+          await db.setCallDisposition(callSid, "collections_hardship_flagged", {
+            source: "offerPaymentArrangement",
+            arrangement_type: arrangementType,
+            domain,
+          });
+          webhookService.addLiveEvent(
+            callSid,
+            "🛟 Collections hardship review flagged",
+            { force: true },
+          );
+        }
+      } catch (err) {
+        console.error("offerPaymentArrangement handler error:", err);
+        payload.status = "failed";
+        payload.message = err?.message || "payment_arrangement_failed";
+      }
+      return payload;
+    },
+    captureDisputeReason: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "collections_servicing");
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "captureDisputeReason",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      const disputeReason =
+        String(args.disputeReason || args.reason || "").trim() ||
+        "collections_dispute";
+      const notes =
+        String(args.notes || args.summary || args.note || "").trim() || null;
+      const priority =
+        String(args.priority || "normal").trim().toLowerCase() || "normal";
+      const payload = {
+        reviewCaseId: null,
+        status: "open",
+        disputeReason,
+        priority,
+        domain,
+      };
+      try {
+        const reviewCaseId = await db.createReviewCase({
+          call_sid: callSid,
+          phone_number: callRecord?.phone_number || null,
+          requested_action: "review_case",
+          reason: disputeReason,
+          notes,
+          source: "captureDisputeReason",
+          metadata: {
+            category: "collections_dispute",
+            priority,
+            domain,
+            dispute_reason: disputeReason,
+          },
+        });
+        payload.reviewCaseId = reviewCaseId;
+        await db.updateCallState(callSid, "review_case_requested", {
+          source: "captureDisputeReason",
+          review_case_id: reviewCaseId,
+          category: "collections_dispute",
+          priority,
+          reason: disputeReason,
+          domain,
+          notes,
+        });
+        await db.setCallDisposition(callSid, "collections_dispute_created", {
+          source: "captureDisputeReason",
+          priority,
+          reason: disputeReason,
+          review_case_id: reviewCaseId,
+          domain,
+        });
+        webhookService.addLiveEvent(
+          callSid,
+          "🗂 Collections dispute review created",
+          { force: true },
+        );
+      } catch (err) {
+        console.error("captureDisputeReason handler error:", err);
+        payload.status = "failed";
+        payload.message = err?.message || "collections_dispute_failed";
+      }
+      return payload;
+    },
+    classifyFraudAlert: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "fraud_review");
+      const { callRecord, callState } = await readCallContext();
+      const domainFlowGate = await ensureDomainFlowAllowed(
+        domain,
+        "classifyFraudAlert",
+        callRecord,
+        callState,
+      );
+      if (!domainFlowGate.allowed) return domainFlowGate.payload;
+      const verificationGate = await ensureProtectedDomainVerification(
+        domain,
+        "classifyFraudAlert",
+      );
+      if (!verificationGate.allowed) return verificationGate.payload;
+      const disposition = getFraudDispositionForArgs(
+        args,
+        "fraud_uncertain_review_required",
+      );
+      const requiresReview = [
+        "fraud_denied_transaction",
+        "fraud_uncertain_review_required",
+      ].includes(disposition);
+      const payload = {
+        classification: disposition,
+        requiresReview,
+        reviewCaseId: null,
+        domain,
+        recommendedNextStep:
+          disposition === "fraud_confirmed_legitimate"
+            ? "Confirm the activity as recognized, summarize the safe next step, and offer secure follow-up if requested."
+            : disposition === "fraud_denied_transaction"
+              ? "Create a review case, stop detailed discussion, and use secure follow-up for protective next steps."
+              : disposition === "low_confidence_safe_stop"
+                ? "Stop the classification flow and use a safe non-transfer follow-up."
+                : "Create a review case and send a cautious secure follow-up.",
+      };
+      try {
+        if (requiresReview) {
+          const reviewCaseId = await db.createReviewCase({
+            call_sid: callSid,
+            phone_number: callRecord?.phone_number || null,
+            requested_action: "review_case",
+            reason: disposition,
+            notes: String(args.incidentSummary || args.summary || "").trim() || null,
+            source: "classifyFraudAlert",
+            metadata: {
+              category: "fraud_review",
+              domain,
+              account_channel:
+                String(args.accountChannel || "").trim().toLowerCase() || null,
+              disposition,
+            },
+          });
+          payload.reviewCaseId = reviewCaseId;
+        }
+        await db.updateCallState(callSid, "fraud_alert_classified", {
+          source: "classifyFraudAlert",
+          account_channel:
+            String(args.accountChannel || "").trim().toLowerCase() || null,
+          incident_summary: String(args.incidentSummary || args.summary || "").trim(),
+          review_case_id: payload.reviewCaseId,
+          ...payload,
+        });
+        await db.setCallDisposition(callSid, disposition, {
+          source: "classifyFraudAlert",
+          account_channel:
+            String(args.accountChannel || "").trim().toLowerCase() || null,
+          review_case_id: payload.reviewCaseId,
+          domain,
+        });
+        webhookService.addLiveEvent(
+          callSid,
+          disposition === "fraud_confirmed_legitimate"
+            ? "🛡 Fraud review confirmed legitimate activity"
+            : disposition === "fraud_denied_transaction"
+              ? "🗂 Fraud review case created for denied transaction"
+              : disposition === "low_confidence_safe_stop"
+                ? "🛑 Fraud review stopped for low confidence"
+                : "🗂 Fraud review case created for uncertain activity",
+          { force: true },
+        );
+      } catch (err) {
+        console.error("classifyFraudAlert handler error:", err);
+        payload.classification = "low_confidence_safe_stop";
+        payload.requiresReview = false;
+        payload.message = err?.message || "fraud_alert_classification_failed";
+      }
+      return payload;
+    },
+    sendSecureFollowup: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "tax_support");
+      const channel = String(args.channel || "sms").trim().toLowerCase() || "sms";
+      const artifactType =
+        String(args.artifactType || "checklist").trim().toLowerCase() || "checklist";
+      const purpose =
+        String(
+          args.purpose ||
+            (domain === "collections_servicing"
+              ? "collections_servicing"
+              : domain === "bank_servicing"
+                ? "bank_servicing"
+                : domain === "fraud_review"
+                  ? "fraud_review"
+              : "tax_support"),
+        ).trim() ||
+        (domain === "collections_servicing"
+          ? "collections_servicing"
+          : domain === "bank_servicing"
+            ? "bank_servicing"
+            : domain === "fraud_review"
+              ? "fraud_review"
+          : "tax_support");
+      const payload = {
+        status: "queued",
+        channel,
+        artifactType,
+        purpose,
+        domain,
+      };
+      try {
+        const { callRecord, callState } = await readCallContext();
+        if (channel !== "sms") {
+          payload.status = "unsupported_channel";
+          payload.message = "Only SMS secure follow-up is available.";
+          return payload;
+        }
+        if (!callRecord?.phone_number) {
+          payload.status = "missing_phone_number";
+          payload.message = "Missing phone number for secure follow-up.";
+          return payload;
+        }
+        const smsBody =
+          domain === "collections_servicing"
+            ? buildCollectionsServicingSmsBody(callRecord, callState, args)
+            : domain === "bank_servicing"
+              ? buildBankServicingSmsBody(callRecord, callState, args)
+              : domain === "fraud_review"
+                ? buildFraudReviewSmsBody(callRecord, callState, args)
+                : buildTaxSupportSmsBody(callRecord, callState, args);
+        await smsService.sendSMS(callRecord.phone_number, smsBody);
+        await db.updateCallState(callSid, "secure_follow_up_sent", {
+          source: "sendSecureFollowup",
+          channel,
+          artifact_type: artifactType,
+          purpose,
+          domain,
+        });
+        const disposition =
+          domain === "collections_servicing"
+            ? getCollectionsDispositionForFollowup(args)
+            : domain === "bank_servicing"
+              ? "bank_secure_followup_sent"
+              : domain === "fraud_review"
+                ? getFraudDispositionForArgs(args, "fraud_uncertain_review_required")
+                : "tax_missing_docs_followup";
+        if (disposition) {
+          await db.setCallDisposition(callSid, disposition, {
+            source: "sendSecureFollowup",
+            artifact_type: artifactType,
+            purpose,
+            domain,
+          });
+        }
+        webhookService.addLiveEvent(
+          callSid,
+          `${domain === "collections_servicing" ? "🔐 Collections" : domain === "bank_servicing" ? "🔐 Bank" : domain === "fraud_review" ? "🔐 Fraud" : "🔐 Tax"} secure follow-up sent`,
+          { force: true },
+        );
+      } catch (err) {
+        console.error("sendSecureFollowup handler error:", err);
+        payload.status = "failed";
+        payload.message = err?.message || "secure_follow_up_failed";
+      }
+      return payload;
+    },
+    createCallbackTask: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "tax_support");
+      const requestedWindow =
+        String(args.requestedWindow || "").trim() || "next_available";
+      const priority = String(args.priority || "normal").trim().toLowerCase() || "normal";
+      const reason =
+        String(
+          args.reason ||
+            (domain === "collections_servicing"
+              ? "collections_servicing_follow_up"
+              : domain === "bank_servicing"
+                ? "bank_servicing_follow_up"
+                : domain === "fraud_review"
+                  ? "fraud_review_follow_up"
+              : "tax_support_follow_up"),
+        ).trim() ||
+        (domain === "collections_servicing"
+          ? "collections_servicing_follow_up"
+          : domain === "bank_servicing"
+            ? "bank_servicing_follow_up"
+            : domain === "fraud_review"
+              ? "fraud_review_follow_up"
+          : "tax_support_follow_up");
+      const payload = {
+        callbackTaskId: null,
+        status: "queued",
+        requestedWindow,
+        priority,
+        reason,
+        domain,
+      };
+      try {
+        const { callRecord, callState } = await readCallContext();
+        if (!callRecord?.phone_number) {
+          payload.status = "missing_phone_number";
+          return payload;
+        }
+        const delayMin = Math.max(
+          1,
+          Number(config.inbound?.callbackDelayMinutes) || 15,
+        );
+        const runAt = new Date(Date.now() + delayMin * 60 * 1000).toISOString();
+        const callbackPayload = buildCallbackPayload(callRecord, callState);
+        const callbackTaskId = await scheduleCallJob(
+          "callback_call",
+          callbackPayload,
+          runAt,
+        );
+        payload.callbackTaskId = callbackTaskId;
+        await db.updateCallState(callSid, "callback_requested", {
+          source: "createCallbackTask",
+          requested_window: requestedWindow,
+          priority,
+          reason,
+          domain,
+          callback_task_id: callbackTaskId,
+          run_at: runAt,
+        });
+        if (domain === "tax_support") {
+          await db.setCallDisposition(callSid, "tax_missing_docs_followup", {
+            source: "createCallbackTask",
+            requested_window: requestedWindow,
+            priority,
+            reason,
+            callback_task_id: callbackTaskId,
+          });
+        }
+        webhookService.addLiveEvent(
+          callSid,
+          `${domain === "collections_servicing" ? "⏲ Collections" : domain === "bank_servicing" ? "⏲ Bank" : domain === "fraud_review" ? "⏲ Fraud" : "⏲ Tax"} callback task created`,
+          { force: true },
+        );
+      } catch (err) {
+        console.error("createCallbackTask handler error:", err);
+        payload.status = "failed";
+        payload.message = err?.message || "callback_task_failed";
+      }
+      return payload;
+    },
+    createReviewCase: async (args = {}) => {
+      const domain = normalizeOperationalDomain(args, "tax_support");
+      const category = String(
+        args.category ||
+          (domain === "collections_servicing"
+            ? "collections_servicing"
+            : domain === "bank_servicing"
+              ? "bank_servicing"
+              : domain === "fraud_review"
+                ? "fraud_review"
+            : "tax_support"),
+      )
+        .trim()
+        .toLowerCase();
+      const priority = String(args.priority || "normal").trim().toLowerCase() || "normal";
+      const reason =
+        String(
+          args.reason ||
+            (domain === "collections_servicing"
+              ? "collections_account_review"
+              : domain === "bank_servicing"
+                ? "bank_account_review"
+                : domain === "fraud_review"
+                  ? "fraud_review"
+              : "tax_support_review"),
+        ).trim() ||
+        (domain === "collections_servicing"
+          ? "collections_account_review"
+          : domain === "bank_servicing"
+            ? "bank_account_review"
+            : domain === "fraud_review"
+              ? "fraud_review"
+          : "tax_support_review");
+      const payload = {
+        reviewCaseId: null,
+        status: "open",
+        category,
+        priority,
+        reason,
+        domain,
+      };
+      try {
+        const { callRecord } = await readCallContext();
+        const reviewCaseId = await db.createReviewCase({
+          call_sid: callSid,
+          phone_number: callRecord?.phone_number || null,
+          requested_action: "review_case",
+          reason,
+          notes: null,
+          source: "createReviewCase",
+          metadata: {
+            category,
+            priority,
+            domain,
+          },
+        });
+        payload.reviewCaseId = reviewCaseId;
+        await db.updateCallState(callSid, "review_case_requested", {
+          source: "createReviewCase",
+          review_case_id: reviewCaseId,
+          category,
+          priority,
+          reason,
+          domain,
+        });
+        const disposition =
+          domain === "collections_servicing"
+            ? getCollectionsDispositionForReviewCase(args)
+            : domain === "fraud_review"
+              ? getFraudDispositionForArgs(args, "fraud_uncertain_review_required")
+              : domain === "bank_servicing"
+                ? null
+                : category.includes("notice")
+                  ? "tax_notice_help_requested"
+                  : "tax_resolution_case_created";
+        if (disposition) {
+          await db.setCallDisposition(callSid, disposition, {
+            source: "createReviewCase",
+            category,
+            priority,
+            reason,
+            review_case_id: reviewCaseId,
+            domain,
+          });
+        }
+        webhookService.addLiveEvent(
+          callSid,
+          `${domain === "collections_servicing" ? "🗂 Collections" : domain === "bank_servicing" ? "🗂 Bank" : domain === "fraud_review" ? "🗂 Fraud" : "🗂 Tax"} review case created`,
+          { force: true },
+        );
+      } catch (err) {
+        console.error("createReviewCase handler error:", err);
+        payload.status = "failed";
+        payload.message = err?.message || "review_case_failed";
       }
       return payload;
     },
@@ -10166,19 +11590,13 @@ function applyTelephonyTools(
   const allowDigitCollection = options.allowDigitCollection !== false;
   const allowPayment = options.allowPayment === true;
   const normalizedName = (tool) =>
-    String(tool?.function?.name || "")
-      .trim()
-      .toLowerCase();
+    normalizeEscalationToolName(tool?.function?.name);
 
   const filteredBaseTools = (Array.isArray(baseTools) ? baseTools : []).filter(
     (tool) => {
       const name = normalizedName(tool);
       if (!name) return false;
-      if (
-        !allowTransfer &&
-        (name === "route_to_agent" || name === "transfercall")
-      )
-        return false;
+      if (!allowTransfer && name === "route_to_agent") return false;
       if (
         !allowDigitCollection &&
         (name === "collect_digits" || name === "collect_multiple_digits")
@@ -10243,6 +11661,10 @@ function applyTelephonyTools(
     delete combinedImpl.route_to_agent;
     delete combinedImpl.transferCall;
     delete combinedImpl.transfercall;
+    delete combinedImpl.transfer_call;
+    delete combinedImpl.transfer;
+    delete combinedImpl.handoff;
+    delete combinedImpl.specialist;
   }
   if (!allowDigitCollection) {
     delete combinedImpl.collect_digits;
@@ -17361,6 +18783,8 @@ async function listMiniAppCallLogs(options = {}) {
       phone_number: call.phone_number || null,
       status: call.status || null,
       status_normalized: call.status_normalized || null,
+      call_disposition: call.call_disposition || null,
+      call_disposition_label: call.call_disposition_label || null,
       direction: call.direction || null,
       duration: Number.isFinite(Number(call.duration)) ? Number(call.duration) : 0,
       transcript_count: Number(call.transcript_count) || 0,
@@ -17408,6 +18832,8 @@ async function getMiniAppActiveCallForTelegramUser(telegramId = "") {
       phone_number: call.phone_number || null,
       status: call.status || null,
       status_normalized: call.status_normalized || null,
+      call_disposition: call.call_disposition || null,
+      call_disposition_label: call.call_disposition_label || null,
       direction: call.direction || null,
       provider: call.provider || call.runtime_provider || null,
       created_at: call.created_at || null,
@@ -17642,6 +19068,8 @@ async function buildMiniAppBootstrapPayload(req) {
 
 const MINI_APP_SUPPORTED_ACTIONS = Object.freeze([
   "audit.feed",
+  "callback_tasks.list",
+  "review_cases.list",
   "callerflags.list",
   "callerflags.upsert",
   "calls.events",
@@ -17719,7 +19147,7 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
     label: "Ops Dashboard",
     capability: "dashboard_view",
     command: "/status",
-    action_contracts: ["runtime.status"],
+    action_contracts: ["runtime.status", "calls.list", "calls.search", "calls.get", "calls.events", "callback_tasks.list", "review_cases.list"],
     order: 0,
     enabled: true,
   },
@@ -17778,7 +19206,7 @@ const MINI_APP_DASHBOARD_MODULE_DEFINITIONS = [
     label: "Call Log Explorer",
     capability: "dashboard_view",
     command: "/calllog",
-    action_contracts: ["calls.list", "calls.search", "calls.get", "calls.events"],
+    action_contracts: ["calls.list", "calls.search", "calls.get", "calls.events", "callback_tasks.list", "review_cases.list"],
     order: 5,
     enabled: true,
   },
@@ -18057,6 +19485,42 @@ function buildMiniAppActionSpec(action, payload = {}) {
       capability: "dashboard_view",
       method: "GET",
       path: `/api/calls/${encodeURIComponent(callSid)}/status`,
+    };
+  }
+
+  if (normalizedAction === "callback_tasks.list") {
+    const status = String(input.status || "").trim().toLowerCase();
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 10,
+      min: 1,
+      max: 50,
+    });
+    return {
+      capability: "dashboard_view",
+      method: "GET",
+      path: "/api/callback-tasks",
+      query: {
+        limit,
+        ...(status ? { status } : {}),
+      },
+    };
+  }
+
+  if (normalizedAction === "review_cases.list") {
+    const status = String(input.status || "").trim().toLowerCase();
+    const limit = parseBoundedInteger(input.limit, {
+      defaultValue: 10,
+      min: 1,
+      max: 50,
+    });
+    return {
+      capability: "dashboard_view",
+      method: "GET",
+      path: "/api/review-cases",
+      query: {
+        limit,
+        ...(status ? { status } : {}),
+      },
     };
   }
 
@@ -23983,6 +25447,43 @@ function safeJsonParse(value, fallback = null) {
   }
 }
 
+const VALID_CALL_DISPOSITIONS = Object.freeze([
+  "tax_refund_status_answered",
+  "tax_missing_docs_followup",
+  "tax_notice_help_requested",
+  "tax_consultation_booked",
+  "tax_resolution_case_created",
+  "bank_servicing_resolved",
+  "bank_secure_followup_sent",
+  "fraud_confirmed_legitimate",
+  "fraud_denied_transaction",
+  "fraud_uncertain_review_required",
+  "collections_payment_link_sent",
+  "collections_promise_to_pay",
+  "collections_hardship_flagged",
+  "collections_dispute_created",
+  "low_confidence_safe_stop",
+  "verification_incomplete",
+  "policy_blocked",
+]);
+
+function normalizeCallDispositionForApi(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  return VALID_CALL_DISPOSITIONS.includes(normalized) ? normalized : null;
+}
+
+function formatCallDispositionLabel(value) {
+  const normalized = normalizeCallDispositionForApi(value);
+  if (!normalized) return null;
+  return normalized
+    .split("_")
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
 function normalizeCallRecordForApi(call) {
   if (!call || typeof call !== "object") return call;
   const normalized = { ...call };
@@ -24001,6 +25502,34 @@ function normalizeCallRecordForApi(call) {
     normalized.generated_functions,
     [],
   );
+  const dispositionPayload = safeJsonParse(normalized.call_disposition_data, null);
+  const dispositionMeta =
+    dispositionPayload && typeof dispositionPayload === "object"
+      ? { ...dispositionPayload }
+      : null;
+  const normalizedDisposition = normalizeCallDispositionForApi(
+    dispositionMeta?.disposition || normalized.call_disposition,
+  );
+  if (dispositionMeta && "disposition" in dispositionMeta) {
+    delete dispositionMeta.disposition;
+  }
+  normalized.call_disposition = normalizedDisposition;
+  normalized.call_disposition_label =
+    formatCallDispositionLabel(normalizedDisposition);
+  normalized.call_disposition_reason =
+    typeof dispositionMeta?.reason === "string" && dispositionMeta.reason.trim()
+      ? dispositionMeta.reason.trim()
+      : null;
+  normalized.call_disposition_source =
+    typeof dispositionMeta?.source === "string" && dispositionMeta.source.trim()
+      ? dispositionMeta.source.trim()
+      : null;
+  normalized.call_disposition_updated_at =
+    normalized.call_disposition_updated_at ||
+    dispositionMeta?.updated_at ||
+    null;
+  normalized.call_disposition_meta = dispositionMeta;
+  delete normalized.call_disposition_data;
   return normalized;
 }
 
@@ -27564,11 +29093,13 @@ registerCallRoutes(app, {
   resolveHost,
   config,
   placeOutboundCall,
+  scheduleCallJob,
   buildErrorDetails,
   getCurrentProvider: () => currentProvider,
   getDb: () => db,
   isSafeId,
   normalizeCallRecordForApi,
+  buildCallbackPayload,
   buildDigitSummary,
   parsePagination,
   normalizeCallStatus,

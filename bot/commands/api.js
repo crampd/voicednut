@@ -8,12 +8,77 @@ async function replyApiError(ctx, error, fallback, options = {}) {
     return ctx.reply(message, options);
 }
 
+async function requireAdminAccess(ctx) {
+    const access = await getAccessProfile(ctx);
+    if (!access?.isAdmin) {
+        await ctx.reply('❌ Access denied. This action is available to administrators only.');
+        return null;
+    }
+    return access;
+}
+
+function formatTimestamp(value) {
+    if (!value) return 'Unknown';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+}
+
+function formatPhoneSuffix(value) {
+    if (!value) return 'n/a';
+    const digits = String(value).replace(/\D+/g, '');
+    if (!digits) return 'n/a';
+    return digits.slice(-4);
+}
+
+function getArrayPayload(response, key) {
+    if (Array.isArray(response?.data?.[key])) return response.data[key];
+    if (Array.isArray(response?.data?.data?.[key])) return response.data.data[key];
+    return [];
+}
+
+function formatCallbackTaskLine(task) {
+    const id = escapeMarkdown(String(task?.id ?? 'unknown'));
+    const status = escapeMarkdown(String(task?.status || 'unknown'));
+    const runAt = escapeMarkdown(formatTimestamp(task?.run_at));
+    const phone = escapeMarkdown(formatPhoneSuffix(task?.phone_number));
+    return `• #${id} ${status} at ${runAt} for xxxx${phone}`;
+}
+
+function formatReviewCaseLine(reviewCase) {
+    const id = escapeMarkdown(String(reviewCase?.id ?? 'unknown'));
+    const status = escapeMarkdown(String(reviewCase?.status || 'open'));
+    const action = escapeMarkdown(String(reviewCase?.requested_action || 'review_case'));
+    const reason = escapeMarkdown(String(reviewCase?.reason || 'No reason provided'));
+    return `• #${id} ${status} ${action}: ${reason}`;
+}
+
+function normalizeDispositionLabel(call) {
+    return String(
+        call?.call_disposition_label ||
+        call?.call_disposition ||
+        'Unclassified'
+    );
+}
+
+function summarizeDispositionCounts(calls) {
+    const counts = new Map();
+    for (const call of calls) {
+        if (!call?.call_disposition && !call?.call_disposition_label) {
+            continue;
+        }
+        const label = normalizeDispositionLabel(call);
+        counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    return Array.from(counts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5);
+}
+
 async function handleStatusCommand(ctx) {
     try {
-        const access = await getAccessProfile(ctx);
-        if (!access?.isAdmin) {
-            return ctx.reply('❌ Access denied. This action is available to administrators only.');
-        }
+        const access = await requireAdminAccess(ctx);
+        if (!access) return;
 
         await sendEphemeral(ctx, '🔍 Checking system status...');
 
@@ -187,13 +252,129 @@ async function handleHealthCommand(ctx) {
     }
 }
 
+async function handleCallbackTasksCommand(ctx) {
+    try {
+        const access = await requireAdminAccess(ctx);
+        if (!access) return;
+
+        await sendEphemeral(ctx, '📞 Loading callback tasks...');
+
+        const response = await httpClient.get(null, `${config.apiUrl}/api/callback-tasks?limit=10`, {
+            timeout: 15000
+        });
+        const callbackTasks = getArrayPayload(response, 'callback_tasks');
+
+        let message = '📞 *Callback Tasks*\n\n';
+        if (!callbackTasks.length) {
+            message += 'No callback tasks found.';
+        } else {
+            message += callbackTasks.map(formatCallbackTaskLine).join('\n');
+        }
+
+        await ctx.reply(message, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    } catch (error) {
+        console.error('Callback tasks command error:', error);
+        await replyApiError(ctx, error, 'Failed to load callback tasks.', {
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    }
+}
+
+async function handleReviewCasesCommand(ctx) {
+    try {
+        const access = await requireAdminAccess(ctx);
+        if (!access) return;
+
+        await sendEphemeral(ctx, '🗂️ Loading review cases...');
+
+        const response = await httpClient.get(null, `${config.apiUrl}/api/review-cases?limit=10`, {
+            timeout: 15000
+        });
+        const reviewCases = getArrayPayload(response, 'review_cases');
+
+        let message = '🗂️ *Review Cases*\n\n';
+        if (!reviewCases.length) {
+            message += 'No review cases found.';
+        } else {
+            message += reviewCases.map(formatReviewCaseLine).join('\n');
+        }
+
+        await ctx.reply(message, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    } catch (error) {
+        console.error('Review cases command error:', error);
+        await replyApiError(ctx, error, 'Failed to load review cases.', {
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    }
+}
+
+async function handleDomainStatsCommand(ctx) {
+    try {
+        const access = await requireAdminAccess(ctx);
+        if (!access) return;
+
+        await sendEphemeral(ctx, '📊 Loading recent domain outcomes...');
+
+        const response = await httpClient.get(null, `${config.apiUrl}/api/calls?limit=20`, {
+            timeout: 15000
+        });
+        const calls = getArrayPayload(response, 'calls');
+        const topDispositions = summarizeDispositionCounts(calls);
+        const recentOutcomes = calls
+            .filter((call) => call?.call_disposition || call?.call_disposition_label)
+            .slice(0, 5);
+
+        let message = '📊 *Domain Outcomes*\n\n';
+        if (!topDispositions.length) {
+            message += 'No structured call dispositions found.';
+        } else {
+            message += '*Top Outcomes*\n';
+            message += topDispositions
+                .map(([label, count]) => `• ${escapeMarkdown(label)}: ${count}`)
+                .join('\n');
+        }
+
+        if (recentOutcomes.length) {
+            message += '\n\n*Recent Outcomes*\n';
+            message += recentOutcomes.map((call) => {
+                const label = escapeMarkdown(normalizeDispositionLabel(call));
+                const source = escapeMarkdown(String(call?.call_disposition_source || 'unknown'));
+                const updatedAt = escapeMarkdown(formatTimestamp(call?.call_disposition_updated_at));
+                return `• ${label} via ${source} at ${updatedAt}`;
+            }).join('\n');
+        }
+
+        await ctx.reply(message, {
+            parse_mode: 'Markdown',
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    } catch (error) {
+        console.error('Domain stats command error:', error);
+        await replyApiError(ctx, error, 'Failed to load domain outcomes.', {
+            reply_markup: buildMainMenuReplyMarkup(ctx)
+        });
+    }
+}
+
 function registerApiCommands(bot) {
     bot.command('status', handleStatusCommand);
+    bot.command('callbacks', handleCallbackTasksCommand);
+    bot.command('reviewcases', handleReviewCasesCommand);
+    bot.command('domainstats', handleDomainStatsCommand);
     bot.command(['health', 'ping'], handleHealthCommand);
 }
 
 module.exports = {
     registerApiCommands,
     handleStatusCommand,
-    handleHealthCommand
+    handleHealthCommand,
+    handleCallbackTasksCommand,
+    handleReviewCasesCommand,
+    handleDomainStatsCommand
 };

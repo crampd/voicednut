@@ -900,6 +900,10 @@ function createListCallsFilteredHandler(ctx = {}) {
           }
         });
       });
+      const callsWithDispositions =
+        typeof db.attachLatestCallDispositions === "function"
+          ? await db.attachLatestCallDispositions(calls)
+          : calls;
 
       const countQuery = `SELECT COUNT(*) as count FROM calls c ${whereClause}`;
       const totalCount = await new Promise((resolve) => {
@@ -913,7 +917,7 @@ function createListCallsFilteredHandler(ctx = {}) {
         });
       });
 
-      const enhancedCalls = calls.map((call) => {
+      const enhancedCalls = callsWithDispositions.map((call) => {
         const normalized = normalizeCallRecordForApi(call);
         const hasConversation =
           call.speakers &&
@@ -1047,12 +1051,16 @@ function createSearchCallsHandler(ctx = {}) {
           }
         });
       });
+      const searchResultsWithDispositions =
+        typeof db.attachLatestCallDispositions === "function"
+          ? await db.attachLatestCallDispositions(searchResults)
+          : searchResults;
 
       const digitService =
         typeof ctx.getDigitService === "function"
           ? ctx.getDigitService()
           : ctx.digitService;
-      const formattedResults = searchResults.map((call) => {
+      const formattedResults = searchResultsWithDispositions.map((call) => {
         const normalized = normalizeCallRecordForApi(call);
         return {
           ...normalized,
@@ -1088,6 +1096,676 @@ function createSearchCallsHandler(ctx = {}) {
   };
 }
 
+const CALLBACK_TASK_STATUSES = new Set([
+  "pending",
+  "running",
+  "completed",
+  "failed",
+]);
+const CALLBACK_TASK_MUTATION_STATUSES = new Set([
+  "pending",
+  "completed",
+  "failed",
+]);
+const REVIEW_CASE_STATUSES = new Set([
+  "open",
+  "in_progress",
+  "resolved",
+  "closed",
+]);
+
+function sendRouteError(ctx, req, res, status, code, message, extra = null) {
+  if (typeof ctx.sendApiError === "function") {
+    return ctx.sendApiError(
+      res,
+      status,
+      code,
+      message,
+      req.requestId || null,
+      extra || undefined,
+    );
+  }
+  return res.status(status).json({
+    success: false,
+    code,
+    error: message,
+    ...(extra && typeof extra === "object" ? extra : {}),
+  });
+}
+
+function parseJsonObject(value) {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCallbackTask(job = {}) {
+  const payload = parseJsonObject(job.payload) || {};
+  return {
+    id: job.id,
+    type: job.job_type,
+    status: job.status,
+    run_at: job.run_at,
+    attempts: Number(job.attempts) || 0,
+    last_error: job.last_error || null,
+    source_call_sid:
+      payload.source_call_sid || payload.call_sid || payload.callSid || null,
+    phone_number: payload.number || payload.phone_number || null,
+    user_chat_id: payload.user_chat_id || null,
+    created_at: job.created_at || null,
+    updated_at: job.updated_at || null,
+    completed_at: job.completed_at || null,
+    payload,
+  };
+}
+
+function normalizeReviewCase(reviewCase = {}) {
+  return {
+    id: reviewCase.id,
+    call_sid: reviewCase.call_sid || null,
+    phone_number: reviewCase.phone_number || null,
+    requested_action: reviewCase.requested_action || null,
+    reason: reviewCase.reason || null,
+    notes: reviewCase.notes || null,
+    source: reviewCase.source || null,
+    status: reviewCase.status,
+    created_by: reviewCase.created_by || null,
+    metadata: parseJsonObject(reviewCase.metadata),
+    created_at: reviewCase.created_at || null,
+    updated_at: reviewCase.updated_at || null,
+    resolved_at: reviewCase.resolved_at || null,
+  };
+}
+
+function normalizePhoneNumber(value) {
+  const normalized = String(value || "").trim();
+  return normalized || "";
+}
+
+function resolveScheduledRunAt(rawRunAt, rawDelayMinutes, defaultDelayMinutes = 15) {
+  const delayMinutesValue = Number(rawDelayMinutes);
+  if (Number.isFinite(delayMinutesValue) && delayMinutesValue >= 0) {
+    return new Date(Date.now() + delayMinutesValue * 60 * 1000).toISOString();
+  }
+  const runAt = String(rawRunAt || "").trim();
+  if (runAt) {
+    const parsed = new Date(runAt);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+    return parsed.toISOString();
+  }
+  return new Date(
+    Date.now() + Math.max(0, Number(defaultDelayMinutes) || 15) * 60 * 1000,
+  ).toISOString();
+}
+
+function createListCallbackTasksHandler(ctx = {}) {
+  const { parseBoundedInteger } = ctx;
+
+  return async function handleListCallbackTasks(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.listCallJobs) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          500,
+          "database_unavailable",
+          "Database unavailable",
+        );
+      }
+      const status = String(req.query?.status || "")
+        .trim()
+        .toLowerCase();
+      if (status && !CALLBACK_TASK_STATUSES.has(status)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "Invalid callback task status",
+        );
+      }
+      const limit = parseBoundedInteger(req.query?.limit, {
+        defaultValue: 20,
+        min: 1,
+        max: 100,
+      });
+      const jobs = await db.listCallJobs({
+        job_type: "callback_call",
+        status: status || null,
+        limit,
+      });
+      return res.json({
+        success: true,
+        callback_tasks: jobs.map(normalizeCallbackTask),
+      });
+    } catch (error) {
+      console.error("Error listing callback tasks:", error);
+      return sendRouteError(
+        ctx,
+        req,
+        res,
+        500,
+        "callback_tasks_list_failed",
+        "Failed to list callback tasks",
+      );
+    }
+  };
+}
+
+function createCreateCallbackTaskHandler(ctx = {}) {
+  const { isSafeId, buildCallbackPayload, scheduleCallJob, config } = ctx;
+
+  return async function handleCreateCallbackTask(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.getCall || !scheduleCallJob) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          500,
+          "callback_tasks_unavailable",
+          "Callback task scheduling unavailable",
+        );
+      }
+
+      const callSid = String(req.body?.call_sid || "").trim();
+      if (!callSid) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "call_sid is required",
+        );
+      }
+      if (typeof isSafeId === "function" && !isSafeId(callSid)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "Invalid call_sid",
+        );
+      }
+
+      const call = await db.getCall(callSid);
+      if (!call) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          404,
+          "call_not_found",
+          "Call not found",
+        );
+      }
+      const callState = await db
+        .getLatestCallState?.(callSid, "call_created")
+        .catch(() => null);
+      const payloadBuilder =
+        typeof buildCallbackPayload === "function"
+          ? buildCallbackPayload(call, callState)
+          : {
+              number: call.phone_number,
+              prompt: call.prompt || null,
+              first_message: call.first_message || null,
+              user_chat_id: call.user_chat_id || null,
+            };
+      const payload = {
+        ...payloadBuilder,
+        source_call_sid: callSid,
+      };
+      if (!payload.number || !/^\+[1-9]\d{1,14}$/.test(String(payload.number))) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "invalid_phone_number",
+          "Call does not have a valid E.164 phone number",
+        );
+      }
+
+      const defaultDelayMinutes = Number(config?.inbound?.callbackDelayMinutes) || 15;
+      const runAt = resolveScheduledRunAt(
+        req.body?.run_at,
+        req.body?.delay_minutes,
+        defaultDelayMinutes,
+      );
+      if (!runAt) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "run_at must be a valid timestamp",
+        );
+      }
+
+      const taskId = await scheduleCallJob("callback_call", payload, runAt);
+      await db
+        .updateCallState?.(callSid, "callback_scheduled", {
+          run_at: runAt,
+          source: "api",
+          callback_task_id: taskId,
+        })
+        .catch(() => null);
+      const job = await db.getCallJob?.(taskId);
+      return res.status(201).json({
+        success: true,
+        callback_task: normalizeCallbackTask(
+          job || {
+            id: taskId,
+            job_type: "callback_call",
+            status: "pending",
+            run_at: runAt,
+            payload: JSON.stringify(payload),
+          },
+        ),
+      });
+    } catch (error) {
+      console.error("Error creating callback task:", error);
+      return sendRouteError(
+        ctx,
+        req,
+        res,
+        500,
+        "callback_task_create_failed",
+        "Failed to create callback task",
+      );
+    }
+  };
+}
+
+function createUpdateCallbackTaskStatusHandler(ctx = {}) {
+  const { parseBoundedInteger } = ctx;
+
+  return async function handleUpdateCallbackTaskStatus(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.getCallJob) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          500,
+          "callback_tasks_unavailable",
+          "Callback task status updates unavailable",
+        );
+      }
+      const taskId = parseBoundedInteger(req.params?.taskId, {
+        defaultValue: NaN,
+        min: 1,
+        max: Number.MAX_SAFE_INTEGER,
+      });
+      if (!Number.isFinite(taskId)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "Invalid callback task id",
+        );
+      }
+      const job = await db.getCallJob(taskId);
+      if (!job || job.job_type !== "callback_call") {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          404,
+          "callback_task_not_found",
+          "Callback task not found",
+        );
+      }
+      const status = String(req.body?.status || "")
+        .trim()
+        .toLowerCase();
+      if (!CALLBACK_TASK_MUTATION_STATUSES.has(status)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "status must be pending, completed, or failed",
+        );
+      }
+      if (status === "pending") {
+        const runAtInputProvided =
+          req.body?.run_at !== undefined || req.body?.delay_minutes !== undefined;
+        if (!runAtInputProvided) {
+          return sendRouteError(
+            ctx,
+            req,
+            res,
+            400,
+            "validation_error",
+            "run_at or delay_minutes is required when setting status to pending",
+          );
+        }
+        const runAt = resolveScheduledRunAt(
+          req.body?.run_at,
+          req.body?.delay_minutes,
+          0,
+        );
+        if (!runAt) {
+          return sendRouteError(
+            ctx,
+            req,
+            res,
+            400,
+            "validation_error",
+            "run_at must be a valid timestamp",
+          );
+        }
+        await db.rescheduleCallJob(taskId, runAt, req.body?.error || null);
+      } else {
+        await db.completeCallJob(taskId, status, req.body?.error || null);
+      }
+      const updated = await db.getCallJob(taskId);
+      return res.json({
+        success: true,
+        callback_task: normalizeCallbackTask(updated),
+      });
+    } catch (error) {
+      console.error("Error updating callback task status:", error);
+      return sendRouteError(
+        ctx,
+        req,
+        res,
+        500,
+        "callback_task_update_failed",
+        "Failed to update callback task status",
+      );
+    }
+  };
+}
+
+function createListReviewCasesHandler(ctx = {}) {
+  const { parseBoundedInteger } = ctx;
+
+  return async function handleListReviewCases(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.listReviewCases) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          500,
+          "review_cases_unavailable",
+          "Review case listing unavailable",
+        );
+      }
+      const status = String(req.query?.status || "")
+        .trim()
+        .toLowerCase();
+      if (status && !REVIEW_CASE_STATUSES.has(status)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "Invalid review case status",
+        );
+      }
+      const limit = parseBoundedInteger(req.query?.limit, {
+        defaultValue: 20,
+        min: 1,
+        max: 100,
+      });
+      const reviewCases = await db.listReviewCases({
+        status: status || null,
+        limit,
+      });
+      return res.json({
+        success: true,
+        review_cases: reviewCases.map(normalizeReviewCase),
+      });
+    } catch (error) {
+      console.error("Error listing review cases:", error);
+      return sendRouteError(
+        ctx,
+        req,
+        res,
+        500,
+        "review_cases_list_failed",
+        "Failed to list review cases",
+      );
+    }
+  };
+}
+
+function createCreateReviewCaseHandler(ctx = {}) {
+  const { isSafeId } = ctx;
+
+  return async function handleCreateReviewCase(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.createReviewCase) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          500,
+          "review_cases_unavailable",
+          "Review case creation unavailable",
+        );
+      }
+      const callSid = String(req.body?.call_sid || "").trim();
+      const requestedAction =
+        String(req.body?.requested_action || "review_case").trim() ||
+        "review_case";
+      let phoneNumber = normalizePhoneNumber(req.body?.phone_number);
+      if (!callSid && !phoneNumber) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "call_sid or phone_number is required",
+        );
+      }
+      if (callSid && typeof isSafeId === "function" && !isSafeId(callSid)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "Invalid call_sid",
+        );
+      }
+      let call = null;
+      if (callSid) {
+        call = await db.getCall?.(callSid);
+        if (!call) {
+          return sendRouteError(
+            ctx,
+            req,
+            res,
+            404,
+            "call_not_found",
+            "Call not found",
+          );
+        }
+        if (!phoneNumber) {
+          phoneNumber = normalizePhoneNumber(call.phone_number);
+        }
+      }
+      if (phoneNumber && !/^\+[1-9]\d{1,14}$/.test(phoneNumber)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "invalid_phone_number",
+          "phone_number must use E.164 format",
+        );
+      }
+      const createdBy = String(req.headers?.["x-telegram-chat-id"] || "")
+        .trim()
+        || null;
+      const reviewCaseId = await db.createReviewCase({
+        call_sid: callSid || null,
+        phone_number: phoneNumber || null,
+        requested_action: requestedAction,
+        reason: req.body?.reason || null,
+        notes: req.body?.notes || null,
+        source: req.body?.source || "api",
+        created_by: createdBy,
+        metadata:
+          req.body?.metadata && typeof req.body.metadata === "object"
+            ? req.body.metadata
+            : null,
+      });
+      if (callSid) {
+        await db
+          .updateCallState?.(callSid, "review_case_requested", {
+            at: new Date().toISOString(),
+            source: "api",
+            requested_action: requestedAction,
+            review_case_id: reviewCaseId,
+          })
+          .catch(() => null);
+      }
+      const reviewCase = await db.getReviewCase?.(reviewCaseId);
+      return res.status(201).json({
+        success: true,
+        review_case: normalizeReviewCase(
+          reviewCase || {
+            id: reviewCaseId,
+            call_sid: callSid || null,
+            phone_number: phoneNumber || null,
+            requested_action: requestedAction,
+            reason: req.body?.reason || null,
+            notes: req.body?.notes || null,
+            source: req.body?.source || "api",
+            status: "open",
+            created_by: createdBy,
+            metadata:
+              req.body?.metadata && typeof req.body.metadata === "object"
+                ? JSON.stringify(req.body.metadata)
+                : null,
+          },
+        ),
+      });
+    } catch (error) {
+      console.error("Error creating review case:", error);
+      return sendRouteError(
+        ctx,
+        req,
+        res,
+        500,
+        "review_case_create_failed",
+        "Failed to create review case",
+      );
+    }
+  };
+}
+
+function createUpdateReviewCaseStatusHandler(ctx = {}) {
+  const { parseBoundedInteger } = ctx;
+
+  return async function handleUpdateReviewCaseStatus(req, res) {
+    try {
+      const db = typeof ctx.getDb === "function" ? ctx.getDb() : ctx.db;
+      if (!db?.getReviewCase || !db?.updateReviewCaseStatus) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          500,
+          "review_cases_unavailable",
+          "Review case status updates unavailable",
+        );
+      }
+      const reviewCaseId = parseBoundedInteger(req.params?.caseId, {
+        defaultValue: NaN,
+        min: 1,
+        max: Number.MAX_SAFE_INTEGER,
+      });
+      if (!Number.isFinite(reviewCaseId)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "Invalid review case id",
+        );
+      }
+      const reviewCase = await db.getReviewCase(reviewCaseId);
+      if (!reviewCase) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          404,
+          "review_case_not_found",
+          "Review case not found",
+        );
+      }
+      const status = String(req.body?.status || "")
+        .trim()
+        .toLowerCase();
+      if (!REVIEW_CASE_STATUSES.has(status)) {
+        return sendRouteError(
+          ctx,
+          req,
+          res,
+          400,
+          "validation_error",
+          "status must be open, in_progress, resolved, or closed",
+        );
+      }
+      await db.updateReviewCaseStatus(reviewCaseId, status, {
+        notes: req.body?.notes || null,
+        metadata:
+          req.body?.metadata && typeof req.body.metadata === "object"
+            ? req.body.metadata
+            : undefined,
+      });
+      const updated = await db.getReviewCase(reviewCaseId);
+      return res.json({
+        success: true,
+        review_case: normalizeReviewCase(updated),
+      });
+    } catch (error) {
+      console.error("Error updating review case status:", error);
+      return sendRouteError(
+        ctx,
+        req,
+        res,
+        500,
+        "review_case_update_failed",
+        "Failed to update review case status",
+      );
+    }
+  };
+}
+
 function registerCallRoutes(app, ctx = {}) {
   const requireOutboundAuthorization =
     typeof ctx.requireOutboundAuthorization === "function"
@@ -1099,6 +1777,14 @@ function registerCallRoutes(app, ctx = {}) {
   const handleListCalls = createListCallsHandler(ctx);
   const handleListCallsFiltered = createListCallsFilteredHandler(ctx);
   const handleSearchCalls = createSearchCallsHandler(ctx);
+  const handleListCallbackTasks = createListCallbackTasksHandler(ctx);
+  const handleCreateCallbackTask = createCreateCallbackTaskHandler(ctx);
+  const handleUpdateCallbackTaskStatus =
+    createUpdateCallbackTaskStatusHandler(ctx);
+  const handleListReviewCases = createListReviewCasesHandler(ctx);
+  const handleCreateReviewCase = createCreateReviewCaseHandler(ctx);
+  const handleUpdateReviewCaseStatus =
+    createUpdateReviewCaseStatusHandler(ctx);
   const handleGetCallQa = createGetCallQaHandler(ctx);
   const handleEvaluateCallQa = createEvaluateCallQaHandler(ctx);
   const handleGetQaSummary = createGetQaSummaryHandler(ctx);
@@ -1117,6 +1803,36 @@ function registerCallRoutes(app, ctx = {}) {
   app.get("/api/calls", requireOutboundAuthorization, handleListCalls);
   app.get("/api/calls/list", requireOutboundAuthorization, handleListCallsFiltered);
   app.get("/api/calls/search", requireOutboundAuthorization, handleSearchCalls);
+  app.get(
+    "/api/callback-tasks",
+    requireOutboundAuthorization,
+    handleListCallbackTasks,
+  );
+  app.post(
+    "/api/callback-tasks",
+    requireOutboundAuthorization,
+    handleCreateCallbackTask,
+  );
+  app.patch(
+    "/api/callback-tasks/:taskId/status",
+    requireOutboundAuthorization,
+    handleUpdateCallbackTaskStatus,
+  );
+  app.get(
+    "/api/review-cases",
+    requireOutboundAuthorization,
+    handleListReviewCases,
+  );
+  app.post(
+    "/api/review-cases",
+    requireOutboundAuthorization,
+    handleCreateReviewCase,
+  );
+  app.patch(
+    "/api/review-cases/:caseId/status",
+    requireOutboundAuthorization,
+    handleUpdateReviewCaseStatus,
+  );
   app.get("/api/qa/summary", requireOutboundAuthorization, handleGetQaSummary);
   app.get("/api/calls/:callSid/qa", requireOutboundAuthorization, handleGetCallQa);
   app.post(

@@ -20,11 +20,11 @@ const CONNECTOR_REGISTRY = Object.freeze({
     approval: { required: false, mode: "none" },
   },
   route_to_agent: {
-    id: "human_handoff",
+    id: "non_transfer_escalation",
     class: "side_effect",
     risk_class: "medium",
-    capability_tags: ["handoff", "escalation", "support"],
-    default_policy: { timeout_ms: 8000, retry_limit: 0, circuit_group: "handoff" },
+    capability_tags: ["escalation", "follow_up", "support"],
+    default_policy: { timeout_ms: 8000, retry_limit: 0, circuit_group: "escalation" },
     approval: { required: false, mode: "none" },
   },
   collect_digits: {
@@ -372,11 +372,11 @@ function deriveDescriptorFromPattern(toolName = "", fallbackClass = "read") {
     normalized.includes("handoff")
   ) {
     return {
-      id: `${normalized}_handoff`,
+      id: `${normalized}_escalation`,
       class: "side_effect",
       risk_class: "medium",
-      capability_tags: ["handoff", "escalation", "support"],
-      default_policy: { timeout_ms: 8000, retry_limit: 0, circuit_group: "handoff" },
+      capability_tags: ["escalation", "follow_up", "support"],
+      default_policy: { timeout_ms: 8000, retry_limit: 0, circuit_group: "escalation" },
       approval: { required: false, mode: "none" },
     };
   }
@@ -528,7 +528,7 @@ function deriveIntentEnvelope(callConfig = {}, options = {}) {
     .join(" ");
   const combinedIntentText = `${purposeText} ${runtimeSignalText}`.trim();
 
-  const allowedCapabilities = new Set(["general", "handoff", "disclosure"]);
+  const allowedCapabilities = new Set(["general", "escalation", "follow_up", "disclosure"]);
   let confidence = "low";
   let intent = "general_assistance";
 
@@ -700,7 +700,8 @@ function routeToolsByIntent(tools = [], callConfig = {}, options = {}) {
     return (
       capabilities.has("general") ||
       capabilities.has("disclosure") ||
-      capabilities.has("handoff")
+      capabilities.has("escalation") ||
+      capabilities.has("follow_up")
     );
   });
   const finalTools = routed.length > 0 ? routed : safeFallback;

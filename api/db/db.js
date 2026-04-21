@@ -22,11 +22,58 @@ const CALL_ACTIVE_STATUSES = Object.freeze([
     'in-progress',
     'connecting',
 ]);
+const CALL_DISPOSITION_STATE = 'call_disposition';
+const VALID_CALL_DISPOSITIONS = Object.freeze([
+    'tax_refund_status_answered',
+    'tax_missing_docs_followup',
+    'tax_notice_help_requested',
+    'tax_consultation_booked',
+    'tax_resolution_case_created',
+    'bank_servicing_resolved',
+    'bank_secure_followup_sent',
+    'fraud_confirmed_legitimate',
+    'fraud_denied_transaction',
+    'fraud_uncertain_review_required',
+    'collections_payment_link_sent',
+    'collections_promise_to_pay',
+    'collections_hardship_flagged',
+    'collections_dispute_created',
+    'low_confidence_safe_stop',
+    'verification_incomplete',
+    'policy_blocked',
+]);
 function normalizeCallStatusForDb(value) {
     return String(value || '')
         .trim()
         .toLowerCase()
         .replace(/_/g, '-');
+}
+
+function normalizeCallDispositionForDb(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, '_');
+}
+
+function isValidCallDisposition(value) {
+    return VALID_CALL_DISPOSITIONS.includes(normalizeCallDispositionForDb(value));
+}
+
+function parseDispositionStateRow(row) {
+    if (!row?.data) return null;
+    try {
+        const parsed = JSON.parse(row.data);
+        const disposition = normalizeCallDispositionForDb(parsed?.disposition);
+        if (!isValidCallDisposition(disposition)) return null;
+        return {
+            ...(parsed && typeof parsed === 'object' ? parsed : {}),
+            disposition,
+            updated_at: row.timestamp || parsed?.updated_at || null,
+        };
+    } catch (_) {
+        return null;
+    }
 }
 
 function getCallStatusRank(status) {
@@ -318,6 +365,23 @@ class EnhancedDatabase {
                 replayed_at DATETIME,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`,
+
+            // Operational review cases for non-transfer escalations
+            `CREATE TABLE IF NOT EXISTS review_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_sid TEXT,
+                phone_number TEXT,
+                requested_action TEXT,
+                reason TEXT,
+                notes TEXT,
+                source TEXT DEFAULT 'api',
+                status TEXT DEFAULT 'open' CHECK(status IN ('open', 'in_progress', 'resolved', 'closed')),
+                created_by TEXT,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                resolved_at DATETIME
             )`,
 
             // Outbound API rate-limit counters (shared coordination across app instances)
@@ -986,6 +1050,104 @@ class EnhancedDatabase {
                     }
                 }
             });
+        });
+    }
+
+    async setCallDisposition(call_sid, disposition, metadata = {}) {
+        const normalizedCallSid = String(call_sid || '').trim();
+        if (!normalizedCallSid) {
+            throw new Error('call_sid is required');
+        }
+
+        const normalizedDisposition = normalizeCallDispositionForDb(disposition);
+        if (!isValidCallDisposition(normalizedDisposition)) {
+            throw new Error(`Unsupported call disposition: ${disposition}`);
+        }
+
+        const details =
+            metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+                ? { ...metadata }
+                : {};
+        const payload = {
+            ...details,
+            disposition: normalizedDisposition,
+        };
+
+        await this.updateCallState(normalizedCallSid, CALL_DISPOSITION_STATE, payload);
+        return payload;
+    }
+
+    async getLatestCallDisposition(call_sid) {
+        const dispositions = await this.getLatestCallDispositions([call_sid]);
+        const normalizedCallSid = String(call_sid || '').trim();
+        return dispositions[normalizedCallSid] || null;
+    }
+
+    async getLatestCallDispositions(callSids = []) {
+        const normalizedCallSids = [...new Set(
+            (Array.isArray(callSids) ? callSids : [])
+                .map((value) => String(value || '').trim())
+                .filter(Boolean),
+        )];
+        if (!normalizedCallSids.length) {
+            return {};
+        }
+
+        return new Promise((resolve, reject) => {
+            const placeholders = normalizedCallSids.map(() => '?').join(', ');
+            const sql = `
+                SELECT cs.call_sid, cs.data, cs.timestamp
+                FROM call_states cs
+                INNER JOIN (
+                    SELECT call_sid, MAX(sequence_number) AS max_sequence_number
+                    FROM call_states
+                    WHERE state = ? AND call_sid IN (${placeholders})
+                    GROUP BY call_sid
+                ) latest
+                    ON latest.call_sid = cs.call_sid
+                   AND latest.max_sequence_number = cs.sequence_number
+                WHERE cs.state = ?
+            `;
+            this.db.all(
+                sql,
+                [CALL_DISPOSITION_STATE, ...normalizedCallSids, CALL_DISPOSITION_STATE],
+                (err, rows) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+
+                    const dispositions = {};
+                    (rows || []).forEach((row) => {
+                        const parsed = parseDispositionStateRow(row);
+                        if (!parsed?.disposition || !row?.call_sid) return;
+                        dispositions[row.call_sid] = parsed;
+                    });
+                    resolve(dispositions);
+                },
+            );
+        });
+    }
+
+    async attachLatestCallDispositions(calls = []) {
+        const rows = Array.isArray(calls) ? calls : [];
+        if (!rows.length) {
+            return [];
+        }
+
+        const dispositions = await this.getLatestCallDispositions(
+            rows.map((row) => row?.call_sid),
+        );
+
+        return rows.map((row) => {
+            const disposition = row?.call_sid ? dispositions[row.call_sid] : null;
+            if (!disposition) return row;
+            return {
+                ...row,
+                call_disposition: disposition.disposition,
+                call_disposition_data: disposition,
+                call_disposition_updated_at: disposition.updated_at || null,
+            };
         });
     }
 
@@ -2812,7 +2974,9 @@ class EnhancedDatabase {
                     console.error('Database error in getRecentCalls:', err);
                     reject(err);
                 } else {
-                    resolve(rows || []);
+                    this.attachLatestCallDispositions(rows || [])
+                        .then(resolve)
+                        .catch(reject);
                 }
             });
         });
@@ -3222,6 +3386,19 @@ class EnhancedDatabase {
         });
     }
 
+    async getCallJob(job_id) {
+        return new Promise((resolve, reject) => {
+            const sql = `SELECT * FROM call_jobs WHERE id = ?`;
+            this.db.get(sql, [job_id], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
     async listCallJobs({ job_type = null, status = null, limit = 20 } = {}) {
         const clauses = [];
         const params = [];
@@ -3329,6 +3506,136 @@ class EnhancedDatabase {
                     resolve(this.changes);
                 }
             });
+        });
+    }
+
+    async createReviewCase(reviewCase = {}) {
+        const status = String(reviewCase?.status || 'open').trim().toLowerCase() || 'open';
+        const metadata = reviewCase?.metadata && typeof reviewCase.metadata === 'object'
+            ? JSON.stringify(reviewCase.metadata)
+            : null;
+        return new Promise((resolve, reject) => {
+            const stmt = this.db.prepare(`
+                INSERT INTO review_cases (
+                    call_sid,
+                    phone_number,
+                    requested_action,
+                    reason,
+                    notes,
+                    source,
+                    status,
+                    created_by,
+                    metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            stmt.run(
+                [
+                    reviewCase?.call_sid || null,
+                    reviewCase?.phone_number || null,
+                    reviewCase?.requested_action || null,
+                    reviewCase?.reason || null,
+                    reviewCase?.notes || null,
+                    reviewCase?.source || 'api',
+                    status,
+                    reviewCase?.created_by || null,
+                    metadata,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.lastID);
+                    }
+                }
+            );
+            stmt.finalize();
+        });
+    }
+
+    async getReviewCase(review_case_id) {
+        return new Promise((resolve, reject) => {
+            const sql = `SELECT * FROM review_cases WHERE id = ?`;
+            this.db.get(sql, [review_case_id], (err, row) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(row || null);
+                }
+            });
+        });
+    }
+
+    async listReviewCases({ status = null, limit = 20 } = {}) {
+        const clauses = [];
+        const params = [];
+        if (status) {
+            clauses.push('status = ?');
+            params.push(status);
+        }
+        const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+        const sql = `
+            SELECT * FROM review_cases
+            ${where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+        `;
+        params.push(Math.min(100, Math.max(1, Number(limit) || 20)));
+        return new Promise((resolve, reject) => {
+            this.db.all(sql, params, (err, rows) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(rows || []);
+                }
+            });
+        });
+    }
+
+    async updateReviewCaseStatus(review_case_id, status, updates = {}) {
+        const normalizedStatus = String(status || '').trim().toLowerCase();
+        const updatedAt = new Date().toISOString();
+        const metadata = updates?.metadata && typeof updates.metadata === 'object'
+            ? JSON.stringify(updates.metadata)
+            : undefined;
+        const resolvedAt =
+            normalizedStatus === 'resolved' || normalizedStatus === 'closed'
+                ? updatedAt
+                : null;
+        return new Promise((resolve, reject) => {
+            const sql = `
+                UPDATE review_cases
+                SET status = ?,
+                    notes = COALESCE(?, notes),
+                    metadata = COALESCE(?, metadata),
+                    updated_at = ?,
+                    resolved_at = CASE
+                        WHEN ? IS NOT NULL THEN ?
+                        WHEN ? IN ('open', 'in_progress') THEN NULL
+                        ELSE resolved_at
+                    END
+                WHERE id = ?
+            `;
+            this.db.run(
+                sql,
+                [
+                    normalizedStatus,
+                    updates?.notes || null,
+                    metadata === undefined ? null : metadata,
+                    updatedAt,
+                    resolvedAt,
+                    resolvedAt,
+                    normalizedStatus,
+                    review_case_id,
+                ],
+                function(err) {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve(this.changes);
+                    }
+                }
+            );
         });
     }
 
@@ -3523,7 +3830,9 @@ class EnhancedDatabase {
                 if (err) {
                     reject(err);
                 } else {
-                    resolve(row);
+                    this.attachLatestCallDispositions(row ? [row] : [])
+                        .then((rows) => resolve(rows[0] || null))
+                        .catch(reject);
                 }
             });
         });
@@ -3905,7 +4214,9 @@ class EnhancedDatabase {
                 if (err) {
                     reject(err);
                 } else {
-                    resolve(rows || []);
+                    this.attachLatestCallDispositions(rows || [])
+                        .then(resolve)
+                        .catch(reject);
                 }
             });
         });

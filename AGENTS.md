@@ -105,7 +105,7 @@
 
 - Skill or workflow updates -> use `skill-creator`.
 - Provider/API docs lookup and integration behavior validation -> use `openai-docs` + Context7.
-- Feature implementation/code generation -> use `voicednut-codegen`.
+- Feature implementation/code generation -> use `intent-codegen`.
 - Provider integration and adapter development -> use `provider-integration`.
 - Miniapp UI/UX enhancement and visual quality improvements -> use `miniapp-ui` with `frontend-skill`.
 - Design-to-code implementation from Figma URLs/nodes -> use `figma-implement-design` (and `figma` for MCP setup/troubleshooting).
@@ -145,7 +145,7 @@
 ## Miniapp skill orchestration (required)
 
 - For Mini App enhancement tasks, route by default through this sequence unless task scope requires otherwise:
-  1. `voicednut-codegen` for scoped implementation plan and minimal diff strategy.
+  1. `intent-codegen` for scoped implementation plan and minimal diff strategy.
   2. `frontend-skill` for UI hierarchy, polish, and interaction quality.
   3. `playwright` for UI/runtime validation on critical flows.
   4. `bug-risk-analyzer` for high-risk paths (auth, admin actions, destructive operations).
@@ -219,7 +219,7 @@ See [api/README.md](api/README.md) for troubleshooting.
 
 Use runtime-discovered skills from `~/.codex/config.toml` instead of maintaining a static list in this file. For this repository, prefer:
 
-- `voicednut-codegen` for implementation.
+- `intent-codegen` for implementation.
 - `provider-integration` for adding new providers.
 - `miniapp-ui` for Mini App UI development.
 - `legacy-code-reader` for complex code explanation.

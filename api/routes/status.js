@@ -2045,10 +2045,10 @@ class EnhancedWebhookService {
           [
             { text: '⏺️ Record', callback_data: `lc:rec:${callSid}` },
             { text: '⏹ End', callback_data: `lc:end:${callSid}` },
-            { text: '🔀 Transfer', callback_data: `lc:xfer:${callSid}` }
+            { text: '🗂 Review case', callback_data: `lc:review_case:${callSid}` }
           ],
           [
-            { text: '📩 SMS', callback_data: `lc:sms:${callSid}` },
+            { text: '🔐 Secure follow-up', callback_data: `lc:secure_follow_up:${callSid}` },
             { text: '⏲ Callback', callback_data: `lc:callback:${callSid}` },
             { text: '⚠️ Spam', callback_data: `lc:spam:${callSid}` }
           ],
@@ -2069,7 +2069,11 @@ class EnhancedWebhookService {
         [
           { text: '⏺️ Record', callback_data: `lc:rec:${callSid}` },
           { text: '⏹ End', callback_data: `lc:end:${callSid}` },
-          { text: '🔀 Transfer', callback_data: `lc:xfer:${callSid}` }
+          { text: '🗂 Review case', callback_data: `lc:review_case:${callSid}` }
+        ],
+        [
+          { text: '🔐 Secure follow-up', callback_data: `lc:secure_follow_up:${callSid}` },
+          { text: '⏲ Callback', callback_data: `lc:callback:${callSid}` }
         ],
         [
           { text: compactLabel, callback_data: `lc:compact:${callSid}` }

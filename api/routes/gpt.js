@@ -25,6 +25,32 @@ function stableHash(value) {
   return crypto.createHash('sha256').update(body).digest('hex');
 }
 
+const LEGACY_ESCALATION_TOOL_FALLBACKS = Object.freeze({
+  route_to_agent: 'route_to_agent',
+  routetoagent: 'route_to_agent',
+  route_agent: 'route_to_agent',
+  transfer: 'route_to_agent',
+  transfercall: 'route_to_agent',
+  transfer_call: 'route_to_agent',
+  handoff: 'route_to_agent',
+  specialist: 'route_to_agent',
+  route_to_specialist: 'route_to_agent',
+  live_agent: 'route_to_agent',
+  liveagent: 'route_to_agent',
+  human_agent: 'route_to_agent',
+  humanagent: 'route_to_agent'
+});
+
+function normalizeEscalationToolFallback(toolName = '') {
+  const normalized = String(toolName || '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  if (!normalized) return '';
+  return LEGACY_ESCALATION_TOOL_FALLBACKS[normalized] || '';
+}
+
 class EnhancedGptService extends EventEmitter {
   constructor(customPrompt = null, customFirstMessage = null, options = {}) {
     super();
@@ -515,6 +541,9 @@ class EnhancedGptService extends EventEmitter {
 
   isLikelySideEffectTool(toolName = '') {
     const name = String(toolName || '').toLowerCase();
+    if (normalizeEscalationToolFallback(name) === 'route_to_agent') {
+      return true;
+    }
     return [
       'route_to_agent',
       'transfercall',
@@ -529,9 +558,9 @@ class EnhancedGptService extends EventEmitter {
   }
 
   getDefaultToolFallback(toolName = '') {
-    const name = String(toolName || '').toLowerCase();
-    if (name === 'transfercall' || name === 'transfer_call') {
-      return 'route_to_agent';
+    const escalationFallback = normalizeEscalationToolFallback(toolName);
+    if (escalationFallback) {
+      return escalationFallback;
     }
     return null;
   }

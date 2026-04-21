@@ -68,6 +68,9 @@ const COMMAND_CAPABILITIES = {
   callerflags: 'caller_flags_manage',
   admin: 'admin_panel',
   status: 'status_admin',
+  callbacks: 'status_admin',
+  reviewcases: 'status_admin',
+  domainstats: 'status_admin',
   health: 'health',
   ping: 'health'
 };

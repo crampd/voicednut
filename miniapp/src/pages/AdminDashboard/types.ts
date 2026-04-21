@@ -108,8 +108,37 @@ export interface CallLogRow {
   transcript_count?: unknown;
   voice_runtime?: unknown;
   ended_reason?: unknown;
+  call_disposition?: unknown;
+  call_disposition_label?: unknown;
+  call_disposition_reason?: unknown;
+  call_disposition_source?: unknown;
+  call_disposition_updated_at?: unknown;
   created_at?: unknown;
   updated_at?: unknown;
+}
+
+export interface CallbackTaskRow {
+  id?: unknown;
+  type?: unknown;
+  status?: unknown;
+  run_at?: unknown;
+  source_call_sid?: unknown;
+  phone_number?: unknown;
+  created_at?: unknown;
+  updated_at?: unknown;
+  completed_at?: unknown;
+}
+
+export interface ReviewCaseRow {
+  id?: unknown;
+  call_sid?: unknown;
+  phone_number?: unknown;
+  requested_action?: unknown;
+  reason?: unknown;
+  status?: unknown;
+  created_at?: unknown;
+  updated_at?: unknown;
+  resolved_at?: unknown;
 }
 
 export interface DlqPayload {

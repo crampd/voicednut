@@ -10,6 +10,17 @@ class DynamicFunctionEngine {
     this.initializeCoreTemplates();
   }
 
+  static get DOMAIN_SIGNAL_PATTERNS() {
+    return {
+      tax: ['tax', 'refund', 'return', 'notice', 'filing'],
+      tax_resolution: ['notice', 'balance due', 'resolution', 'installment agreement', 'payment due'],
+      bank: ['bank', 'account', 'card', 'checking', 'savings', 'debit', 'credit'],
+      fraud: ['suspicious transaction', 'suspicious', 'fraud', 'unauthorized', 'chargeback', 'account takeover'],
+      collections: ['collections', 'installment', 'payment due', 'past due', 'delinquent', 'promise to pay', 'hardship', 'dispute'],
+      verification: ['verification', 'verify', 'identity', 'identity check', 'security code', 'otp'],
+    };
+  }
+
   // Initialize core function templates that can adapt to any business
   initializeCoreTemplates() {
     this.functionTemplates.set('inventory_check', {
@@ -117,6 +128,183 @@ class DynamicFunctionEngine {
       },
       implementation: this.createLeadQualificationFunction.bind(this)
     });
+
+    this.functionTemplates.set('verify_identity', {
+      name: 'verifyIdentity',
+      description: 'Collect and confirm non-sensitive identity verification checkpoints before continuing',
+      parameters: {
+        type: 'object',
+        properties: {
+          customerName: { type: 'string', description: 'Customer name as provided on the call' },
+          verificationType: { type: 'string', enum: ['basic', 'step_up', 'document'], description: 'Verification path needed' },
+          knownLast4: { type: 'string', description: 'Last four digits or similar limited identifier if allowed' }
+        },
+        required: ['verificationType']
+      },
+      implementation: this.createIdentityVerificationFunction.bind(this)
+    });
+
+    this.functionTemplates.set('create_callback_task', {
+      name: 'createCallbackTask',
+      description: 'Queue a callback task when the issue cannot be completed during the live call',
+      parameters: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string', description: 'Reason a callback is needed' },
+          priority: { type: 'string', enum: ['low', 'normal', 'high'], description: 'Operational priority' },
+          requestedWindow: { type: 'string', description: 'Requested callback timing or window' }
+        },
+        required: ['reason']
+      },
+      implementation: this.createCallbackTaskFunction.bind(this)
+    });
+
+    this.functionTemplates.set('create_review_case', {
+      name: 'createReviewCase',
+      description: 'Create a manual review case for issues that need offline review instead of live transfer',
+      parameters: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string', description: 'Reason the case should be reviewed' },
+          category: { type: 'string', description: 'Operational case category' },
+          priority: { type: 'string', enum: ['low', 'normal', 'high'], description: 'Review priority' }
+        },
+        required: ['reason']
+      },
+      implementation: this.createReviewCaseFunction.bind(this)
+    });
+
+    this.functionTemplates.set('send_secure_followup', {
+      name: 'sendSecureFollowup',
+      description: 'Send a secure follow-up instruction or link after the call',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string', enum: ['sms', 'email'], description: 'Preferred secure follow-up channel' },
+          purpose: { type: 'string', description: 'Why the secure follow-up is being sent' },
+          artifactType: { type: 'string', description: 'Type of secure link, form, or message to send' }
+        },
+        required: ['purpose']
+      },
+      implementation: this.createSecureFollowupFunction.bind(this)
+    });
+
+    this.functionTemplates.set('classify_tax_inquiry', {
+      name: 'classifyTaxInquiry',
+      description: 'Classify a tax inquiry into refund, notice, filing, or document follow-up categories',
+      parameters: {
+        type: 'object',
+        properties: {
+          inquirySummary: { type: 'string', description: 'Caller summary of the tax question' },
+          mentionsNotice: { type: 'boolean', description: 'Whether the caller mentions a notice or letter' }
+        },
+        required: ['inquirySummary']
+      },
+      implementation: this.createTaxInquiryClassificationFunction.bind(this)
+    });
+
+    this.functionTemplates.set('classify_fraud_alert', {
+      name: 'classifyFraudAlert',
+      description: 'Classify a possible fraud report into blocked, review, or likely legitimate categories',
+      parameters: {
+        type: 'object',
+        properties: {
+          incidentSummary: { type: 'string', description: 'Summary of the suspicious activity' },
+          accountChannel: { type: 'string', description: 'Card, account, login, or transfer channel involved' }
+        },
+        required: ['incidentSummary']
+      },
+      implementation: this.createFraudClassificationFunction.bind(this)
+    });
+
+    this.functionTemplates.set('capture_promise_to_pay', {
+      name: 'capturePromiseToPay',
+      description: 'Capture a caller commitment to pay by a specific date without taking payment live',
+      parameters: {
+        type: 'object',
+        properties: {
+          amount: { type: 'number', description: 'Promised amount' },
+          paymentDate: { type: 'string', description: 'Promised payment date' },
+          notes: { type: 'string', description: 'Collection notes or qualifiers' }
+        },
+        required: ['paymentDate']
+      },
+      implementation: this.createPromiseToPayFunction.bind(this)
+    });
+
+    this.functionTemplates.set('collect_document_checklist_status', {
+      name: 'collectDocumentChecklistStatus',
+      description: 'Capture which required documents are ready, missing, or pending follow-up',
+      parameters: {
+        type: 'object',
+        properties: {
+          checklistType: { type: 'string', description: 'Document checklist category' },
+          completedItems: { type: 'array', items: { type: 'string' }, description: 'Items already completed' },
+          missingItems: { type: 'array', items: { type: 'string' }, description: 'Items still missing' }
+        },
+        required: ['checklistType']
+      },
+      implementation: this.createDocumentChecklistFunction.bind(this)
+    });
+
+    this.functionTemplates.set('offer_payment_arrangement', {
+      name: 'offerPaymentArrangement',
+      description: 'Present a compliant payment arrangement option without taking payment live',
+      parameters: {
+        type: 'object',
+        properties: {
+          balance: { type: 'number', description: 'Outstanding balance' },
+          preferredPlan: { type: 'string', description: 'Requested plan cadence or structure' },
+          hardshipFlag: { type: 'boolean', description: 'Whether hardship was mentioned' }
+        },
+        required: ['balance']
+      },
+      implementation: this.createPaymentArrangementFunction.bind(this)
+    });
+
+    this.functionTemplates.set('lookup_policy_answer', {
+      name: 'lookupPolicyAnswer',
+      description: 'Look up a policy-safe answer for servicing, tax, or bank questions',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string', description: 'Policy or servicing topic' },
+          policyType: { type: 'string', description: 'Category of policy guidance needed' }
+        },
+        required: ['topic']
+      },
+      implementation: this.createPolicyLookupFunction.bind(this)
+    });
+
+    this.functionTemplates.set('schedule_consultation', {
+      name: 'scheduleConsultation',
+      description: 'Schedule a follow-up consultation or specialist review slot without live transfer',
+      parameters: {
+        type: 'object',
+        properties: {
+          consultationType: { type: 'string', description: 'Type of consultation requested' },
+          preferredDate: { type: 'string', description: 'Preferred follow-up date' },
+          preferredWindow: { type: 'string', description: 'Preferred time window' }
+        },
+        required: ['consultationType']
+      },
+      implementation: this.createConsultationFunction.bind(this)
+    });
+
+    this.functionTemplates.set('capture_dispute_reason', {
+      name: 'captureDisputeReason',
+      description: 'Capture the stated reason for a collections or transaction dispute',
+      parameters: {
+        type: 'object',
+        properties: {
+          disputeReason: { type: 'string', description: 'Caller-stated reason for dispute' },
+          category: { type: 'string', description: 'Dispute category' },
+          requestedResolution: { type: 'string', description: 'What outcome the caller wants' }
+        },
+        required: ['disputeReason']
+      },
+      implementation: this.createDisputeReasonFunction.bind(this)
+    });
   }
 
   // Analyze business context from prompt and generate appropriate functions
@@ -141,10 +329,6 @@ class DynamicFunctionEngine {
       }
     });
 
-    // Always include transfer function
-    functions.push(this.createTransferFunction());
-    functionImplementations['transferCall'] = this.getTransferImplementation();
-
     return {
       functions,
       implementations: functionImplementations,
@@ -163,7 +347,9 @@ class DynamicFunctionEngine {
       services: [],
       suggestedFunctions: [],
       keyTerms: [],
-      customerActions: []
+      customerActions: [],
+      detectedDomains: [],
+      domainScores: {}
     };
 
     // Industry detection
@@ -202,6 +388,8 @@ class DynamicFunctionEngine {
       analysis.suggestedFunctions.push('customer_support');
     }
 
+    this.applyOperationalDomainAnalysis(analysis, combinedText);
+
     // Always include information lookup for flexibility
     analysis.suggestedFunctions.push('information_lookup');
 
@@ -226,7 +414,119 @@ class DynamicFunctionEngine {
       }
     });
 
+    analysis.suggestedFunctions = Array.from(new Set(analysis.suggestedFunctions));
+    analysis.keyTerms = Array.from(new Set(analysis.keyTerms));
+
     return analysis;
+  }
+
+  applyOperationalDomainAnalysis(analysis, combinedText) {
+    const scores = {};
+    const signalPatterns = DynamicFunctionEngine.DOMAIN_SIGNAL_PATTERNS;
+    Object.entries(signalPatterns).forEach(([key, keywords]) => {
+      const matches = keywords.filter(keyword => combinedText.includes(keyword));
+      scores[key] = matches.length;
+      if (matches.length > 0) {
+        analysis.keyTerms.push(...matches);
+      }
+    });
+
+    analysis.domainScores = scores;
+
+    if (scores.tax > 0) {
+      const taxDomain = scores.tax_resolution >= 2 ? 'tax_resolution' : 'tax_support';
+      analysis.detectedDomains.push(taxDomain);
+      analysis.industry = 'finance';
+      analysis.businessType = taxDomain;
+      this.addSuggestedFunctions(
+        analysis,
+        'classify_tax_inquiry',
+        'lookup_policy_answer',
+        'collect_document_checklist_status'
+      );
+      if (taxDomain === 'tax_resolution') {
+        this.addSuggestedFunctions(analysis, 'create_review_case', 'schedule_consultation');
+      } else {
+        this.addSuggestedFunctions(analysis, 'create_callback_task');
+      }
+    }
+
+    if (scores.bank > 0) {
+      analysis.detectedDomains.push('bank_servicing');
+      analysis.industry = 'finance';
+      if (analysis.businessType === 'sales') {
+        analysis.businessType = 'bank_servicing';
+      }
+      this.addSuggestedFunctions(
+        analysis,
+        'verify_identity',
+        'lookup_policy_answer',
+        'send_secure_followup'
+      );
+      if (combinedText.includes('card') || combinedText.includes('account')) {
+        this.addSuggestedFunctions(analysis, 'create_callback_task');
+      }
+    }
+
+    if (scores.fraud > 0) {
+      analysis.detectedDomains.push('fraud_review');
+      analysis.industry = 'finance';
+      analysis.businessType = 'fraud_review';
+      this.addSuggestedFunctions(
+        analysis,
+        'verify_identity',
+        'classify_fraud_alert',
+        'create_review_case',
+        'send_secure_followup'
+      );
+    }
+
+    if (scores.collections > 0) {
+      analysis.detectedDomains.push('collections_servicing');
+      analysis.industry = 'finance';
+      analysis.businessType = 'collections_servicing';
+      this.addSuggestedFunctions(
+        analysis,
+        'verify_identity',
+        'offer_payment_arrangement',
+        'capture_promise_to_pay',
+        'capture_dispute_reason'
+      );
+      if (combinedText.includes('installment') || combinedText.includes('payment due')) {
+        this.addSuggestedFunctions(analysis, 'create_callback_task');
+      }
+      if (combinedText.includes('dispute') || combinedText.includes('hardship')) {
+        this.addSuggestedFunctions(analysis, 'create_review_case');
+      }
+    }
+
+    if (scores.verification > 0) {
+      analysis.detectedDomains.push('identity_verification_plus');
+      if (analysis.industry === 'general') {
+        analysis.industry = 'finance';
+      }
+      if (analysis.businessType === 'sales') {
+        analysis.businessType = 'identity_verification_plus';
+      }
+      this.addSuggestedFunctions(
+        analysis,
+        'verify_identity',
+        'send_secure_followup'
+      );
+      if (combinedText.includes('document') || combinedText.includes('unable to verify')) {
+        this.addSuggestedFunctions(analysis, 'create_review_case');
+      }
+    }
+
+    analysis.detectedDomains = Array.from(new Set(analysis.detectedDomains));
+  }
+
+  addSuggestedFunctions(analysis, ...functionTypes) {
+    functionTypes.forEach(functionType => {
+      if (!analysis.suggestedFunctions.includes(functionType)) {
+        analysis.suggestedFunctions.push(functionType);
+      }
+    });
   }
 
   // Adapt function template to specific business context
@@ -286,7 +586,19 @@ class DynamicFunctionEngine {
       'handleSupport': 'I\'ll help you resolve that issue right away.',
       'qualifyLead': 'Let me gather some information to better assist you.',
       'checkAvailability': 'Let me check our availability for you.',
-      'checkProperties': 'Let me search our property listings.'
+      'checkProperties': 'Let me search our property listings.',
+      'verifyIdentity': 'I need to confirm a few identity details before we continue.',
+      'createCallbackTask': 'I can queue a callback so this is handled safely offline.',
+      'createReviewCase': 'I can create a review case for follow-up after this call.',
+      'sendSecureFollowup': 'I can send a secure follow-up with the next steps.',
+      'classifyTaxInquiry': 'Let me classify that tax issue so I can guide the next step.',
+      'classifyFraudAlert': 'Let me categorize that fraud concern carefully.',
+      'capturePromiseToPay': 'I can record that payment commitment for follow-up.',
+      'collectDocumentChecklistStatus': 'Let me capture which documents are ready and which are still missing.',
+      'offerPaymentArrangement': 'Let me review the available payment arrangement options.',
+      'lookupPolicyAnswer': 'Let me check the policy-safe guidance for that question.',
+      'scheduleConsultation': 'I can schedule a follow-up consultation for that request.',
+      'captureDisputeReason': 'Let me capture the dispute details accurately.'
     };
 
     return messages[functionName] || 'One moment please, let me help you with that.';
@@ -317,6 +629,30 @@ class DynamicFunctionEngine {
           orderId: { type: 'string', description: 'Order confirmation ID' },
           total: { type: 'number', description: 'Total order amount' },
           deliveryDate: { type: 'string', description: 'Expected delivery date' }
+        }
+      },
+      'verifyIdentity': {
+        type: 'object',
+        properties: {
+          status: { type: 'string', description: 'Verification outcome' },
+          verificationType: { type: 'string', description: 'Applied verification path' },
+          nextStep: { type: 'string', description: 'Next recommended step' }
+        }
+      },
+      'createCallbackTask': {
+        type: 'object',
+        properties: {
+          callbackTaskId: { type: 'string', description: 'Callback task identifier' },
+          status: { type: 'string', description: 'Queued status' },
+          requestedWindow: { type: 'string', description: 'Requested callback window' }
+        }
+      },
+      'createReviewCase': {
+        type: 'object',
+        properties: {
+          reviewCaseId: { type: 'string', description: 'Review case identifier' },
+          status: { type: 'string', description: 'Case status' },
+          category: { type: 'string', description: 'Review case category' }
         }
       }
     };
@@ -508,34 +844,196 @@ class DynamicFunctionEngine {
     };
   }
 
-  createTransferFunction() {
-    return {
-      type: 'function',
-      function: {
-        name: 'transferCall',
-        say: 'One moment while I transfer your call to a specialist.',
-        description: 'Transfer the customer to a live agent when needed.',
-        parameters: {
-          type: 'object',
-          properties: {
-            callSid: { type: 'string', description: 'The unique identifier for the active phone call.' },
-            reason: { type: 'string', description: 'Reason for transfer' }
-          },
-          required: ['callSid']
-        },
-        returns: {
-          type: 'object',
-          properties: {
-            status: { type: 'string', description: 'Whether or not the customer call was successfully transferred' }
-          }
-        }
-      }
+  createIdentityVerificationFunction(context) {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'verifyIdentity'} function`);
+
+      const verificationType = functionArgs.verificationType || 'basic';
+      const nextStep = verificationType === 'document'
+        ? 'send_secure_followup'
+        : verificationType === 'step_up'
+          ? 'create_review_case'
+          : 'continue_call';
+
+      return JSON.stringify({
+        status: verificationType === 'step_up' ? 'additional_review_needed' : 'verified',
+        verificationType,
+        customerName: functionArgs.customerName || null,
+        nextStep,
+        domain: context.businessType || context.industry || 'general'
+      });
     };
   }
 
-  getTransferImplementation() {
-    const transferCall = require('./transferCall');
-    return transferCall;
+  createCallbackTaskFunction(context) {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'createCallbackTask'} function`);
+
+      return JSON.stringify({
+        callbackTaskId: `CB-${Date.now().toString().slice(-8)}`,
+        status: 'queued',
+        requestedWindow: functionArgs.requestedWindow || 'next_available_window',
+        priority: functionArgs.priority || 'normal',
+        reason: functionArgs.reason,
+        domain: context.businessType || context.industry || 'general'
+      });
+    };
+  }
+
+  createReviewCaseFunction(context) {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'createReviewCase'} function`);
+
+      return JSON.stringify({
+        reviewCaseId: `RC-${Date.now().toString().slice(-8)}`,
+        status: 'open',
+        category: functionArgs.category || context.businessType || 'general_review',
+        priority: functionArgs.priority || 'normal',
+        reason: functionArgs.reason
+      });
+    };
+  }
+
+  createSecureFollowupFunction(context) {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'sendSecureFollowup'} function`);
+
+      return JSON.stringify({
+        status: 'sent',
+        channel: functionArgs.channel || 'sms',
+        artifactType: functionArgs.artifactType || 'secure_link',
+        purpose: functionArgs.purpose,
+        domain: context.businessType || context.industry || 'general'
+      });
+    };
+  }
+
+  createTaxInquiryClassificationFunction() {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'classifyTaxInquiry'} function`);
+
+      const summary = String(functionArgs.inquirySummary || '').toLowerCase();
+      const category = functionArgs.mentionsNotice || summary.includes('notice')
+        ? 'notice'
+        : summary.includes('refund')
+          ? 'refund'
+          : summary.includes('document') || summary.includes('checklist')
+            ? 'document_follow_up'
+            : 'general_tax_support';
+
+      return JSON.stringify({
+        category,
+        requiresReview: category === 'notice',
+        recommendedNextStep: category === 'notice' ? 'create_review_case' : 'lookup_policy_answer'
+      });
+    };
+  }
+
+  createFraudClassificationFunction() {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'classifyFraudAlert'} function`);
+
+      const summary = String(functionArgs.incidentSummary || '').toLowerCase();
+      const severity = summary.includes('unauthorized') || summary.includes('takeover')
+        ? 'high'
+        : summary.includes('suspicious')
+          ? 'medium'
+          : 'low';
+
+      return JSON.stringify({
+        severity,
+        disposition: severity === 'high' ? 'review_required' : severity === 'medium' ? 'step_up_verification' : 'customer_confirmed_legitimate',
+        accountChannel: functionArgs.accountChannel || 'unspecified'
+      });
+    };
+  }
+
+  createPromiseToPayFunction() {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'capturePromiseToPay'} function`);
+
+      return JSON.stringify({
+        status: 'captured',
+        amount: functionArgs.amount || null,
+        paymentDate: functionArgs.paymentDate,
+        notes: functionArgs.notes || '',
+        nextStep: 'callback_follow_up'
+      });
+    };
+  }
+
+  createDocumentChecklistFunction() {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'collectDocumentChecklistStatus'} function`);
+
+      const completedItems = Array.isArray(functionArgs.completedItems) ? functionArgs.completedItems : [];
+      const missingItems = Array.isArray(functionArgs.missingItems) ? functionArgs.missingItems : [];
+
+      return JSON.stringify({
+        checklistType: functionArgs.checklistType,
+        completedCount: completedItems.length,
+        missingCount: missingItems.length,
+        status: missingItems.length > 0 ? 'follow_up_needed' : 'complete'
+      });
+    };
+  }
+
+  createPaymentArrangementFunction() {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'offerPaymentArrangement'} function`);
+
+      const planType = functionArgs.hardshipFlag ? 'hardship_review' : 'standard_installment';
+      return JSON.stringify({
+        eligible: true,
+        planType,
+        balance: functionArgs.balance,
+        preferredPlan: functionArgs.preferredPlan || 'monthly',
+        nextStep: functionArgs.hardshipFlag ? 'create_review_case' : 'capture_promise_to_pay'
+      });
+    };
+  }
+
+  createPolicyLookupFunction(context) {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'lookupPolicyAnswer'} function`);
+
+      const topic = functionArgs.topic || 'general';
+      return JSON.stringify({
+        topic,
+        policyType: functionArgs.policyType || context.businessType || 'general_policy',
+        answer: `Policy guidance is available for ${topic}; confirm the caller's situation and use secure follow-up for sensitive next steps.`,
+        safeNextStep: 'send_secure_followup'
+      });
+    };
+  }
+
+  createConsultationFunction(context) {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'scheduleConsultation'} function`);
+
+      return JSON.stringify({
+        scheduled: true,
+        consultationId: `CONS-${Date.now().toString().slice(-8)}`,
+        consultationType: functionArgs.consultationType,
+        preferredDate: functionArgs.preferredDate || 'next_available_date',
+        preferredWindow: functionArgs.preferredWindow || 'business_hours',
+        domain: context.businessType || context.industry || 'general'
+      });
+    };
+  }
+
+  createDisputeReasonFunction() {
+    return async function(functionArgs) {
+      console.log(`GPT -> called ${this.name || 'captureDisputeReason'} function`);
+
+      return JSON.stringify({
+        status: 'captured',
+        disputeReason: functionArgs.disputeReason,
+        category: functionArgs.category || 'general_dispute',
+        requestedResolution: functionArgs.requestedResolution || 'manual_review',
+        nextStep: 'create_review_case'
+      });
+    };
   }
 
   // Save generated functions to files

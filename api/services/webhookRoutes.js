@@ -129,6 +129,31 @@ function getDigitService(ctx = {}) {
   return typeof ctx.getDigitService === "function" ? ctx.getDigitService() : ctx.digitService;
 }
 
+const CONSOLE_ACTION_ALIASES = Object.freeze({
+  sms: "secure_follow_up",
+  secure_follow_up: "secure_follow_up",
+  follow_up: "secure_follow_up",
+  followup_sms: "secure_follow_up",
+  callback: "callback",
+  call_back: "callback",
+  review_case: "review_case",
+  review: "review_case",
+  case_review: "review_case",
+  xfer: "review_case",
+  transfer: "review_case",
+  handoff: "review_case",
+  route_to_agent: "review_case",
+  "route-agent": "review_case",
+});
+
+function normalizeConsoleAction(action) {
+  if (typeof action !== "string") {
+    return action;
+  }
+  const normalized = action.trim().toLowerCase();
+  return CONSOLE_ACTION_ALIASES[normalized] || normalized;
+}
+
 async function dedupeProviderEvent(asyncFn, syncFn, source, payload, options = {}) {
   const fn = typeof asyncFn === "function"
     ? asyncFn
@@ -541,6 +566,10 @@ function createTelegramWebhookHandler(ctx = {}) {
           .catch(() => {});
         return;
       }
+      const requestedAction = prefix === "lc" ? action : null;
+      if (prefix === "lc") {
+        action = normalizeConsoleAction(action);
+      }
 
       if (prefix === "retry") {
         const retryAction = action;
@@ -834,35 +863,50 @@ function createTelegramWebhookHandler(ctx = {}) {
         return;
       }
 
-      if (action === "sms") {
+      if (action === "secure_follow_up") {
         if (!callRecord?.phone_number) {
           webhookService
             .answerCallbackQuery(cb.id, "No phone number on record")
             .catch(() => {});
           return;
         }
-        webhookService.lockConsoleButtons(callSid, "Sending SMS…");
+        webhookService.lockConsoleButtons(callSid, "Sending secure follow-up…");
         try {
           const inbound = callState?.inbound === true;
           const smsBody = inbound
             ? buildInboundSmsBody(callRecord, callState)
             : buildRetrySmsBody(callRecord, callState);
           await smsService.sendSMS(callRecord.phone_number, smsBody);
-          webhookService.addLiveEvent(callSid, "💬 Follow-up SMS sent", {
-            force: true,
-          });
-          await logConsoleAction(callSid, "sms", {
+          const sentAt = new Date().toISOString();
+          await db.updateCallState(callSid, "secure_follow_up_sent", {
+            at: sentAt,
             inbound,
+            source: "telegram",
+            requested_by: chatId || null,
+            requested_action: requestedAction || action,
             to: callRecord.phone_number,
           });
-          webhookService.answerCallbackQuery(cb.id, "SMS sent").catch(() => {});
+          webhookService.addLiveEvent(callSid, "🔐 Secure follow-up sent", {
+            force: true,
+          });
+          await logConsoleAction(callSid, "secure_follow_up", {
+            inbound,
+            requested_at: sentAt,
+            to: callRecord.phone_number,
+            ...(requestedAction && requestedAction !== action
+              ? { requested_action: requestedAction }
+              : {}),
+          });
+          webhookService
+            .answerCallbackQuery(cb.id, "Secure follow-up sent")
+            .catch(() => {});
         } catch (smsError) {
           webhookService
-            .answerCallbackQuery(cb.id, "Failed to send SMS")
+            .answerCallbackQuery(cb.id, "Failed to send secure follow-up")
             .catch(() => {});
           await webhookService.sendTelegramMessage(
             chatId,
-            `❌ Failed to send follow-up SMS: ${smsError.message || smsError}`,
+            `❌ Failed to send secure follow-up: ${smsError.message || smsError}`,
           );
         } finally {
           setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
@@ -885,7 +929,15 @@ function createTelegramWebhookHandler(ctx = {}) {
           );
           const runAt = new Date(Date.now() + delayMin * 60 * 1000).toISOString();
           const payload = buildCallbackPayload(callRecord, callState);
-          await scheduleCallJob("callback_call", payload, runAt);
+          const taskId = await scheduleCallJob("callback_call", payload, runAt);
+          await db.updateCallState(callSid, "callback_scheduled", {
+            at: new Date().toISOString(),
+            run_at: runAt,
+            source: "telegram",
+            requested_by: chatId || null,
+            requested_action: requestedAction || action,
+            callback_task_id: taskId,
+          });
           webhookService.addLiveEvent(
             callSid,
             `⏲ Callback scheduled in ${delayMin}m`,
@@ -893,6 +945,10 @@ function createTelegramWebhookHandler(ctx = {}) {
           );
           await logConsoleAction(callSid, "callback_scheduled", {
             run_at: runAt,
+            callback_task_id: taskId,
+            ...(requestedAction && requestedAction !== action
+              ? { requested_action: requestedAction }
+              : {}),
           });
           webhookService
             .answerCallbackQuery(cb.id, "Callback scheduled")
@@ -900,6 +956,52 @@ function createTelegramWebhookHandler(ctx = {}) {
         } catch (callbackError) {
           webhookService
             .answerCallbackQuery(cb.id, "Failed to schedule callback")
+            .catch(() => {});
+        } finally {
+          setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
+        }
+        return;
+      }
+
+      if (action === "review_case") {
+        webhookService.lockConsoleButtons(callSid, "Creating review case…");
+        try {
+          const requestedAt = new Date().toISOString();
+          const reviewCaseId = await db.createReviewCase({
+            call_sid: callSid,
+            phone_number: callRecord?.phone_number || null,
+            requested_action: requestedAction || action,
+            reason: "Operator requested review case",
+            notes: null,
+            source: "telegram",
+            created_by: chatId ? String(chatId) : null,
+            metadata: {
+              requested_action: requestedAction || action,
+            },
+          });
+          await db.updateCallState(callSid, "review_case_requested", {
+            at: requestedAt,
+            source: "telegram",
+            requested_by: chatId || null,
+            requested_action: requestedAction || action,
+            review_case_id: reviewCaseId,
+          });
+          webhookService.addLiveEvent(callSid, "🗂 Review case requested", {
+            force: true,
+          });
+          await logConsoleAction(callSid, "review_case", {
+            requested_at: requestedAt,
+            review_case_id: reviewCaseId,
+            ...(requestedAction && requestedAction !== action
+              ? { requested_action: requestedAction }
+              : {}),
+          });
+          webhookService
+            .answerCallbackQuery(cb.id, "Review case requested")
+            .catch(() => {});
+        } catch (reviewError) {
+          webhookService
+            .answerCallbackQuery(cb.id, "Failed to request review case")
             .catch(() => {});
         } finally {
           setTimeout(() => webhookService.unlockConsoleButtons(callSid), 1000);
@@ -1009,37 +1111,6 @@ function createTelegramWebhookHandler(ctx = {}) {
         return;
       }
 
-      if (action === "xfer") {
-        if (!config.twilio.transferNumber) {
-          webhookService
-            .answerCallbackQuery(cb.id, "Transfer not configured")
-            .catch(() => {});
-          return;
-        }
-        webhookService.lockConsoleButtons(callSid, "Transferring…");
-        try {
-          const transferCall =
-            typeof ctx.getTransferCall === "function"
-              ? ctx.getTransferCall()
-              : require("../functions/transferCall");
-          await transferCall({ callSid });
-          webhookService.markToolInvocation(callSid, "transferCall").catch(() => {});
-          await logConsoleAction(callSid, "transfer");
-          webhookService
-            .answerCallbackQuery(cb.id, "Transferring...")
-            .catch(() => {});
-        } catch (e) {
-          webhookService
-            .answerCallbackQuery(
-              cb.id,
-              `Transfer failed: ${e.message}`.slice(0, 180),
-            )
-            .catch(() => {});
-          webhookService.unlockConsoleButtons(callSid);
-        }
-        setTimeout(() => webhookService.unlockConsoleButtons(callSid), 2000);
-        return;
-      }
     } catch (error) {
       try {
         res.status(200).send("OK");

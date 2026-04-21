@@ -36,6 +36,18 @@ const PROFILE_ALIASES = Object.freeze({
   estate: "real_estate_agent",
   real_estate: "real_estate_agent",
   "real estate agent": "real_estate_agent",
+  "tax support": "tax_support",
+  "tax-support": "tax_support",
+  "tax resolution": "tax_resolution",
+  "tax-resolution": "tax_resolution",
+  "bank servicing": "bank_servicing",
+  "bank-servicing": "bank_servicing",
+  "fraud review": "fraud_review",
+  "fraud-review": "fraud_review",
+  "collections servicing": "collections_servicing",
+  "collections-servicing": "collections_servicing",
+  "identity verification plus": "identity_verification_plus",
+  "identity-verification-plus": "identity_verification_plus",
 });
 
 const PROFILE_POLICY_KEYS = Object.freeze([
@@ -56,6 +68,12 @@ const PROFILE_RESPONSE_CONSTRAINTS = Object.freeze({
   community: Object.freeze({ maxChars: 240, maxQuestions: 1 }),
   marketplace_seller: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
   real_estate_agent: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  tax_support: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  tax_resolution: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  bank_servicing: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  fraud_review: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  collections_servicing: Object.freeze({ maxChars: 220, maxQuestions: 1 }),
+  identity_verification_plus: Object.freeze({ maxChars: 200, maxQuestions: 1 }),
 });
 
 const REQUIRED_PROFILE_FRONTMATTER_KEYS = Object.freeze([
@@ -1160,6 +1178,126 @@ const PROFILE_DEFINITIONS = Object.freeze({
     goalEnum: ["qualify", "schedule_tour", "share_listing", "follow_up", "handoff", "close"],
     safeFallback:
       "I can continue with compliant real-estate guidance and a clear next step.",
+    policy: {
+      antiImpersonation: true,
+      antiHarassment: true,
+      antiCoercion: true,
+      antiMoneyPressure: true,
+    },
+  },
+  tax_support: {
+    id: "tax_support",
+    flowType: "tax_support",
+    objectiveTag: "tax_support_service",
+    marker: "[profile_tax_support_v1]",
+    defaultFirstMessage:
+      "Hi, this is a tax support assistant. I can help review your account and next steps.",
+    contextKey: "relationship_profile_context",
+    stageEnum: ["intake", "verification", "issue_review", "next_steps", "closed"],
+    vibeEnum: ["professional", "calm", "concerned", "confused", "urgent", "neutral"],
+    goalEnum: ["verify", "clarify", "review_issue", "guide", "callback", "close"],
+    safeFallback:
+      "I can continue with transparent tax support guidance, or arrange a callback or review case if needed.",
+    policy: {
+      antiImpersonation: true,
+      antiHarassment: true,
+      antiCoercion: true,
+      antiMoneyPressure: true,
+    },
+  },
+  tax_resolution: {
+    id: "tax_resolution",
+    flowType: "tax_resolution",
+    objectiveTag: "tax_resolution_service",
+    marker: "[profile_tax_resolution_v1]",
+    defaultFirstMessage:
+      "Hi, this is a tax resolution assistant. I can help review your case status and safe next steps.",
+    contextKey: "relationship_profile_context",
+    stageEnum: ["intake", "verification", "resolution_review", "documents_or_payment", "closed"],
+    vibeEnum: ["professional", "calm", "stressed", "skeptical", "urgent", "neutral"],
+    goalEnum: ["verify", "review_case", "collect_documents", "set_next_step", "callback", "close"],
+    safeFallback:
+      "I can continue with transparent tax-resolution guidance and use review or callback paths when the case needs manual handling.",
+    policy: {
+      antiImpersonation: true,
+      antiHarassment: true,
+      antiCoercion: true,
+      antiMoneyPressure: true,
+    },
+  },
+  bank_servicing: {
+    id: "bank_servicing",
+    flowType: "bank_servicing",
+    objectiveTag: "bank_servicing_support",
+    marker: "[profile_bank_servicing_v1]",
+    defaultFirstMessage:
+      "Hi, this is a bank servicing assistant. I can help verify the request and explain the next secure step.",
+    contextKey: "relationship_profile_context",
+    stageEnum: ["intake", "verification", "account_review", "servicing_action", "closed"],
+    vibeEnum: ["professional", "calm", "concerned", "frustrated", "urgent", "neutral"],
+    goalEnum: ["verify", "review_request", "secure_follow_up", "callback", "guide", "close"],
+    safeFallback:
+      "I can continue with clear bank-servicing guidance and route to secure follow-up, callback, or review case when required.",
+    policy: {
+      antiImpersonation: true,
+      antiHarassment: true,
+      antiCoercion: true,
+      antiMoneyPressure: true,
+    },
+  },
+  fraud_review: {
+    id: "fraud_review",
+    flowType: "fraud_review",
+    objectiveTag: "fraud_review_support",
+    marker: "[profile_fraud_review_v1]",
+    defaultFirstMessage:
+      "Hi, this is a fraud review assistant. I can help verify the concern and explain the protective next step.",
+    contextKey: "relationship_profile_context",
+    stageEnum: ["disclosure", "verification", "incident_review", "protective_action", "closed"],
+    vibeEnum: ["professional", "calm", "concerned", "urgent", "protective", "neutral"],
+    goalEnum: ["verify", "review_incident", "secure_follow_up", "callback", "stabilize", "close"],
+    safeFallback:
+      "I can continue with transparent fraud-review guidance and use secure follow-up, callback, or review case when extra protection is needed.",
+    policy: {
+      antiImpersonation: true,
+      antiHarassment: true,
+      antiCoercion: true,
+      antiMoneyPressure: true,
+    },
+  },
+  collections_servicing: {
+    id: "collections_servicing",
+    flowType: "collections_servicing",
+    objectiveTag: "collections_servicing_support",
+    marker: "[profile_collections_servicing_v1]",
+    defaultFirstMessage:
+      "Hi, this is a collections servicing assistant. I can review the account status and safe next options with you.",
+    contextKey: "relationship_profile_context",
+    stageEnum: ["disclosure", "verification", "balance_review", "options", "closed"],
+    vibeEnum: ["professional", "calm", "concerned", "resistant", "urgent", "neutral"],
+    goalEnum: ["verify", "review_balance", "set_option", "callback", "review_case", "close"],
+    safeFallback:
+      "I can continue with respectful collections guidance and use callback or review-case paths instead of pressure or live handoff.",
+    policy: {
+      antiImpersonation: true,
+      antiHarassment: true,
+      antiCoercion: true,
+      antiMoneyPressure: true,
+    },
+  },
+  identity_verification_plus: {
+    id: "identity_verification_plus",
+    flowType: "identity_verification_plus",
+    objectiveTag: "identity_verification_plus",
+    marker: "[profile_identity_verification_plus_v1]",
+    defaultFirstMessage:
+      "Hi, this is a verification assistant. I can explain the identity-check process and the next secure step.",
+    contextKey: "relationship_profile_context",
+    stageEnum: ["disclosure", "verification", "challenge", "review", "closed"],
+    vibeEnum: ["professional", "calm", "careful", "concerned", "urgent", "neutral"],
+    goalEnum: ["disclose", "verify", "secure_follow_up", "callback", "review_case", "close"],
+    safeFallback:
+      "I can continue with a transparent verification flow and use secure follow-up, callback, or review-case handling when needed.",
     policy: {
       antiImpersonation: true,
       antiHarassment: true,

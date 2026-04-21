@@ -24,6 +24,23 @@ const CORE_CALL_FLOW_TYPES = Object.freeze([
   "general_outreach",
 ]);
 
+const DOMAIN_FLOW_OBJECTIVE_TAG_MAP = Object.freeze({
+  tax_support: "tax_support_service",
+  tax_resolution: "tax_resolution_service",
+  bank_servicing: "bank_servicing_support",
+  fraud_review: "fraud_review_support",
+  collections_servicing: "collections_servicing_support",
+  identity_verification_plus: "identity_verification_plus",
+});
+
+const DOMAIN_CALL_OBJECTIVE_IDS = Object.freeze(
+  Array.from(new Set(Object.values(DOMAIN_FLOW_OBJECTIVE_TAG_MAP))),
+);
+
+const DOMAIN_CALL_FLOW_TYPES = Object.freeze(
+  Object.keys(DOMAIN_FLOW_OBJECTIVE_TAG_MAP),
+);
+
 const RELATIONSHIP_FLOW_TYPE_SET = new Set(RELATIONSHIP_FLOW_TYPES);
 
 const FLOW_OBJECTIVE_TAG_MAP = Object.freeze({
@@ -32,6 +49,7 @@ const FLOW_OBJECTIVE_TAG_MAP = Object.freeze({
   appointment_confirmation: "appointment_confirm",
   service_recovery: "service_recovery",
   general_outreach: "general_outreach",
+  ...DOMAIN_FLOW_OBJECTIVE_TAG_MAP,
   ...RELATIONSHIP_FLOW_TYPES.reduce((acc, flowType) => {
     const normalizedProfile = normalizeRelationshipProfileType(flowType, "");
     const objectiveTag = RELATIONSHIP_PROFILE_OBJECTIVE_MAP[normalizedProfile];
@@ -48,11 +66,13 @@ const FLOW_OBJECTIVE_TAGS = Object.freeze(
 
 const CALL_OBJECTIVE_IDS = Object.freeze([
   ...CORE_CALL_OBJECTIVE_IDS,
+  ...DOMAIN_CALL_OBJECTIVE_IDS,
   ...RELATIONSHIP_OBJECTIVE_TAGS,
 ]);
 
 const CALL_SCRIPT_FLOW_TYPES = Object.freeze([
   ...CORE_CALL_FLOW_TYPES,
+  ...DOMAIN_CALL_FLOW_TYPES,
   ...RELATIONSHIP_FLOW_TYPES,
   "general",
 ]);
@@ -85,9 +105,45 @@ const CALL_SCRIPT_FLOW_TYPE_ALIASES = Object.freeze(
       general_outreach: "general_outreach",
       "general-outreach": "general_outreach",
       outreach: "general_outreach",
+      tax_support: "tax_support",
+      "tax-support": "tax_support",
+      tax_support_service: "tax_support",
+      "tax-support-service": "tax_support",
+      tax_resolution: "tax_resolution",
+      "tax-resolution": "tax_resolution",
+      tax_resolution_service: "tax_resolution",
+      "tax-resolution-service": "tax_resolution",
+      bank_servicing: "bank_servicing",
+      "bank-servicing": "bank_servicing",
+      bank_servicing_support: "bank_servicing",
+      "bank-servicing-support": "bank_servicing",
+      fraud_review: "fraud_review",
+      "fraud-review": "fraud_review",
+      fraud_review_support: "fraud_review",
+      "fraud-review-support": "fraud_review",
+      collections_servicing: "collections_servicing",
+      "collections-servicing": "collections_servicing",
+      collections_servicing_support: "collections_servicing",
+      "collections-servicing-support": "collections_servicing",
+      identity_verification_plus: "identity_verification_plus",
+      "identity-verification-plus": "identity_verification_plus",
+      identity_verification_plus_flow: "identity_verification_plus",
+      "identity-verification-plus-flow": "identity_verification_plus",
       general: "general",
       default: "general",
     };
+
+    DOMAIN_CALL_FLOW_TYPES.forEach((flowType) => {
+      const objectiveTag = DOMAIN_FLOW_OBJECTIVE_TAG_MAP[flowType];
+      aliases[flowType] = flowType;
+      aliases[flowType.replace(/_/g, "-")] = flowType;
+      aliases[`${flowType}_flow`] = flowType;
+      aliases[`${flowType}-flow`] = flowType;
+      if (objectiveTag) {
+        aliases[objectiveTag] = flowType;
+        aliases[objectiveTag.replace(/_/g, "-")] = flowType;
+      }
+    });
 
     RELATIONSHIP_PROFILE_TYPES.forEach((profileType) => {
       const flowType = RELATIONSHIP_PROFILE_FLOW_MAP[profileType] || profileType;
@@ -240,12 +296,23 @@ function getCallScriptFlowTypes(script = {}) {
     add("general_outreach");
   }
 
+  Object.entries(DOMAIN_FLOW_OBJECTIVE_TAG_MAP).forEach(([flowType, objectiveTag]) => {
+    if (objectiveTag && objectiveTags.includes(objectiveTag)) {
+      add(flowType);
+    }
+  });
+
   RELATIONSHIP_FLOW_TYPES.forEach((flowType) => {
     const objectiveTag = FLOW_OBJECTIVE_TAG_MAP[flowType];
     if (objectiveTag && objectiveTags.includes(objectiveTag)) {
       add(flowType);
     }
   });
+
+  const defaultFlow = normalizeCallScriptFlowType(script.default_profile);
+  if (defaultFlow && defaultFlow !== "general") {
+    add(defaultFlow);
+  }
 
   if (!fallback.length) {
     add("general");
@@ -269,6 +336,8 @@ function getEffectiveObjectiveTags(script = {}) {
 module.exports = {
   CORE_CALL_OBJECTIVE_IDS,
   CORE_CALL_FLOW_TYPES,
+  DOMAIN_CALL_OBJECTIVE_IDS,
+  DOMAIN_CALL_FLOW_TYPES,
   CALL_OBJECTIVE_IDS,
   CALL_SCRIPT_FLOW_TYPES,
   CALL_SCRIPT_FLOW_TYPE_ALIASES,
@@ -284,4 +353,3 @@ module.exports = {
   getEffectiveObjectiveTags,
   isRelationshipFlowType,
 };
-
