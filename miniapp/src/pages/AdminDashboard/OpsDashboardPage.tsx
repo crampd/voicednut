@@ -49,6 +49,16 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
+function buildListRowKey(prefix: string, value: unknown, index: number): string {
+  const suffix = typeof value === 'string'
+    || typeof value === 'number'
+    || typeof value === 'bigint'
+    || typeof value === 'boolean'
+    ? String(value)
+    : String(index);
+  return `${prefix}-${suffix}`;
+}
+
 export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
   if (!visible) return null;
 
@@ -866,7 +876,7 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
               ) : (
                 <ul className="va-list">
                   {callbackTaskRows.map((row, index) => (
-                    <li key={`callback-task-${String(row.id ?? index)}`}>
+                    <li key={buildListRowKey('callback-task', row.id, index)}>
                       <strong>{toText(row.id, `task-${index + 1}`)}</strong>
                       <span>{toText(row.status, 'unknown')}</span>
                       <span>{toText(row.phone_number, 'n/a')}</span>
@@ -884,7 +894,7 @@ export function OpsDashboardPage({ visible, vm }: OpsDashboardPageProps) {
               ) : (
                 <ul className="va-list">
                   {reviewCaseRows.map((row, index) => (
-                    <li key={`review-case-${String(row.id ?? index)}`}>
+                    <li key={buildListRowKey('review-case', row.id, index)}>
                       <strong>{toText(row.id, `case-${index + 1}`)}</strong>
                       <span>{toText(row.status, 'unknown')}</span>
                       <span>{toText(row.requested_action, 'review_case')}</span>
